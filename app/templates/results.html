@@ -1,0 +1,473 @@
+{% extends "base.html" %}
+{% block title %}Results — {{ session.title }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6 animate-fade-in" x-data="resultsPage()">
+    <!-- Breadcrumb -->
+    <div class="flex items-center gap-2 text-sm">
+        <a href="/" class="text-primary-600 dark:text-primary-400 hover:underline font-medium">Sessions</a>
+        <span class="text-gray-400">/</span>
+        <a href="/session/{{ session.id }}"
+            class="text-primary-600 dark:text-primary-400 hover:underline font-medium">{{ session.title }}</a>
+        <span class="text-gray-400">/</span>
+        <span class="text-gray-500 dark:text-gray-400">Results</span>
+    </div>
+
+    <!-- Header -->
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <h1 class="text-2xl font-bold"><span class="gradient-text">Results Dashboard</span></h1>
+        <div class="flex gap-3">
+            <a href="/session/{{ session.id }}/export/csv"
+                class="px-4 py-2 text-sm font-medium border border-gray-300 dark:border-gray-700 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800 transition flex items-center gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                CSV
+            </a>
+            <a href="/session/{{ session.id }}/export/json"
+                class="px-4 py-2 text-sm font-medium border border-gray-300 dark:border-gray-700 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800 transition flex items-center gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                JSON
+            </a>
+        </div>
+    </div>
+
+    {% if stats %}
+    <!-- Statistics cards -->
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div class="glass rounded-xl p-5 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Students</p>
+            <p class="mt-2 text-2xl font-bold">{{ stats.count }}</p>
+        </div>
+        <div class="glass rounded-xl p-5 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Average</p>
+            <p class="mt-2 text-2xl font-bold gradient-text">{{ stats.average }}</p>
+        </div>
+        <div class="glass rounded-xl p-5 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Median</p>
+            <p class="mt-2 text-2xl font-bold">{{ stats.median }}</p>
+        </div>
+        <div class="glass rounded-xl p-5 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Std Dev</p>
+            <p class="mt-2 text-2xl font-bold">{{ stats.stdev }}</p>
+        </div>
+        <div class="glass rounded-xl p-5 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Min</p>
+            <p class="mt-2 text-2xl font-bold text-red-500">{{ stats.min }}</p>
+        </div>
+        <div class="glass rounded-xl p-5 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Max</p>
+            <p class="mt-2 text-2xl font-bold text-emerald-500">{{ stats.max }}</p>
+        </div>
+    </div>
+
+    <!-- Grade distribution chart -->
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
+        <h2 class="text-lg font-semibold mb-4">Grade Distribution</h2>
+        <div class="h-64">
+            <canvas id="gradeChart"></canvas>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Filters + Search -->
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-4">
+        <div class="flex flex-col sm:flex-row gap-4">
+            <div class="flex-1">
+                <input type="text" x-model="searchQuery" placeholder="Search by student ID…"
+                    class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-2.5 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition">
+            </div>
+            <select x-model="filterGrade"
+                class="rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-2.5 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition">
+                <option value="">All Grades</option>
+                <option value="A">A range</option>
+                <option value="B">B range</option>
+                <option value="C">C range</option>
+                <option value="D">D range</option>
+                <option value="F">F</option>
+            </select>
+            <select x-model="filterConfidence"
+                class="rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-2.5 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition">
+                <option value="">All Confidence</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Student results -->
+    <div class="space-y-3">
+        {% for sub in submissions %}
+        <div class="student-card bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 overflow-hidden transition card-hover"
+            x-show="matchesFilters('{{ sub.student_identifier }}', '{{ sub.ai_letter_grade or '' }}', '{{ sub.ai_confidence or '' }}', '{{ sub.status }}', {{ 'true' if sub.is_reviewed else 'false' }}, {{ 'true' if sub.is_overridden else 'false' }})"
+            x-data="{ expanded: false }">
+
+            <!-- Collapsed header -->
+            <div class="p-4 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 transition flex items-center justify-between"
+                @click="expanded = !expanded">
+                <div class="flex items-center gap-4">
+                    <div class="flex-shrink-0 w-12 h-12 rounded-xl flex items-center justify-center text-lg font-bold
+                        {% if sub.ai_letter_grade and sub.ai_letter_grade.startswith('A') %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300
+                        {% elif sub.ai_letter_grade and sub.ai_letter_grade.startswith('B') %}bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300
+                        {% elif sub.ai_letter_grade and sub.ai_letter_grade.startswith('C') %}bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300
+                        {% elif sub.ai_letter_grade and sub.ai_letter_grade.startswith('D') %}bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300
+                        {% elif sub.ai_letter_grade == 'F' %}bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300
+                        {% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400{% endif %}">
+                        {{ sub.ai_letter_grade or '?' }}
+                    </div>
+                    <div>
+                        <h3 class="font-semibold">{{ sub.student_identifier }}</h3>
+                        <div class="flex items-center gap-2 mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                            <span>Score: <strong class="text-gray-700 dark:text-gray-200">{{ sub.final_score if
+                                    sub.final_score is not none else '-' }} / {{ session.max_score }}</strong></span>
+                            {% if sub.is_overridden %}
+                            <span
+                                class="px-1.5 py-0.5 bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300 rounded-md text-xs font-medium">Adjusted</span>
+                            {% endif %}
+                            {% if sub.is_reviewed %}
+                            <span
+                                class="px-1.5 py-0.5 bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 rounded-md text-xs font-medium">Reviewed</span>
+                            {% endif %}
+                            {% if sub.ai_confidence == 'low' %}
+                            <span
+                                class="px-1.5 py-0.5 bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 rounded-md text-xs font-medium">Needs
+                                Review</span>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+                <svg class="w-5 h-5 text-gray-400 transition-transform" :class="{ 'rotate-180': expanded }" fill="none"
+                    stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                </svg>
+            </div>
+
+            <!-- Expanded details -->
+            <div x-show="expanded" x-cloak x-collapse class="border-t border-gray-200 dark:border-gray-800">
+                {% set ai = sub.ai_result | from_json %}
+                {% if ai %}
+                <div class="p-5 space-y-5">
+                    <!-- Overall feedback -->
+                    <div>
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Overall Feedback</h4>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed whitespace-pre-wrap">{{
+                            ai.overall_feedback or 'No feedback available' }}</p>
+                    </div>
+
+                    <!-- Rubric breakdown -->
+                    {% if ai.rubric_breakdown %}
+                    <div>
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Rubric Breakdown</h4>
+                        <div class="space-y-2">
+                            {% for item in ai.rubric_breakdown %}
+                            <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                <div class="flex items-center justify-between mb-1">
+                                    <span class="text-sm font-medium">{{ item.criterion }}</span>
+                                    {% set item_max = item.max if item.max is defined else (item.max_score if
+                                    item.max_score is defined else 0) %}
+                                    <span class="text-sm font-bold
+                                        {% if item_max > 0 and item.score >= item_max * 0.8 %}text-emerald-600 dark:text-emerald-400
+                                        {% elif item_max > 0 and item.score >= item_max * 0.6 %}text-amber-600 dark:text-amber-400
+                                        {% else %}text-red-600 dark:text-red-400{% endif %}">
+                                        {{ item.score }} / {{ item_max }}
+                                    </span>
+                                </div>
+                                {% if item_max > 0 %}
+                                <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 mb-2">
+                                    <div class="h-1.5 rounded-full transition-all
+                                        {% if item.score >= item_max * 0.8 %}bg-emerald-500
+                                        {% elif item.score >= item_max * 0.6 %}bg-amber-500
+                                        {% else %}bg-red-500{% endif %}"
+                                        style="width: {{ (item.score / item_max * 100) if item_max > 0 else 0 }}%">
+                                    </div>
+                                </div>
+                                {% endif %}
+                                {% if item.justification or item.feedback %}
+                                <p class="text-xs text-gray-500 dark:text-gray-400">{{ item.justification or
+                                    item.feedback }}</p>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <!-- Strengths & Weaknesses -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {% if ai.strengths %}
+                        <div>
+                            <h4 class="text-sm font-semibold text-emerald-700 dark:text-emerald-400 mb-2">Strengths</h4>
+                            <ul class="space-y-1">
+                                {% for s in ai.strengths %}
+                                <li class="text-xs text-gray-600 dark:text-gray-400 flex items-start gap-1.5">
+                                    <span class="text-emerald-500 mt-0.5">+</span> {{ s }}
+                                </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        {% if ai.weaknesses %}
+                        <div>
+                            <h4 class="text-sm font-semibold text-red-700 dark:text-red-400 mb-2">Weaknesses</h4>
+                            <ul class="space-y-1">
+                                {% for w in ai.weaknesses %}
+                                <li class="text-xs text-gray-600 dark:text-gray-400 flex items-start gap-1.5">
+                                    <span class="text-red-500 mt-0.5">−</span> {{ w }}
+                                </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                    </div>
+
+                    {% if ai.critical_errors %}
+                    <div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-3">
+                        <h4 class="text-sm font-semibold text-red-700 dark:text-red-400 mb-1">Critical Errors</h4>
+                        <ul class="space-y-1">
+                            {% for e in ai.critical_errors %}
+                            <li class="text-xs text-red-600 dark:text-red-400">{{ e }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+
+                    {% if ai.suggestions_for_improvement %}
+                    <div>
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1">Suggestions</h4>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 whitespace-pre-wrap">{{
+                            ai.suggestions_for_improvement }}</p>
+                    </div>
+                    {% endif %}
+
+                    <!-- Submitted Files -->
+                    <div x-data="{ filesLoaded: false, filesList: [], filesLoading: false }"
+                        class="border-t border-gray-200 dark:border-gray-800 pt-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                                <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor"
+                                    viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                </svg>
+                                Submitted Files
+                            </h4>
+                            <button x-show="!filesLoaded"
+                                @click="filesLoading = true; fetch('/session/{{ session.id }}/student/{{ sub.id }}/files').then(r => r.json()).then(f => { filesList = f.map(x => Object.assign(x, {open: false, loading: false, loaded: false, content: null})); filesLoaded = true; filesLoading = false; }).catch(() => { filesLoading = false; })"
+                                :disabled="filesLoading"
+                                class="text-xs px-3 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 rounded-lg hover:bg-primary-200 dark:hover:bg-primary-900/50 transition disabled:opacity-50">
+                                <span x-show="!filesLoading">Load Files</span>
+                                <span x-show="filesLoading" x-cloak>Loading...</span>
+                            </button>
+                        </div>
+                        <div x-show="filesLoaded" class="space-y-2">
+                            <template x-for="(file, fi) in filesList" :key="fi">
+                                <div class="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
+                                    <div @click="file.open = !file.open; if(file.open && !file.loaded && file.view_url && file.display_type !== 'image' && file.display_type !== 'pdf') { file.loading = true; fetch(file.view_url).then(r => r.text()).then(t => { file.content = t; file.loaded = true; file.loading = false; }).catch(() => { file.content = 'Error'; file.loaded = true; file.loading = false; }); } else if (file.open) { file.loaded = true; }"
+                                        class="px-3 py-2 bg-gray-50 dark:bg-gray-800/50 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800 transition flex items-center justify-between">
+                                        <div class="flex items-center gap-2">
+                                            <span class="text-sm font-medium text-gray-900 dark:text-gray-100"
+                                                x-text="file.filename"></span>
+                                            <span
+                                                class="text-xs px-1.5 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-500"
+                                                x-text="file.extension"></span>
+                                        </div>
+                                        <svg class="w-4 h-4 text-gray-400 transition-transform"
+                                            :class="file.open ? 'rotate-180' : ''" fill="none" stroke="currentColor"
+                                            viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M19 9l-7 7-7-7" />
+                                        </svg>
+                                    </div>
+                                    <div x-show="file.open" x-collapse>
+                                        <div class="p-3 border-t border-gray-200 dark:border-gray-700">
+                                            <div x-show="file.loading" class="text-center py-3 text-xs text-gray-400">
+                                                Loading...</div>
+                                            <div
+                                                x-show="!file.loading && (file.display_type === 'code' || file.display_type === 'text' || file.display_type === 'notebook' || file.display_type === 'docx')">
+                                                <pre
+                                                    class="bg-gray-900 text-gray-100 rounded-xl p-3 overflow-x-auto text-xs leading-relaxed max-h-72 overflow-y-auto"><code x-text="file.content || ''"></code></pre>
+                                            </div>
+                                            <div x-show="!file.loading && file.display_type === 'image'"
+                                                class="flex justify-center">
+                                                <img :src="file.view_url" :alt="file.filename"
+                                                    class="max-w-full max-h-72 rounded-xl border border-gray-200 dark:border-gray-700">
+                                            </div>
+                                            <div x-show="!file.loading && file.display_type === 'pdf'">
+                                                <embed :src="file.view_url" type="application/pdf"
+                                                    class="w-full h-72 rounded-xl border border-gray-200 dark:border-gray-700">
+                                            </div>
+                                            <div x-show="!file.loading && file.display_type === 'binary'"
+                                                class="text-center py-3">
+                                                <a x-show="file.view_url" :href="file.view_url" target="_blank"
+                                                    class="text-xs text-primary-500 hover:underline">Download</a>
+                                            </div>
+                                            <div x-show="!file.exists" class="text-center py-3 text-xs text-gray-400">
+                                                File not found</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                            <div x-show="filesList.length === 0" class="text-center py-3 text-xs text-gray-400">No files
+                                found.</div>
+                        </div>
+                    </div>
+
+                    <!-- Override controls -->
+                    <div class="border-t border-gray-200 dark:border-gray-800 pt-4" x-data="{
+                        overrideScore: {{ sub.override_score if sub.override_score is not none else (sub.ai_score if sub.ai_score is not none else 0) }},
+                        overrideComments: '{{ (sub.override_comments or '') | replace("'", "\\'") }}',
+                        isReviewed: {{ 'true' if sub.is_reviewed else 'false' }},
+                        saving: false
+                    }">
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Instructor Override</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div>
+                                <label
+                                    class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Score</label>
+                                <input type="number" x-model="overrideScore" min="0" max="{{ session.max_score }}"
+                                    step="0.5"
+                                    class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none">
+                            </div>
+                            <div class="sm:col-span-2">
+                                <label
+                                    class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Comments</label>
+                                <input type="text" x-model="overrideComments" placeholder="Optional…"
+                                    class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none">
+                            </div>
+                        </div>
+                        <div class="mt-3 flex items-center gap-4">
+                            <label class="flex items-center gap-2 text-sm">
+                                <input type="checkbox" x-model="isReviewed"
+                                    class="rounded border-gray-300 dark:border-gray-700 text-primary-600 focus:ring-primary-500">
+                                Mark as Reviewed
+                            </label>
+                            <button
+                                @click="saveOverride({{ sub.id }}, overrideScore, overrideComments, isReviewed, $el)"
+                                :disabled="saving"
+                                class="px-4 py-1.5 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 transition disabled:opacity-50">
+                                <span x-show="!saving">Save Override</span>
+                                <span x-show="saving" x-cloak>Saving…</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                {% elif sub.status == 'error' %}
+                <div class="p-5">
+                    <p class="text-sm text-red-500">Grading failed for this student.</p>
+                    {% if sub.error_message %}
+                    <pre
+                        class="mt-2 text-xs text-red-400 bg-red-50 dark:bg-red-900/20 rounded-xl p-3 overflow-x-auto">{{ sub.error_message }}</pre>
+                    {% endif %}
+                </div>
+                {% else %}
+                <div class="p-5">
+                    <p class="text-sm text-gray-500 dark:text-gray-400">No grading results available yet.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function resultsPage() {
+        return {
+            searchQuery: '',
+            filterGrade: '',
+            filterConfidence: '',
+
+            matchesFilters(studentId, grade, confidence, status, isReviewed, isOverridden) {
+                if (this.searchQuery && !studentId.toLowerCase().includes(this.searchQuery.toLowerCase())) return false;
+                if (this.filterGrade && !grade.startsWith(this.filterGrade)) return false;
+                if (this.filterConfidence && confidence !== this.filterConfidence) return false;
+                return true;
+            },
+
+            async saveOverride(studentId, score, comments, isReviewed, btn) {
+                try {
+                    const resp = await fetch(`/session/{{ session.id }}/student/${studentId}/override`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ score: parseFloat(score), comments, is_reviewed: isReviewed })
+                    });
+                    if (resp.ok) {
+                        showToast('Override saved!', 'success');
+                    } else {
+                        showToast('Failed to save', 'error');
+                    }
+                } catch (e) {
+                    showToast('Network error', 'error');
+                }
+            }
+        };
+    }
+
+    // Grade distribution chart
+    document.addEventListener('DOMContentLoaded', function () {
+        const canvas = document.getElementById('gradeChart');
+        if (!canvas) return;
+
+        const gradeDist = {{ grade_dist | tojson if grade_dist else '{}'
+    }};
+    const orderedGrades = ['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'F'];
+    const labels = [];
+    const data = [];
+    const colors = [];
+    const colorMap = {
+        'A+': '#059669', 'A': '#10b981', 'A-': '#34d399',
+        'B+': '#2563eb', 'B': '#3b82f6', 'B-': '#60a5fa',
+        'C+': '#d97706', 'C': '#f59e0b', 'C-': '#fbbf24',
+        'D+': '#ea580c', 'D': '#f97316',
+        'F': '#dc2626',
+    };
+
+    for (const g of orderedGrades) {
+        if (gradeDist[g]) {
+            labels.push(g);
+            data.push(gradeDist[g]);
+            colors.push(colorMap[g] || '#6b7280');
+        }
+    }
+    for (const [g, count] of Object.entries(gradeDist)) {
+        if (!orderedGrades.includes(g)) {
+            labels.push(g);
+            data.push(count);
+            colors.push('#6b7280');
+        }
+    }
+
+    if (labels.length > 0) {
+        new Chart(canvas, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Students',
+                    data: data,
+                    backgroundColor: colors,
+                    borderRadius: 8,
+                    barPercentage: 0.7,
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: { beginAtZero: true, ticks: { stepSize: 1, precision: 0 } },
+                    x: { grid: { display: false } }
+                }
+            }
+        });
+    }
+});
+</script>
+{% endblock %}

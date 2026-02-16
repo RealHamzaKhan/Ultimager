@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}AI Grading System — Home{% endblock %}
+
+{% block content %}
+<div class="space-y-8 animate-fade-in">
+    <!-- Hero Header -->
+    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+        <div>
+            <h1 class="text-3xl font-bold tracking-tight">
+                <span class="gradient-text">Grading Sessions</span>
+            </h1>
+            <p class="mt-2 text-gray-500 dark:text-gray-400">Manage your AI-powered grading sessions</p>
+        </div>
+        <a href="/session/new"
+            class="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-primary-600 to-purple-600 text-white font-semibold rounded-xl hover:from-primary-700 hover:to-purple-700 transition-all shadow-lg shadow-primary-500/25 hover:shadow-primary-500/40 hover:scale-[1.02] active:scale-[0.98]">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+            New Session
+        </a>
+    </div>
+
+    {% if sessions %}
+    <!-- Stats Overview -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div class="glass rounded-xl p-4 text-center">
+            <div class="text-2xl font-bold gradient-text">{{ sessions|length }}</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">Total Sessions</div>
+        </div>
+        <div class="glass rounded-xl p-4 text-center">
+            <div class="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{{ sessions|selectattr('status',
+                'equalto', 'completed')|list|length }}</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">Completed</div>
+        </div>
+        <div class="glass rounded-xl p-4 text-center">
+            <div class="text-2xl font-bold text-amber-600 dark:text-amber-400">{{ sessions|selectattr('status',
+                'equalto', 'grading')|list|length }}</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">In Progress</div>
+        </div>
+        <div class="glass rounded-xl p-4 text-center">
+            <div class="text-2xl font-bold text-gray-600 dark:text-gray-400">{{ sessions|selectattr('status', 'equalto',
+                'pending')|list|length }}</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">Pending</div>
+        </div>
+    </div>
+
+    <!-- Session Cards -->
+    <div class="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+        {% for s in sessions %}
+        <a href="/session/{{ s.id }}"
+            class="card-hover block bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6 group relative overflow-hidden">
+            <!-- Gradient accent line -->
+            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r
+                {% if s.status == 'completed' %}from-emerald-400 to-emerald-600
+                {% elif s.status == 'grading' %}from-amber-400 to-amber-600
+                {% elif s.status == 'failed' or s.status == 'completed_with_errors' %}from-red-400 to-red-600
+                {% else %}from-gray-300 to-gray-400 dark:from-gray-700 dark:to-gray-600{% endif %}"></div>
+
+            <div class="flex items-start justify-between gap-3">
+                <h3
+                    class="text-lg font-semibold group-hover:text-primary-600 dark:group-hover:text-primary-400 transition leading-tight">
+                    {{ s.title }}</h3>
+                {% if s.status == 'completed' %}
+                <span
+                    class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 whitespace-nowrap">
+                    <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd"
+                            d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+                            clip-rule="evenodd" />
+                    </svg>
+                    Done
+                </span>
+                {% elif s.status == 'grading' %}
+                <span
+                    class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 whitespace-nowrap">
+                    <svg class="animate-spin w-3 h-3 mr-1" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    Grading
+                </span>
+                {% elif s.status == 'completed_with_errors' %}
+                <span
+                    class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300 whitespace-nowrap">
+                    ⚠ Partial
+                </span>
+                {% elif s.status == 'failed' %}
+                <span
+                    class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 whitespace-nowrap">
+                    Failed
+                </span>
+                {% else %}
+                <span
+                    class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 whitespace-nowrap">Pending</span>
+                {% endif %}
+            </div>
+
+            <p class="mt-3 text-sm text-gray-500 dark:text-gray-400 line-clamp-2 leading-relaxed">{{ (s.description or
+                'No description')[:120] }}{% if (s.description or '')|length > 120 %}…{% endif %}</p>
+
+            <div class="mt-5 flex items-center justify-between text-xs text-gray-400 dark:text-gray-500">
+                <span class="flex items-center gap-1.5">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                    {{ s.total_students }} students
+                </span>
+                <span>{{ s.created_at.strftime('%b %d, %Y') if s.created_at else 'N/A' }}</span>
+            </div>
+
+            {% if s.total_students > 0 %}
+            <div class="mt-3 w-full bg-gray-100 dark:bg-gray-800 rounded-full h-1.5 overflow-hidden">
+                <div class="bg-gradient-to-r from-primary-500 to-purple-500 h-full rounded-full transition-all duration-500"
+                    style="width: {{ ((s.graded_count or 0) / s.total_students * 100) if s.total_students > 0 else 0 }}%">
+                </div>
+            </div>
+            {% endif %}
+        </a>
+        {% endfor %}
+    </div>
+    {% else %}
+    <!-- Empty State -->
+    <div
+        class="text-center py-24 bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 animate-slide-up">
+        <div
+            class="w-20 h-20 mx-auto bg-gradient-to-br from-primary-100 to-purple-100 dark:from-primary-900/40 dark:to-purple-900/40 rounded-2xl flex items-center justify-center mb-6">
+            <svg class="h-10 w-10 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+        </div>
+        <h3 class="text-xl font-semibold">No grading sessions yet</h3>
+        <p class="mt-2 text-gray-500 dark:text-gray-400 max-w-sm mx-auto">Create your first session to start grading
+            student submissions with AI.</p>
+        <a href="/session/new"
+            class="mt-8 inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-primary-600 to-purple-600 text-white font-semibold rounded-xl hover:from-primary-700 hover:to-purple-700 transition shadow-lg shadow-primary-500/25">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+            Create First Session
+        </a>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

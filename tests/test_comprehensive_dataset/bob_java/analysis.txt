@@ -1,0 +1,7 @@
+BST Complexity Analysis
+=======================
+Insert: O(log n) average, O(n) worst
+Search: O(log n) average, O(n) worst  
+Delete: O(log n) average, O(n) worst
+Space:  O(n) overall, O(h) for recursion stack
+The worst case happens when the tree degenerates into a linked list.

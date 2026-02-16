@@ -1,0 +1,940 @@
+{% extends "base.html" %}
+{% block title %}{{ session.title }} — AI Grading System{% endblock %}
+
+{% block content %}
+<div x-data="gradingSession()" x-init="init()" class="space-y-6 animate-fade-in">
+    <!-- Breadcrumb -->
+    <div>
+        <a href="/"
+            class="inline-flex items-center gap-1.5 text-sm text-primary-600 dark:text-primary-400 hover:underline font-medium">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+            </svg>
+            All Sessions
+        </a>
+    </div>
+
+    <!-- Session header -->
+    <div
+        class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6 relative overflow-hidden">
+        <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-primary-500 to-purple-500"></div>
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div>
+                <h1 class="text-2xl font-bold">{{ session.title }}</h1>
+                <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">Created {{ session.created_at.strftime('%b %d,
+                    %Y at %H:%M') if session.created_at else 'N/A' }}</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <template x-if="status === 'completed' || status === 'completed_with_errors'">
+                    <span
+                        class="px-3 py-1.5 rounded-lg text-sm font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">Completed</span>
+                </template>
+                <template x-if="status === 'grading'">
+                    <span
+                        class="px-3 py-1.5 rounded-lg text-sm font-semibold bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 flex items-center gap-1.5">
+                        <svg class="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+                            <path class="opacity-75" fill="currentColor"
+                                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        Grading...
+                    </span>
+                </template>
+                <template x-if="status === 'pending'">
+                    <span
+                        class="px-3 py-1.5 rounded-lg text-sm font-semibold bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">Pending</span>
+                </template>
+                <a x-bind:href="'/session/' + sessionId + '/results'" x-show="hasResults"
+                    class="px-3 py-1.5 rounded-lg text-sm font-semibold bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 hover:bg-blue-200 transition">
+                    View Results
+                </a>
+            </div>
+        </div>
+
+        <div class="mt-5 grid grid-cols-1 md:grid-cols-2 gap-5 text-sm">
+            <div>
+                <h4 class="font-semibold text-gray-700 dark:text-gray-300 mb-1">Description</h4>
+                <p class="text-gray-500 dark:text-gray-400 whitespace-pre-wrap leading-relaxed">{{ session.description
+                    or 'No description provided' }}</p>
+            </div>
+            <div>
+                <h4 class="font-semibold text-gray-700 dark:text-gray-300 mb-1">Rubric</h4>
+                <pre
+                    class="text-gray-500 dark:text-gray-400 whitespace-pre-wrap text-xs bg-gray-50 dark:bg-gray-800 rounded-xl p-4 leading-relaxed">{{ session.rubric or 'No rubric provided' }}</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Upload ZIP -->
+    {% if session.total_students == 0 %}
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6"
+        x-data="uploadWidget()">
+        <h2 class="text-lg font-semibold mb-4">Upload Student Submissions</h2>
+        <form action="/session/{{ session.id }}/upload" method="post" enctype="multipart/form-data" class="space-y-4"
+            x-ref="uploadForm">
+            <div class="border-2 border-dashed rounded-2xl p-10 text-center transition cursor-pointer"
+                :class="dragging ? 'border-primary-400 bg-primary-50 dark:bg-primary-900/20' : 'border-gray-300 dark:border-gray-700 hover:border-primary-400 hover:bg-primary-50/50 dark:hover:bg-primary-900/10'"
+                @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false"
+                @drop.prevent="handleDrop($event)" @click="$refs.zipInput.click()">
+                <div
+                    class="w-14 h-14 mx-auto bg-gradient-to-br from-primary-100 to-purple-100 dark:from-primary-900/40 dark:to-purple-900/40 rounded-2xl flex items-center justify-center mb-4">
+                    <svg class="h-7 w-7 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                            d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                    </svg>
+                </div>
+                <p class="text-sm text-gray-600 dark:text-gray-400" x-show="!fileName">Drag and drop your master ZIP
+                    file here, or click to browse</p>
+                <p class="text-sm text-emerald-600 dark:text-emerald-400 font-semibold" x-show="fileName" x-cloak
+                    x-text="'Selected: ' + fileName"></p>
+                <input type="file" name="zip_file" accept=".zip,.rar,.7z,.tar,.tar.gz,.tgz" x-ref="zipInput"
+                    class="hidden" @change="handleFileSelect($event)" @click.stop>
+                <p class="mt-2 text-xs text-gray-400">.zip, .rar, .7z, .tar.gz files</p>
+            </div>
+            <button type="submit"
+                class="px-6 py-3 bg-gradient-to-r from-primary-600 to-purple-600 text-white font-semibold rounded-xl hover:from-primary-700 hover:to-purple-700 transition-all shadow-lg shadow-primary-500/25 disabled:opacity-50 disabled:cursor-not-allowed"
+                :disabled="!fileName" x-text="uploading ? 'Uploading...' : 'Upload and Extract'">
+                Upload and Extract
+            </button>
+        </form>
+    </div>
+    {% endif %}
+
+    <!-- Grading Controls and Progress -->
+    {% if session.total_students > 0 %}
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
+        <div class="flex items-center justify-between mb-5">
+            <h2 class="text-lg font-semibold">
+                Students
+                <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span x-text="gradedCount"></span> /
+                    <span x-text="totalStudents"></span> graded)</span>
+            </h2>
+            <div class="flex gap-3 flex-wrap">
+                <template x-if="status !== 'grading' && status !== 'completed' && status !== 'completed_with_errors'">
+                    <button @click="startGrading()"
+                        class="px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white text-sm font-semibold rounded-xl hover:from-emerald-600 hover:to-emerald-700 transition-all shadow-lg shadow-emerald-500/25 disabled:opacity-50"
+                        :disabled="isGrading">
+                        <span x-show="!isGrading">Start AI Grading</span>
+                        <span x-show="isGrading" x-cloak class="flex items-center gap-2">
+                            <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                                    stroke-width="4" />
+                                <path class="opacity-75" fill="currentColor"
+                                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            Starting...
+                        </span>
+                    </button>
+                </template>
+                <template x-if="failedCount > 0">
+                    <button @click="retryFailed()"
+                        class="px-4 py-2 text-sm font-medium text-orange-700 dark:text-orange-300 border border-orange-300 dark:border-orange-700 rounded-xl hover:bg-orange-50 dark:hover:bg-orange-900/20 transition">
+                        Retry Failed (<span x-text="failedCount"></span>)
+                    </button>
+                </template>
+                <template x-if="status === 'completed' || status === 'completed_with_errors' || hasResults">
+                    <div class="flex gap-2">
+                        <a x-bind:href="'/session/' + sessionId + '/export/csv'"
+                            class="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-xl hover:bg-blue-700 transition shadow flex items-center gap-1.5">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            CSV
+                        </a>
+                        <a x-bind:href="'/session/' + sessionId + '/export/json'"
+                            class="px-4 py-2 bg-purple-600 text-white text-sm font-medium rounded-xl hover:bg-purple-700 transition shadow flex items-center gap-1.5">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            JSON
+                        </a>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Progress bar -->
+        <div x-show="isGrading || status === 'grading'" x-cloak class="mb-6">
+            <div class="flex items-center justify-between text-sm text-gray-500 dark:text-gray-400 mb-2">
+                <span class="flex items-center gap-2">
+                    <span x-show="currentStudent">
+                        Grading: <strong x-text="currentStudent" class="text-gray-700 dark:text-gray-200"></strong>
+                    </span>
+                    <span x-show="!currentStudent" class="text-gray-400">Initializing...</span>
+                    <span x-show="currentStage" x-text="currentStage" class="text-xs text-gray-400 italic"></span>
+                </span>
+                <span class="font-semibold"
+                    x-text="totalStudents > 0 ? Math.round((gradedCount / totalStudents) * 100) + '%' : '0%'"></span>
+            </div>
+            <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-3 overflow-hidden">
+                <div class="bg-gradient-to-r from-emerald-500 to-emerald-400 h-full rounded-full transition-all duration-500 ease-out"
+                    :style="'width: ' + (totalStudents > 0 ? (gradedCount / totalStudents * 100) : 0) + '%'"></div>
+            </div>
+            <div class="mt-2 flex justify-between text-xs text-gray-400">
+                <span x-text="gradedCount + ' of ' + totalStudents + ' students graded'"></span>
+                <span x-show="failedCount > 0" x-text="failedCount + ' failed'" class="text-red-500"></span>
+            </div>
+        </div>
+
+        <!-- Student Cards -->
+        <div class="space-y-3">
+            <template x-for="student in students" :key="student.id">
+                <div class="border border-gray-200 dark:border-gray-800 rounded-xl overflow-hidden transition-all duration-300"
+                    :class="student.status === 'grading' ? 'ring-2 ring-amber-400 dark:ring-amber-600' : ''">
+                    <!-- Card Header -->
+                    <div @click="student.expanded = !student.expanded"
+                        class="p-4 bg-gray-50 dark:bg-gray-800/50 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-4">
+                                <div class="flex-shrink-0">
+                                    <template x-if="student.status === 'pending'">
+                                        <div class="w-3 h-3 rounded-full bg-gray-300 dark:bg-gray-600"></div>
+                                    </template>
+                                    <template x-if="student.status === 'grading'">
+                                        <div class="w-3 h-3 rounded-full bg-amber-400 animate-pulse"></div>
+                                    </template>
+                                    <template x-if="student.status === 'graded'">
+                                        <div class="w-3 h-3 rounded-full bg-emerald-500"></div>
+                                    </template>
+                                    <template x-if="student.status === 'error'">
+                                        <div class="w-3 h-3 rounded-full bg-red-500"></div>
+                                    </template>
+                                </div>
+                                <div>
+                                    <h3 class="font-semibold text-gray-900 dark:text-gray-100"
+                                        x-text="student.student_identifier"></h3>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400">
+                                        <span
+                                            x-text="(student.files && student.files.length) || student.file_count || 0"></span>
+                                        files
+                                    </p>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-4">
+                                <template x-if="student.status === 'graded' && student.final_score !== null">
+                                    <div class="text-right">
+                                        <div class="text-2xl font-bold"
+                                            :class="getGradeColorClass(student.ai_letter_grade)"
+                                            x-text="student.final_score + '%'"></div>
+                                        <div class="text-sm font-medium"
+                                            :class="getGradeColorClass(student.ai_letter_grade)"
+                                            x-text="student.ai_letter_grade"></div>
+                                    </div>
+                                </template>
+                                <svg class="w-5 h-5 text-gray-400 transform transition-transform duration-200"
+                                    :class="student.expanded ? 'rotate-180' : ''" fill="none" stroke="currentColor"
+                                    viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M19 9l-7 7-7-7" />
+                                </svg>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Expanded Details -->
+                    <div x-show="student.expanded" x-collapse
+                        class="border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900">
+                        <div class="p-5 space-y-5">
+                            <!-- Tab Navigation -->
+                            <div class="flex gap-1 border-b border-gray-200 dark:border-gray-700">
+                                <button @click="student.activeTab = 'feedback'"
+                                    class="px-4 py-2.5 text-sm font-medium rounded-t-lg transition-colors"
+                                    :class="(student.activeTab || 'feedback') === 'feedback' ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 border-b-2 border-primary-500' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'">
+                                    <span class="flex items-center gap-1.5">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                        </svg>
+                                        Feedback
+                                    </span>
+                                </button>
+                                <button @click="student.activeTab = 'files'; loadStudentFiles(student)"
+                                    class="px-4 py-2.5 text-sm font-medium rounded-t-lg transition-colors"
+                                    :class="student.activeTab === 'files' ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 border-b-2 border-primary-500' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'">
+                                    <span class="flex items-center gap-1.5">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                        </svg>
+                                        Files
+                                        <span class="text-xs bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded-full"
+                                            x-text="(student.files && student.files.length) || student.file_count || 0"></span>
+                                    </span>
+                                </button>
+                            </div>
+
+                            <!-- ===== FEEDBACK TAB ===== -->
+                            <div x-show="(student.activeTab || 'feedback') === 'feedback'">
+                                <template x-if="student.status === 'graded'">
+                                    <div class="space-y-5">
+                                        <!-- Score + Confidence Summary -->
+                                        <div class="flex items-center gap-4 flex-wrap">
+                                            <div class="flex items-center gap-2 text-sm">
+                                                <span class="text-gray-500">Confidence:</span>
+                                                <span class="px-2 py-0.5 rounded-full text-xs font-semibold"
+                                                    :class="student.ai_confidence === 'high' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300' : student.ai_confidence === 'medium' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300' : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'"
+                                                    x-text="student.ai_confidence || 'N/A'"></span>
+                                            </div>
+                                            <div x-show="student.graded_at" class="text-xs text-gray-400">
+                                                Graded: <span
+                                                    x-text="student.graded_at ? new Date(student.graded_at).toLocaleString() : ''"></span>
+                                            </div>
+                                        </div>
+
+                                        <!-- Overall Feedback -->
+                                        <div x-show="student.ai_feedback">
+                                            <h4
+                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor"
+                                                    viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2"
+                                                        d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+                                                </svg>
+                                                Overall Feedback
+                                            </h4>
+                                            <div
+                                                class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-4">
+                                                <p class="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap leading-relaxed"
+                                                    x-text="student.ai_feedback"></p>
+                                            </div>
+                                        </div>
+
+                                        <!-- Rubric Breakdown -->
+                                        <div x-show="student.rubric_breakdown && student.rubric_breakdown.length > 0">
+                                            <h4
+                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor"
+                                                    viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2"
+                                                        d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                                                </svg>
+                                                Rubric Breakdown
+                                            </h4>
+                                            <div class="space-y-2">
+                                                <template x-for="(item, idx) in student.rubric_breakdown" :key="idx">
+                                                    <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                                        <div class="flex items-center justify-between mb-1">
+                                                            <span
+                                                                class="text-sm font-medium text-gray-700 dark:text-gray-300 capitalize"
+                                                                x-text="item.criterion || 'Criterion ' + (idx + 1)"></span>
+                                                            <span class="text-sm font-bold"
+                                                                x-text="(item.score || 0) + '/' + (item.max || item.max_score || 0)"></span>
+                                                        </div>
+                                                        <div
+                                                            class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 mt-1 mb-2">
+                                                            <div class="bg-gradient-to-r from-primary-500 to-purple-500 h-full rounded-full transition-all duration-500"
+                                                                :style="'width: ' + ((item.score || 0) / (item.max || item.max_score || 1) * 100) + '%'">
+                                                            </div>
+                                                        </div>
+                                                        <p x-show="item.feedback || item.justification"
+                                                            x-text="item.feedback || item.justification"
+                                                            class="text-xs text-gray-500 dark:text-gray-400"></p>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </div>
+
+                                        <!-- Strengths -->
+                                        <div x-show="student.strengths && student.strengths.length > 0">
+                                            <h4
+                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor"
+                                                    viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2" d="M5 13l4 4L19 7" />
+                                                </svg>
+                                                Strengths
+                                            </h4>
+                                            <div
+                                                class="bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded-xl p-4">
+                                                <ul class="space-y-1.5">
+                                                    <template x-for="(s, i) in student.strengths" :key="i">
+                                                        <li
+                                                            class="text-sm text-emerald-800 dark:text-emerald-200 flex items-start gap-2">
+                                                            <span class="text-emerald-500 mt-0.5">&bull;</span>
+                                                            <span x-text="s"></span>
+                                                        </li>
+                                                    </template>
+                                                </ul>
+                                            </div>
+                                        </div>
+
+                                        <!-- Weaknesses -->
+                                        <div x-show="student.weaknesses && student.weaknesses.length > 0">
+                                            <h4
+                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                <svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor"
+                                                    viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2"
+                                                        d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.27 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                                                </svg>
+                                                Weaknesses
+                                            </h4>
+                                            <div
+                                                class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4">
+                                                <ul class="space-y-1.5">
+                                                    <template x-for="(w, i) in student.weaknesses" :key="i">
+                                                        <li
+                                                            class="text-sm text-amber-800 dark:text-amber-200 flex items-start gap-2">
+                                                            <span class="text-amber-500 mt-0.5">&bull;</span>
+                                                            <span x-text="w"></span>
+                                                        </li>
+                                                    </template>
+                                                </ul>
+                                            </div>
+                                        </div>
+
+                                        <!-- Critical Errors -->
+                                        <div x-show="student.critical_errors && student.critical_errors.length > 0">
+                                            <h4
+                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor"
+                                                    viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                                                </svg>
+                                                Critical Errors
+                                            </h4>
+                                            <div
+                                                class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4">
+                                                <ul class="space-y-1.5">
+                                                    <template x-for="(e, i) in student.critical_errors" :key="i">
+                                                        <li
+                                                            class="text-sm text-red-800 dark:text-red-200 flex items-start gap-2">
+                                                            <span class="text-red-500 mt-0.5">&bull;</span>
+                                                            <span x-text="e"></span>
+                                                        </li>
+                                                    </template>
+                                                </ul>
+                                            </div>
+                                        </div>
+
+                                        <!-- Suggestions -->
+                                        <div x-show="student.suggestions_for_improvement">
+                                            <h4
+                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor"
+                                                    viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2"
+                                                        d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                                                </svg>
+                                                Suggestions for Improvement
+                                            </h4>
+                                            <div
+                                                class="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-xl p-4">
+                                                <p class="text-sm text-indigo-800 dark:text-indigo-200 whitespace-pre-wrap leading-relaxed"
+                                                    x-text="student.suggestions_for_improvement"></p>
+                                            </div>
+                                        </div>
+
+                                        <!-- Override -->
+                                        <div class="border-t border-gray-200 dark:border-gray-800 pt-4">
+                                            <h4 class="font-semibold text-gray-900 dark:text-gray-100 mb-3">Instructor
+                                                Override</h4>
+                                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                                <div>
+                                                    <label
+                                                        class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Score
+                                                        (0-{{ session.max_score }})</label>
+                                                    <input type="number" x-model="student.overrideScore" min="0"
+                                                        max="{{ session.max_score }}" step="0.5"
+                                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none">
+                                                </div>
+                                                <div class="sm:col-span-2">
+                                                    <label
+                                                        class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Comments</label>
+                                                    <input type="text" x-model="student.overrideComments"
+                                                        placeholder="Optional comments..."
+                                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none">
+                                                </div>
+                                            </div>
+                                            <div class="mt-3 flex items-center gap-4">
+                                                <label class="flex items-center gap-2 text-sm">
+                                                    <input type="checkbox" x-model="student.isReviewed"
+                                                        class="rounded border-gray-300 dark:border-gray-700 text-primary-600 focus:ring-primary-500">
+                                                    Mark as Reviewed
+                                                </label>
+                                                <button @click="saveOverride(student)" :disabled="student.saving"
+                                                    class="px-4 py-1.5 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 transition disabled:opacity-50">
+                                                    <span x-show="!student.saving">Save Override</span>
+                                                    <span x-show="student.saving" x-cloak>Saving...</span>
+                                                </button>
+                                                <span x-show="student.overrideSaved"
+                                                    class="text-emerald-600 text-sm">Saved!</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </template>
+                                <template x-if="student.status === 'error'">
+                                    <div
+                                        class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4">
+                                        <p class="text-sm text-red-600 dark:text-red-300"
+                                            x-text="student.error_message || 'An error occurred during grading.'"></p>
+                                    </div>
+                                </template>
+                                <template x-if="student.status === 'grading'">
+                                    <div class="flex items-center gap-3 text-sm text-amber-600 dark:text-amber-400">
+                                        <svg class="animate-spin h-5 w-5" fill="none" viewBox="0 0 24 24">
+                                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                                                stroke-width="4" />
+                                            <path class="opacity-75" fill="currentColor"
+                                                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                        </svg>
+                                        Currently being graded by AI...
+                                    </div>
+                                </template>
+                                <template x-if="student.status === 'pending'">
+                                    <p class="text-gray-500 dark:text-gray-400 text-sm">Waiting to be graded...</p>
+                                </template>
+                            </div>
+
+                            <!-- ===== FILES TAB ===== -->
+                            <div x-show="student.activeTab === 'files'">
+                                <div x-show="student.filesLoading" class="flex items-center justify-center py-8">
+                                    <svg class="animate-spin h-6 w-6 text-primary-500" fill="none" viewBox="0 0 24 24">
+                                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                                            stroke-width="4" />
+                                        <path class="opacity-75" fill="currentColor"
+                                            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                    </svg>
+                                    <span class="ml-2 text-sm text-gray-500">Loading files...</span>
+                                </div>
+                                <div x-show="!student.filesLoading && student.loadedFiles" class="space-y-3">
+                                    <template x-for="(file, fi) in (student.loadedFiles || [])" :key="fi">
+                                        <div
+                                            class="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
+                                            <!-- File header -->
+                                            <div @click="file.open = !file.open; if(file.open && !file.loaded) loadFileContent(student, file)"
+                                                class="px-4 py-3 bg-gray-50 dark:bg-gray-800/50 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800 transition flex items-center justify-between">
+                                                <div class="flex items-center gap-3">
+                                                    <span class="text-lg"
+                                                        x-text="getFileIcon(file.display_type)"></span>
+                                                    <div>
+                                                        <span
+                                                            class="text-sm font-medium text-gray-900 dark:text-gray-100"
+                                                            x-text="file.filename"></span>
+                                                        <span class="text-xs text-gray-400 ml-2"
+                                                            x-text="formatFileSize(file.size)"></span>
+                                                        <span class="text-xs ml-2 px-1.5 py-0.5 rounded-full"
+                                                            :class="file.display_type === 'code' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300' : file.display_type === 'image' ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300' : file.display_type === 'pdf' ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300'"
+                                                            x-text="file.extension"></span>
+                                                    </div>
+                                                </div>
+                                                <svg class="w-4 h-4 text-gray-400 transition-transform"
+                                                    :class="file.open ? 'rotate-180' : ''" fill="none"
+                                                    stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        stroke-width="2" d="M19 9l-7 7-7-7" />
+                                                </svg>
+                                            </div>
+                                            <!-- File content -->
+                                            <div x-show="file.open" x-collapse>
+                                                <div class="p-4 border-t border-gray-200 dark:border-gray-700">
+                                                    <!-- Loading -->
+                                                    <div x-show="file.loading"
+                                                        class="text-center py-4 text-sm text-gray-400">Loading...</div>
+                                                    <!-- Code / Text -->
+                                                    <div
+                                                        x-show="!file.loading && (file.display_type === 'code' || file.display_type === 'text' || file.display_type === 'notebook' || file.display_type === 'docx')">
+                                                        <pre
+                                                            class="bg-gray-900 dark:bg-gray-950 text-gray-100 rounded-xl p-4 overflow-x-auto text-xs leading-relaxed max-h-96 overflow-y-auto"><code x-text="file.content || 'Unable to load file content'"></code></pre>
+                                                    </div>
+                                                    <!-- Image -->
+                                                    <div x-show="!file.loading && file.display_type === 'image'"
+                                                        class="flex justify-center">
+                                                        <img :src="file.view_url" :alt="file.filename"
+                                                            class="max-w-full max-h-96 rounded-xl border border-gray-200 dark:border-gray-700">
+                                                    </div>
+                                                    <!-- PDF -->
+                                                    <div x-show="!file.loading && file.display_type === 'pdf'">
+                                                        <embed :src="file.view_url" type="application/pdf"
+                                                            class="w-full h-96 rounded-xl border border-gray-200 dark:border-gray-700">
+                                                    </div>
+                                                    <!-- Unsupported -->
+                                                    <div x-show="!file.loading && file.display_type === 'binary'"
+                                                        class="text-center py-4">
+                                                        <p class="text-sm text-gray-500">Preview not available for this
+                                                            file type</p>
+                                                        <a x-show="file.view_url" :href="file.view_url" target="_blank"
+                                                            class="text-sm text-primary-500 hover:underline mt-1 inline-block">Download</a>
+                                                    </div>
+                                                    <!-- Not found -->
+                                                    <div x-show="!file.loading && !file.exists"
+                                                        class="text-center py-4">
+                                                        <p class="text-sm text-gray-400">File not found on server</p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </template>
+                                    <div x-show="!student.loadedFiles || student.loadedFiles.length === 0"
+                                        class="text-center py-6 text-sm text-gray-400">
+                                        No files found for this student.
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+        <!-- Empty State -->
+        <div x-show="students.length === 0" class="text-center py-12">
+            <p class="text-gray-500 dark:text-gray-400">No students uploaded yet.</p>
+        </div>
+    </div>
+
+    <!-- Delete session -->
+    <div class="flex justify-end">
+        <form action="/session/{{ session.id }}/delete" method="post"
+            onsubmit="return confirm('Are you sure you want to delete this session? This cannot be undone.')">
+            <button type="submit"
+                class="px-4 py-2 text-sm text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800 rounded-xl hover:bg-red-50 dark:hover:bg-red-900/30 transition">
+                Delete Session
+            </button>
+        </form>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function uploadWidget() {
+        return {
+            dragging: false,
+            fileName: '',
+            uploading: false,
+            handleDrop(event) {
+                this.dragging = false;
+                var files = event.dataTransfer.files;
+                if (files.length > 0) {
+                    this.$refs.zipInput.files = files;
+                    this.fileName = files[0].name;
+                }
+            },
+            handleFileSelect(event) {
+                var files = event.target.files;
+                this.fileName = files.length > 0 ? files[0].name : '';
+            }
+        };
+    }
+
+    function gradingSession() {
+        var sid = {{ session.id }};
+    var initStatus = '{{ session.status }}';
+    var initTotal = {{ session.total_students or 0 }};
+    var initGraded = {{ session.graded_count or 0 }};
+    var initIsGrading = {% if session.status == 'grading' %}true{% else %} false{% endif %};
+    var initHasResults = {% if (session.graded_count or 0) > 0 %}true{% else %} false{% endif %};
+    var initSubmissions = {{ submissions_json| safe }};
+
+    return {
+        sessionId: sid,
+        status: initStatus,
+        totalStudents: initTotal,
+        gradedCount: initGraded,
+        currentStudent: '',
+        currentStage: '',
+        isGrading: initIsGrading,
+        sseStatus: 'disconnected',
+        failedCount: 0,
+        hasResults: initHasResults,
+        students: [],
+        eventSource: null,
+        reconnectAttempts: 0,
+        maxReconnectAttempts: 5,
+
+        init() {
+            try {
+                this.students = initSubmissions.map(function (s) {
+                    return Object.assign({}, s, {
+                        expanded: false,
+                        overrideScore: s.is_overridden ? s.override_score : (s.ai_score || 0),
+                        overrideComments: s.override_comments || '',
+                        isReviewed: s.is_reviewed || false,
+                        saving: false,
+                        overrideSaved: false,
+                        files: s.files || [],
+                        activeTab: 'feedback',
+                        loadedFiles: null,
+                        filesLoading: false
+                    });
+                });
+            } catch (e) {
+                console.error('Failed to parse submissions:', e);
+                this.students = [];
+            }
+
+            this.hasResults = this.students.some(function (s) { return s.status === 'graded'; });
+            this.failedCount = this.students.filter(function (s) { return s.status === 'error'; }).length;
+
+            if (this.status === 'grading') {
+                this.isGrading = true;
+                this.connectSSE();
+            }
+        },
+
+        startGrading: function () {
+            var self = this;
+            self.isGrading = true;
+            self.sseStatus = 'connecting';
+            fetch('/session/' + self.sessionId + '/grade', { method: 'POST' })
+                .then(function (resp) { return resp.json().then(function (data) { return { ok: resp.ok, data: data }; }); })
+                .then(function (result) {
+                    if (result.ok) {
+                        showToast('Grading started!', 'success');
+                        self.connectSSE();
+                    } else {
+                        showToast(result.data.message || 'Failed to start grading', 'error');
+                        self.isGrading = false;
+                        self.sseStatus = 'error';
+                    }
+                })
+                .catch(function () {
+                    showToast('Network error', 'error');
+                    self.isGrading = false;
+                    self.sseStatus = 'error';
+                });
+        },
+
+        retryFailed: function () {
+            var self = this;
+            fetch('/session/' + self.sessionId + '/retry-failed', { method: 'POST' })
+                .then(function (resp) { return resp.json().then(function (data) { return { ok: resp.ok, data: data }; }); })
+                .then(function (result) {
+                    if (result.ok) {
+                        showToast(result.data.message, 'success');
+                        setTimeout(function () { location.reload(); }, 500);
+                    } else {
+                        showToast(result.data.message || 'Failed to retry', 'error');
+                    }
+                })
+                .catch(function () { showToast('Network error', 'error'); });
+        },
+
+        connectSSE: function () {
+            var self = this;
+            if (self.eventSource) self.eventSource.close();
+
+            self.sseStatus = 'connecting';
+            self.eventSource = new EventSource('/session/' + self.sessionId + '/grade-stream');
+
+            self.eventSource.onopen = function () {
+                self.sseStatus = 'connected';
+                self.reconnectAttempts = 0;
+            };
+
+            self.eventSource.onmessage = function (event) {
+                try {
+                    var data = JSON.parse(event.data);
+                    self.handleSSEMessage(data);
+                } catch (e) {
+                    console.error('SSE parse error:', e);
+                }
+            };
+
+            self.eventSource.onerror = function () {
+                self.sseStatus = 'error';
+                self.eventSource.close();
+                if (self.isGrading && self.reconnectAttempts < self.maxReconnectAttempts) {
+                    self.reconnectAttempts++;
+                    setTimeout(function () { self.connectSSE(); }, 2000 * self.reconnectAttempts);
+                }
+            };
+        },
+
+        handleSSEMessage: function (data) {
+            var self = this;
+            switch (data.type) {
+                case 'progress':
+                    self.gradedCount = data.graded_count || self.gradedCount;
+                    self.totalStudents = data.total || self.totalStudents;
+                    self.currentStudent = data.student || '';
+                    self.currentStage = data.stage || '';
+                    self.failedCount = data.failed_count || 0;
+                    self.status = 'grading';
+                    // Update the specific student card to show "grading" status
+                    for (var i = 0; i < self.students.length; i++) {
+                        if (self.students[i].student_identifier === data.student) {
+                            self.students[i].status = 'grading';
+                        }
+                    }
+                    break;
+                case 'student_complete':
+                    self.updateStudentFromResult(data);
+                    self.gradedCount = Math.max(self.gradedCount, data.graded_count || 0);
+                    self.failedCount = data.failed_count || 0;
+                    self.hasResults = true;
+                    break;
+                case 'student_error':
+                    // Mark the student as errored in real-time
+                    for (var j = 0; j < self.students.length; j++) {
+                        if (self.students[j].id === data.student_id) {
+                            self.students[j].status = 'error';
+                            self.students[j].error_message = data.error || 'Grading failed';
+                            break;
+                        }
+                    }
+                    self.gradedCount = data.graded_count || self.gradedCount;
+                    self.failedCount = data.failed_count || 0;
+                    break;
+                case 'complete':
+                    self.status = 'completed';
+                    self.isGrading = false;
+                    self.gradedCount = data.graded_count || self.totalStudents;
+                    self.failedCount = data.failed_count || 0;
+                    self.currentStudent = '';
+                    self.currentStage = '';
+                    self.hasResults = true;
+                    showToast(data.message || 'Grading completed!', 'success');
+                    self.closeSSE();
+                    break;
+                case 'error':
+                    showToast(data.message || 'Grading error occurred', 'error');
+                    break;
+            }
+        },
+
+        updateStudentFromResult: function (data) {
+            var self = this;
+            for (var i = 0; i < self.students.length; i++) {
+                if (self.students[i].id === data.student_id) {
+                    var result = data.result || {};
+                    var s = self.students[i];
+                    s.status = 'graded';
+                    s.ai_score = data.score;
+                    s.ai_letter_grade = data.grade;
+                    s.ai_confidence = data.confidence;
+                    s.final_score = s.is_overridden ? s.override_score : data.score;
+                    s.ai_feedback = result.overall_feedback;
+                    s.rubric_breakdown = result.rubric_breakdown;
+                    s.strengths = result.strengths;
+                    s.weaknesses = result.weaknesses;
+                    s.suggestions_for_improvement = result.suggestions_for_improvement;
+                    break;
+                }
+            }
+        },
+
+        saveOverride: function (student) {
+            var self = this;
+            student.saving = true;
+            student.overrideSaved = false;
+            fetch('/session/' + self.sessionId + '/student/' + student.id + '/override', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ score: parseFloat(student.overrideScore), comments: student.overrideComments, is_reviewed: student.isReviewed })
+            })
+                .then(function (resp) {
+                    if (resp.ok) {
+                        student.is_overridden = true;
+                        student.override_score = parseFloat(student.overrideScore);
+                        student.final_score = parseFloat(student.overrideScore);
+                        student.overrideSaved = true;
+                        showToast('Override saved!', 'success');
+                        setTimeout(function () { student.overrideSaved = false; }, 3000);
+                    } else {
+                        showToast('Failed to save override', 'error');
+                    }
+                })
+                .catch(function () { showToast('Network error', 'error'); })
+                .finally(function () { student.saving = false; });
+        },
+
+        closeSSE: function () {
+            if (this.eventSource) { this.eventSource.close(); this.eventSource = null; }
+            this.sseStatus = 'disconnected';
+        },
+
+        getGradeColorClass: function (grade) {
+            if (!grade) return 'text-gray-500';
+            if (grade.startsWith('A')) return 'text-emerald-600 dark:text-emerald-400';
+            if (grade.startsWith('B')) return 'text-blue-600 dark:text-blue-400';
+            if (grade.startsWith('C')) return 'text-amber-600 dark:text-amber-400';
+            if (grade.startsWith('D')) return 'text-orange-600 dark:text-orange-400';
+            return 'text-red-600 dark:text-red-400';
+        },
+
+        getConfidenceColor: function (confidence) {
+            if (!confidence) return 'text-gray-500';
+            if (confidence === 'high') return 'text-emerald-600 dark:text-emerald-400';
+            if (confidence === 'medium') return 'text-amber-600 dark:text-amber-400';
+            return 'text-red-600 dark:text-red-400';
+        },
+
+        loadStudentFiles: function (student) {
+            if (student.loadedFiles !== null) return; // already loaded
+            student.filesLoading = true;
+            var self = this;
+            fetch('/session/' + self.sessionId + '/student/' + student.id + '/files')
+                .then(function (resp) { return resp.json(); })
+                .then(function (files) {
+                    student.loadedFiles = files.map(function (f) {
+                        f.open = false;
+                        f.loading = false;
+                        f.loaded = false;
+                        f.content = null;
+                        return f;
+                    });
+                    student.filesLoading = false;
+                })
+                .catch(function () {
+                    student.loadedFiles = [];
+                    student.filesLoading = false;
+                });
+        },
+
+        loadFileContent: function (student, file) {
+            if (file.loaded || !file.view_url) return;
+            if (file.display_type === 'image' || file.display_type === 'pdf') {
+                file.loaded = true;
+                return; // images and PDFs load via direct URL in img/embed tags
+            }
+            file.loading = true;
+            fetch(file.view_url)
+                .then(function (resp) { return resp.text(); })
+                .then(function (text) {
+                    file.content = text;
+                    file.loaded = true;
+                    file.loading = false;
+                })
+                .catch(function () {
+                    file.content = 'Error loading file content';
+                    file.loaded = true;
+                    file.loading = false;
+                });
+        },
+
+        getFileIcon: function (displayType) {
+            var icons = {
+                'code': '📄',
+                'text': '📝',
+                'image': '🖼️',
+                'pdf': '📕',
+                'docx': '📘',
+                'notebook': '📓',
+                'binary': '📦'
+            };
+            return icons[displayType] || '📄';
+        },
+
+        formatFileSize: function (bytes) {
+            if (!bytes || bytes === 0) return '0 B';
+            var units = ['B', 'KB', 'MB', 'GB'];
+            var i = 0;
+            var size = bytes;
+            while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
+            return size.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+        }
+    };
+}
+</script>
+{% endblock %}

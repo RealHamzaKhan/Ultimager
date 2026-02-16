@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}New Session — AI Grading System{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto animate-fade-in">
+    <div class="mb-8">
+        <a href="/"
+            class="inline-flex items-center gap-1.5 text-sm text-primary-600 dark:text-primary-400 hover:underline font-medium">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+            </svg>
+            Back to sessions
+        </a>
+        <h1 class="mt-3 text-3xl font-bold tracking-tight"><span class="gradient-text">Create New Session</span></h1>
+        <p class="mt-2 text-gray-500 dark:text-gray-400">Set up assignment details and rubric before uploading
+            submissions.</p>
+    </div>
+
+    <form action="/session/new" method="post" enctype="multipart/form-data"
+        class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm p-8 space-y-7">
+
+        <!-- Title -->
+        <div>
+            <label for="title" class="block text-sm font-semibold mb-2">Assignment Title <span
+                    class="text-red-500">*</span></label>
+            <input type="text" id="title" name="title" required
+                class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-3 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition"
+                placeholder="e.g. Lab 4 — Linked List Implementation">
+        </div>
+
+        <!-- Description -->
+        <div>
+            <label for="description" class="block text-sm font-semibold mb-2">Assignment Description <span
+                    class="text-red-500">*</span></label>
+            <textarea id="description" name="description" rows="5" required
+                class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-3 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition"
+                placeholder="Describe what the assignment requires students to do..."></textarea>
+        </div>
+
+        <!-- Rubric -->
+        <div>
+            <label for="rubric" class="block text-sm font-semibold mb-2">Grading Rubric <span
+                    class="text-red-500">*</span></label>
+            <textarea id="rubric" name="rubric" rows="6" required
+                class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-3 text-sm font-mono focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition"
+                placeholder="Correctness: 40 points&#10;Code Quality & Style: 20 points&#10;Edge Cases & Error Handling: 15 points&#10;Documentation/Comments: 15 points&#10;Output/Report Quality: 10 points&#10;Total: 100"></textarea>
+        </div>
+
+        <!-- Max score -->
+        <div>
+            <label for="max_score" class="block text-sm font-semibold mb-2">Max Score</label>
+            <input type="number" id="max_score" name="max_score" value="100" min="1"
+                class="w-36 rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-3 text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition">
+        </div>
+
+        <!-- Test cases (optional) -->
+        <div x-data="{ show: false }" class="border-t border-gray-200 dark:border-gray-800 pt-6">
+            <button type="button" @click="show = !show"
+                class="flex items-center gap-2 text-sm text-primary-600 dark:text-primary-400 hover:underline font-semibold">
+                <svg class="w-4 h-4 transition-transform" :class="show ? 'rotate-90' : ''" fill="none"
+                    stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                </svg>
+                Advanced: Test Cases & Run Command
+            </button>
+            <div x-show="show" x-cloak class="mt-4 space-y-5 animate-fade-in">
+                <div>
+                    <label for="test_cases" class="block text-sm font-semibold mb-2">Test Cases (JSON array)</label>
+                    <textarea id="test_cases" name="test_cases" rows="6"
+                        class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-3 text-sm font-mono focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition"
+                        placeholder='[&#10;  {"input": "5\n3\n", "expected_output": "8", "description": "Basic addition", "points": 10},&#10;  {"input": "0\n0\n", "expected_output": "0", "description": "Zero case", "points": 5}&#10;]'></textarea>
+                </div>
+                <div>
+                    <label for="run_command" class="block text-sm font-semibold mb-2">Run Command</label>
+                    <input type="text" id="run_command" name="run_command"
+                        class="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 py-3 text-sm font-mono focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition"
+                        placeholder="e.g. python3 solution.py   or   javac Main.java && java Main">
+                    <p class="mt-1.5 text-xs text-gray-400">Leave blank to auto-detect from file extensions.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Submit -->
+        <div class="pt-6 border-t border-gray-200 dark:border-gray-800">
+            <button type="submit"
+                class="w-full sm:w-auto px-8 py-3.5 bg-gradient-to-r from-primary-600 to-purple-600 text-white font-semibold rounded-xl hover:from-primary-700 hover:to-purple-700 transition-all shadow-lg shadow-primary-500/25 hover:shadow-primary-500/40 hover:scale-[1.01] active:scale-[0.99]">
+                Create Session
+            </button>
+        </div>
+    </form>
+</div>
+{% endblock %}
