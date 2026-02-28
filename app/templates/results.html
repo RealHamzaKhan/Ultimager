@@ -2,7 +2,7 @@
 {% block title %}Results — {{ session.title }}{% endblock %}
 
 {% block content %}
-<div class="space-y-6 animate-fade-in" x-data="resultsPage()">
+<div class="space-y-6 animate-fade-in" x-data="resultsPage()" x-init="init()">
     <!-- Breadcrumb -->
     <div class="flex items-center gap-2 text-sm">
         <a href="/" class="text-primary-600 dark:text-primary-400 hover:underline font-medium">Sessions</a>
@@ -100,6 +100,208 @@
         </div>
     </div>
 
+    <!-- Detailed Tables -->
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
+        <div class="flex items-center justify-between flex-wrap gap-3 mb-4">
+            <h2 class="text-lg font-semibold">Detailed Analysis Tables</h2>
+            <div class="inline-flex rounded-xl border border-gray-200 dark:border-gray-700 p-1">
+                <button @click="activeTable = 'marks'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
+                    :class="activeTable === 'marks' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">Marks</button>
+                <button @click="activeTable = 'rubric'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
+                    :class="activeTable === 'rubric' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">Rubric</button>
+                <button @click="activeTable = 'ingestion'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
+                    :class="activeTable === 'ingestion' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">Ingestion</button>
+                <button @click="activeTable = 'llm'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
+                    :class="activeTable === 'llm' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">LLM Calls</button>
+            </div>
+        </div>
+
+        <div x-show="tableLoading" x-cloak class="rounded-xl border border-dashed border-primary-300/70 dark:border-primary-700/60 p-8 text-center">
+            <div class="inline-flex items-center gap-3 text-primary-600 dark:text-primary-300">
+                <svg class="w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="4"></circle>
+                    <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor" stroke-width="4"></path>
+                </svg>
+                <span class="text-sm font-medium">Loading detailed analytics...</span>
+            </div>
+        </div>
+
+        <!-- Marks Table -->
+        <div x-show="!tableLoading && activeTable === 'marks'" x-cloak class="overflow-x-auto">
+            <table class="min-w-full text-sm">
+                <thead class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                    <tr class="border-b border-gray-200 dark:border-gray-700">
+                        <th class="text-left py-2 pr-4">Student</th>
+                        <th class="text-left py-2 pr-4">Status</th>
+                        <th class="text-right py-2 pr-4">AI Score</th>
+                        <th class="text-right py-2 pr-4">Final Score</th>
+                        <th class="text-right py-2 pr-4">Delta</th>
+                        <th class="text-right py-2 pr-4">%</th>
+                        <th class="text-left py-2 pr-4">Grade</th>
+                        <th class="text-left py-2">Confidence</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in marks_rows %}
+                    <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                        <td class="py-2 pr-4 font-medium">{{ row.student_identifier }}</td>
+                        <td class="py-2 pr-4">
+                            <span class="px-2 py-0.5 rounded-md text-xs font-semibold
+                                {% if row.status == 'graded' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300
+                                {% elif row.status == 'error' %}bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300
+                                {% elif row.status == 'grading' %}bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300
+                                {% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300{% endif %}">
+                                {{ row.status }}
+                            </span>
+                        </td>
+                        <td class="py-2 pr-4 text-right">{{ row.ai_score if row.ai_score is not none else '-' }}</td>
+                        <td class="py-2 pr-4 text-right font-semibold">{{ row.final_score if row.final_score is not none else '-' }} / {{ session.max_score }}</td>
+                        <td class="py-2 pr-4 text-right">
+                            {% if row.delta is not none %}
+                            <span class="{% if row.delta > 0 %}text-emerald-600{% elif row.delta < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
+                                {{ '%+0.2f'|format(row.delta) }}
+                            </span>
+                            {% else %}-{% endif %}
+                        </td>
+                        <td class="py-2 pr-4 text-right">{{ row.percentage if row.percentage is not none else '-' }}</td>
+                        <td class="py-2 pr-4">{{ row.letter_grade or '-' }}</td>
+                        <td class="py-2">{{ row.confidence or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Rubric Table -->
+        <div x-show="!tableLoading && activeTable === 'rubric'" x-cloak class="overflow-x-auto">
+            <table class="min-w-full text-sm">
+                <thead class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                    <tr class="border-b border-gray-200 dark:border-gray-700">
+                        <th class="text-left py-2 pr-4">Criterion</th>
+                        <th class="text-right py-2 pr-4">Students</th>
+                        <th class="text-right py-2 pr-4">Avg Score</th>
+                        <th class="text-right py-2 pr-4">Avg Max</th>
+                        <th class="text-right py-2 pr-4">Attainment %</th>
+                        <th class="text-right py-2 pr-4">Min</th>
+                        <th class="text-right py-2">Max</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in rubric_rows %}
+                    <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                        <td class="py-2 pr-4 font-medium">{{ row.criterion }}</td>
+                        <td class="py-2 pr-4 text-right">{{ row.students_graded }}</td>
+                        <td class="py-2 pr-4 text-right">{{ row.avg_score }}</td>
+                        <td class="py-2 pr-4 text-right">{{ row.avg_max }}</td>
+                        <td class="py-2 pr-4 text-right">{{ row.attainment_pct }}</td>
+                        <td class="py-2 pr-4 text-right">{{ row.min_score }}</td>
+                        <td class="py-2 text-right">{{ row.max_score }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% if not rubric_rows %}
+            <p class="text-sm text-gray-500 py-2">No rubric analytics yet.</p>
+            {% endif %}
+        </div>
+
+        <!-- Ingestion Table -->
+        <div x-show="!tableLoading && activeTable === 'ingestion'" x-cloak class="space-y-4">
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Reports</p><p class="font-semibold">{{ ingestion_overview.students_with_report }}</p></div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Received</p><p class="font-semibold">{{ ingestion_overview.files_received }}</p></div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Parsed</p><p class="font-semibold">{{ ingestion_overview.files_parsed }}</p></div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Failed</p><p class="font-semibold">{{ ingestion_overview.files_failed }}</p></div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Text Chars</p><p class="font-semibold">{{ ingestion_overview.total_text_chars }}</p></div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Images</p><p class="font-semibold">{{ ingestion_overview.total_images }}</p></div>
+                <div class="bg-amber-50 dark:bg-amber-900/20 rounded-xl p-3"><p class="text-[11px] text-amber-700/70">Warnings</p><p class="font-semibold">{{ ingestion_overview.warnings }}</p></div>
+                <div class="bg-red-50 dark:bg-red-900/20 rounded-xl p-3"><p class="text-[11px] text-red-700/70">Errors</p><p class="font-semibold">{{ ingestion_overview.errors }}</p></div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full text-sm">
+                    <thead class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                        <tr class="border-b border-gray-200 dark:border-gray-700">
+                            <th class="text-left py-2 pr-4">Student</th>
+                            <th class="text-right py-2 pr-4">Received</th>
+                            <th class="text-right py-2 pr-4">Parsed</th>
+                            <th class="text-right py-2 pr-4">Failed</th>
+                            <th class="text-right py-2 pr-4">Text Chars</th>
+                            <th class="text-right py-2 pr-4">Images</th>
+                            <th class="text-right py-2 pr-4">Warnings</th>
+                            <th class="text-right py-2 pr-4">Errors</th>
+                            <th class="text-left py-2">Truncated</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in ingestion_rows %}
+                        <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                            <td class="py-2 pr-4 font-medium">{{ row.student_identifier }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.received }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.parsed }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.failed }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.total_text_chars }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.total_images }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.warnings_count }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.errors_count }}</td>
+                            <td class="py-2">{{ 'Yes' if row.content_truncated else 'No' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% if not ingestion_rows %}
+            <p class="text-sm text-gray-500">No ingestion reports available yet.</p>
+            {% endif %}
+        </div>
+
+        <!-- LLM Table -->
+        <div x-show="!tableLoading && activeTable === 'llm'" x-cloak class="space-y-4">
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Calls</p><p class="font-semibold">{{ llm_overview.calls }}</p></div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Prompt Tokens</p><p class="font-semibold">{{ llm_overview.prompt_tokens }}</p></div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Completion Tokens</p><p class="font-semibold">{{ llm_overview.completion_tokens }}</p></div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Total Tokens</p><p class="font-semibold">{{ llm_overview.total_tokens }}</p></div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Text Chars Sent</p><p class="font-semibold">{{ llm_overview.text_chars_sent }}</p></div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Images Sent</p><p class="font-semibold">{{ llm_overview.images_sent }}</p></div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full text-sm">
+                    <thead class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                        <tr class="border-b border-gray-200 dark:border-gray-700">
+                            <th class="text-left py-2 pr-4">Student</th>
+                            <th class="text-left py-2 pr-4">Provider</th>
+                            <th class="text-left py-2 pr-4">Model</th>
+                            <th class="text-right py-2 pr-4">Prompt</th>
+                            <th class="text-right py-2 pr-4">Completion</th>
+                            <th class="text-right py-2 pr-4">Total Tokens</th>
+                            <th class="text-right py-2 pr-4">Text Chars</th>
+                            <th class="text-right py-2 pr-4">Images</th>
+                            <th class="text-left py-2">Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in llm_rows %}
+                        <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                            <td class="py-2 pr-4 font-medium">{{ row.student_identifier }}</td>
+                            <td class="py-2 pr-4">{{ row.provider or '-' }}</td>
+                            <td class="py-2 pr-4 break-all">{{ row.model or '-' }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.prompt_tokens }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.completion_tokens }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.total_tokens }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.text_chars_sent }}</td>
+                            <td class="py-2 pr-4 text-right">{{ row.images_sent }}</td>
+                            <td class="py-2">{{ row.confidence or '-' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% if not llm_rows %}
+            <p class="text-sm text-gray-500">No LLM trace data available yet.</p>
+            {% endif %}
+        </div>
+    </div>
+
     <!-- Student results -->
     <div class="space-y-3">
         {% for sub in submissions %}
@@ -150,6 +352,7 @@
             <!-- Expanded details -->
             <div x-show="expanded" x-cloak x-collapse class="border-t border-gray-200 dark:border-gray-800">
                 {% set ai = sub.ai_result | from_json %}
+                {% set ingestion = sub.ingestion_report | from_json %}
                 {% if ai %}
                 <div class="p-5 space-y-5">
                     <!-- Overall feedback -->
@@ -158,6 +361,118 @@
                         <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed whitespace-pre-wrap">{{
                             ai.overall_feedback or 'No feedback available' }}</p>
                     </div>
+
+                    <!-- Confidence and Timestamp -->
+                    <div class="flex items-center gap-4 text-sm">
+                        <div class="flex items-center gap-2">
+                            <span class="text-gray-500">Confidence:</span>
+                            <span class="px-2 py-0.5 rounded-full text-xs font-semibold
+                                {% if ai.confidence == 'high' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300
+                                {% elif ai.confidence == 'medium' %}bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300
+                                {% else %}bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300{% endif %}">
+                                {{ ai.confidence|default('N/A') }}
+                            </span>
+                        </div>
+                        {% if ai.confidence_reasoning %}
+                        <span class="text-xs text-gray-400 italic">{{ ai.confidence_reasoning }}</span>
+                        {% endif %}
+                    </div>
+
+                    <!-- LLM Call Overview -->
+                    {% if ai.transparency and ai.transparency.llm_call %}
+                    <div class="bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-xl p-3">
+                        <h4 class="text-sm font-semibold text-purple-700 dark:text-purple-300 mb-2">LLM Call Overview</h4>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                            <div>
+                                <p class="text-purple-600/80">Model</p>
+                                <p class="font-semibold break-all">{{ ai.transparency.llm_call.model or 'N/A' }}</p>
+                            </div>
+                            <div>
+                                <p class="text-purple-600/80">Text Chars</p>
+                                <p class="font-semibold">{{ ai.transparency.text_chars_sent|default(0) }}</p>
+                            </div>
+                            <div>
+                                <p class="text-purple-600/80">Images</p>
+                                <p class="font-semibold">{{ ai.transparency.images_sent|default(0) }}</p>
+                            </div>
+                            <div>
+                                <p class="text-purple-600/80">Tokens</p>
+                                <p class="font-semibold">{{ ai.transparency.llm_call.usage.total_tokens if ai.transparency.llm_call.usage else 'N/A' }}</p>
+                            </div>
+                        </div>
+                        {% if ai.transparency.prompt_preview %}
+                        <details class="mt-2">
+                            <summary class="cursor-pointer text-xs font-medium text-purple-700 dark:text-purple-300">Prompt Preview</summary>
+                            <pre class="mt-2 text-[11px] bg-gray-900 text-gray-100 rounded-lg p-2 whitespace-pre-wrap">{{ ai.transparency.prompt_preview }}</pre>
+                        </details>
+                        {% endif %}
+                    </div>
+                    {% endif %}
+
+                    <!-- Ingestion Report -->
+                    {% if ingestion %}
+                    <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-3">
+                        <h4 class="text-sm font-semibold text-blue-700 dark:text-blue-300 mb-2">Ingestion Report</h4>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
+                            <div><p class="text-blue-600/80">Received</p><p class="font-semibold">{{ ingestion.summary.received|default(0) }}</p></div>
+                            <div><p class="text-blue-600/80">Parsed</p><p class="font-semibold">{{ ingestion.summary.parsed|default(0) }}</p></div>
+                            <div><p class="text-blue-600/80">Text Chars</p><p class="font-semibold">{{ ingestion.total_text_chars|default(0) }}</p></div>
+                            <div><p class="text-blue-600/80">Images</p><p class="font-semibold">{{ ingestion.total_images|default(0) }}</p></div>
+                        </div>
+                        {% if ingestion.files_parsed %}
+                        <div class="space-y-2">
+                            {% for file in ingestion.files_parsed %}
+                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 border border-blue-100 dark:border-blue-900/40">
+                                <div class="flex items-center justify-between">
+                                    <p class="text-xs font-semibold">{{ file.filename }}</p>
+                                    <p class="text-[11px] text-gray-500">{{ file.extraction_method|default('n/a') }}</p>
+                                </div>
+                                {% if file.image_previews %}
+                                <div class="mt-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+                                    {% for preview in file.image_previews %}
+                                    <div class="rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
+                                        <img src="{{ preview.data_url }}" alt="Extracted preview" class="w-full h-24 object-contain bg-gray-50 dark:bg-gray-900" />
+                                        <p class="px-1.5 py-1 text-[10px] text-gray-500">{{ preview.description or ('Page ' ~ preview.page) }}</p>
+                                    </div>
+                                    {% endfor %}
+                                </div>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endif %}
+
+                    <!-- Visual Content Analysis -->
+                    {% if ai.visual_content_analysis %}
+                    <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2 flex items-center gap-2">
+                            <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                            Visual Content Analysis
+                        </h4>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">
+                            Images reviewed: {{ ai.visual_content_analysis.images_reviewed|default(0) }}
+                        </p>
+                        {% if ai.visual_content_analysis.visual_accuracy %}
+                        <p class="text-xs text-gray-500 dark:text-gray-400">
+                            Visual accuracy: {{ ai.visual_content_analysis.visual_accuracy }}
+                        </p>
+                        {% endif %}
+                        {% if ai.visual_content_analysis.key_observations %}
+                        <ul class="mt-1 space-y-1">
+                            {% for obs in ai.visual_content_analysis.key_observations %}
+                            <li class="text-xs text-gray-500 dark:text-gray-400 flex items-start gap-1">
+                                <span class="text-purple-500 mt-0.5">•</span> {{ obs }}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                        {% endif %}
+                    </div>
+                    {% endif %}
 
                     <!-- Rubric breakdown -->
                     {% if ai.rubric_breakdown %}
@@ -190,6 +505,88 @@
                                 {% if item.justification or item.feedback %}
                                 <p class="text-xs text-gray-500 dark:text-gray-400">{{ item.justification or
                                     item.feedback }}</p>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <!-- Question Mapping -->
+                    {% if ai.question_mapping and ai.question_mapping|length > 0 %}
+                    <div>
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2 flex items-center gap-2">
+                            <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                            </svg>
+                            Question Breakdown
+                        </h4>
+                        <div class="space-y-2">
+                            {% for q in ai.question_mapping %}
+                            <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                <div class="flex items-center justify-between mb-1">
+                                    <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                                        Q{{ q.question_number }}: {{ q.question_text[:50] }}{% if q.question_text|length > 50 %}...{% endif %}
+                                    </span>
+                                    <div class="flex items-center gap-2">
+                                        {% set correctness = q.correctness|default('')|lower %}
+                                        <span class="text-xs px-2 py-0.5 rounded-full font-medium
+                                            {% if correctness == 'correct' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300
+                                            {% elif correctness == 'partially_correct' %}bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300
+                                            {% elif correctness == 'incorrect' %}bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300
+                                            {% else %}bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300{% endif %}">
+                                            {{ q.correctness|default('Not assessed') }}
+                                        </span>
+                                        <span class="text-sm font-bold">{{ q.score|default(0) }}/{{ q.max_points|default(0) }}</span>
+                                    </div>
+                                </div>
+                                {% if q.files_addressing and q.files_addressing|length > 0 %}
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">
+                                    Files: {{ q.files_addressing|join(', ') }}
+                                </p>
+                                {% endif %}
+                                {% if q.feedback %}
+                                <p class="text-xs text-gray-500 dark:text-gray-400">{{ q.feedback }}</p>
+                                {% endif %}
+                                {% if q.response_summary %}
+                                <p class="text-xs text-gray-400 dark:text-gray-500 mt-1 italic">{{ q.response_summary[:100] }}{% if q.response_summary|length > 100 %}...{% endif %}</p>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <!-- File Analysis -->
+                    {% if ai.file_analysis and ai.file_analysis|length > 0 %}
+                    <div>
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2 flex items-center gap-2">
+                            <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                            </svg>
+                            File Analysis
+                        </h4>
+                        <div class="space-y-2">
+                            {% for fa in ai.file_analysis %}
+                            <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                <div class="flex items-center justify-between mb-1">
+                                    <span class="text-sm font-medium">{{ fa.filename }}</span>
+                                    <span class="text-xs px-2 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300">{{ fa.file_type }}</span>
+                                </div>
+                                {% if fa.assessment %}
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ fa.assessment[:200] }}{% if fa.assessment|length > 200 %}...{% endif %}</p>
+                                {% endif %}
+                                {% if fa.issues_found and fa.issues_found|length > 0 %}
+                                <div class="mt-2">
+                                    {% for issue in fa.issues_found %}
+                                    <p class="text-xs text-red-500 dark:text-red-400 flex items-start gap-1">
+                                        <span class="mt-0.5">⚠️</span>
+                                        <span>{{ issue.description|default(issue) }}</span>
+                                    </p>
+                                    {% endfor %}
+                                </div>
                                 {% endif %}
                             </div>
                             {% endfor %}
@@ -261,8 +658,19 @@
                                 :disabled="filesLoading"
                                 class="text-xs px-3 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 rounded-lg hover:bg-primary-200 dark:hover:bg-primary-900/50 transition disabled:opacity-50">
                                 <span x-show="!filesLoading">Load Files</span>
-                                <span x-show="filesLoading" x-cloak>Loading...</span>
+                                <span x-show="filesLoading" x-cloak class="inline-flex items-center gap-1.5">
+                                    <svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+                                        <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                                        <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor" stroke-width="3"></path>
+                                    </svg>
+                                    Loading...
+                                </span>
                             </button>
+                        </div>
+                        <div x-show="filesLoading" x-cloak class="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
+                            <template x-for="n in 4" :key="n">
+                                <div class="h-12 rounded-xl bg-gradient-to-r from-gray-100 via-gray-200 to-gray-100 dark:from-gray-800 dark:via-gray-700 dark:to-gray-800 animate-pulse"></div>
+                            </template>
                         </div>
                         <div x-show="filesLoaded" class="space-y-2">
                             <template x-for="(file, fi) in filesList" :key="fi">
@@ -285,8 +693,13 @@
                                     </div>
                                     <div x-show="file.open" x-collapse>
                                         <div class="p-3 border-t border-gray-200 dark:border-gray-700">
-                                            <div x-show="file.loading" class="text-center py-3 text-xs text-gray-400">
-                                                Loading...</div>
+                                            <div x-show="file.loading" class="text-center py-3 text-xs text-gray-400 inline-flex items-center gap-2">
+                                                <svg class="w-3.5 h-3.5 animate-spin text-primary-500" viewBox="0 0 24 24" fill="none">
+                                                    <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                                                    <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor" stroke-width="3"></path>
+                                                </svg>
+                                                Loading preview...
+                                            </div>
                                             <div
                                                 x-show="!file.loading && (file.display_type === 'code' || file.display_type === 'text' || file.display_type === 'notebook' || file.display_type === 'docx')">
                                                 <pre
@@ -383,6 +796,13 @@
             searchQuery: '',
             filterGrade: '',
             filterConfidence: '',
+            activeTable: 'marks',
+            tableLoading: true,
+
+            init() {
+                const self = this;
+                window.setTimeout(function () { self.tableLoading = false; }, 450);
+            },
 
             matchesFilters(studentId, grade, confidence, status, isReviewed, isOverridden) {
                 if (this.searchQuery && !studentId.toLowerCase().includes(this.searchQuery.toLowerCase())) return false;

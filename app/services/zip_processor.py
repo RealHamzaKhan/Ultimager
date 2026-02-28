@@ -32,11 +32,32 @@ ARCHIVE_EXTENSIONS = {
 def _should_ignore(name: str) -> bool:
     """Return True if the file/folder should be skipped."""
     basename = name.strip().rstrip("/")
+    lower_name = basename.lower()
+    
     # Exact name match against ignored names set
-    if basename in IGNORED_NAMES or basename.lower() in {n.lower() for n in IGNORED_NAMES}:
+    if basename in IGNORED_NAMES or lower_name in {n.lower() for n in IGNORED_NAMES}:
         return True
+    
+    # Hidden files and system folders
     if basename.startswith(".") or basename.startswith("__"):
         return True
+    
+    # Test-related patterns
+    test_patterns = ['test', 'testing', 'dataset_', 'sample_', 'example_']
+    for pattern in test_patterns:
+        if pattern in lower_name:
+            return True
+    
+    # Common test data names (single names that look like test data)
+    common_test_names = [
+        'carol', 'eve', 'nick', 'jake', 'grace', 'bob', 'frank', 'dan',
+        'karen', 'leo', 'iris', 'olivia', 'mia', 'alice', 'henry',
+        'test', 'demo', 'sample', 'example'
+    ]
+    # Only ignore if it's a simple name (not like "Test_Submission_2024")
+    if lower_name in common_test_names or lower_name.rstrip('_0123456789') in common_test_names:
+        return True
+    
     return False
 
 

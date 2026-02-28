@@ -1,4 +1,4 @@
-"""AI Grading System - Clean, Fixed Version"""
+"""AI Grading System - Enhanced Version with Full Feature Set"""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import statistics
 import threading
+import urllib.parse
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -21,12 +22,20 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.config import UPLOAD_DIR, BASE_DIR
+from app.config import UPLOAD_DIR, BASE_DIR, ACMAG_ENABLED, SCORING_CONSISTENCY_ALERT_DELTA
 from app.database import get_db, init_db, SessionLocal
 from app.models import GradingSession, StudentSubmission, GradingProgress
 from app.schemas import OverridePayload
-from app.services.zip_processor import extract_master_archive_with_verification
+from app.services.zip_processor import extract_master_archive_with_verification, cleanup_session_files
 from app.services.exporter import export_csv, export_json
+from app.services.file_parser_fixed import process_student_submission, ExtractedContent
+from app.services.ai_grader_fixed import (
+    grade_student,
+    generate_rubric_from_description,
+    validate_submission_relevance,
+    compute_grading_hash,
+)
+from app.services.acmag import ACMAGRuntime, grade_submission_acmag
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,21 +44,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global storage for simple background task tracking (non-persistent for this version)
+# Global storage for grading state
 _active_grading: Dict[int, Dict[str, Any]] = {}
-# SSE event queues: session_id -> list of Queue objects (one per connected client)
+_stop_grading_flags: Dict[int, bool] = {}  # Session ID -> should stop
 _sse_queues: Dict[int, List[Queue]] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting AI Grading System v4.0...")
+    logger.info("Starting AI Grading System v5.0...")
     init_db()
     UPLOAD_DIR.mkdir(exist_ok=True)
     logger.info("System ready")
     yield
     logger.info("System shutdown")
 
-app = FastAPI(title="AI Grading System", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="AI Grading System", version="5.0.0", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key="change-this-in-production")
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -64,6 +73,15 @@ def _json_filter(value):
         return None
 
 templates.env.filters["from_json"] = _json_filter
+
+
+def _run_coro_sync(coro):
+    """Run an async coroutine in an isolated event loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 # ── Helper: serialize submissions for templates ──────────────────
 def _serialize_submission(sub: StudentSubmission) -> dict:
@@ -82,20 +100,45 @@ def _serialize_submission(sub: StudentSubmission) -> dict:
         except (json.JSONDecodeError, TypeError):
             files = []
 
+    # Handle new fields that might not exist in old database records
+    ingestion_report = None
+    try:
+        if hasattr(sub, 'ingestion_report') and sub.ingestion_report:
+            ingestion_report = json.loads(sub.ingestion_report)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        ingestion_report = None
+
+    relevance_flags = None
+    try:
+        if hasattr(sub, 'relevance_flags') and sub.relevance_flags:
+            relevance_flags = json.loads(sub.relevance_flags)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        relevance_flags = None
+    
+    # Handle other new fields with defaults
+    is_relevant = getattr(sub, 'is_relevant', True)
+    is_flagged = getattr(sub, 'is_flagged', False)
+    flag_reason = getattr(sub, 'flag_reason', None) or ""
+    flagged_by = getattr(sub, 'flagged_by', None) or ""
+    flagged_at = getattr(sub, 'flagged_at', None)
+
+    ai_score_val = sub.ai_score
+    final_score_val = sub.override_score if (sub.is_overridden and sub.override_score is not None) else sub.ai_score
+    
     return {
         "id": sub.id,
         "session_id": sub.session_id,
         "student_identifier": sub.student_identifier,
         "status": sub.status,
         "file_count": sub.file_count or len(files),
-        "ai_score": sub.ai_score,
+        "ai_score": float(ai_score_val) if ai_score_val is not None else None,
         "ai_letter_grade": sub.ai_letter_grade or "",
         "ai_confidence": sub.ai_confidence or "",
-        "final_score": sub.override_score if (sub.is_overridden and sub.override_score is not None) else sub.ai_score,
-        "is_overridden": sub.is_overridden or False,
-        "override_score": sub.override_score,
+        "final_score": float(final_score_val) if final_score_val is not None else None,
+        "is_overridden": bool(sub.is_overridden),
+        "override_score": float(sub.override_score) if sub.override_score is not None else None,
         "override_comments": sub.override_comments or "",
-        "is_reviewed": sub.is_reviewed or False,
+        "is_reviewed": bool(sub.is_reviewed),
         "tests_passed": sub.tests_passed or 0,
         "tests_total": sub.tests_total or 0,
         "graded_at": sub.graded_at.isoformat() if sub.graded_at else None,
@@ -105,10 +148,23 @@ def _serialize_submission(sub: StudentSubmission) -> dict:
         "ai_feedback": ai_result.get("overall_feedback", "") if ai_result else "",
         "rubric_breakdown": ai_result.get("rubric_breakdown", []) if ai_result else [],
         "question_mapping": ai_result.get("question_mapping", []) if ai_result else [],
+        "file_analysis": ai_result.get("file_analysis", []) if ai_result else [],
         "strengths": ai_result.get("strengths", []) if ai_result else [],
         "weaknesses": ai_result.get("weaknesses", []) if ai_result else [],
         "critical_errors": ai_result.get("critical_errors", []) if ai_result else [],
         "suggestions_for_improvement": ai_result.get("suggestions_for_improvement", "") if ai_result else "",
+        "visual_content_analysis": ai_result.get("visual_content_analysis") if ai_result else None,
+        "confidence_reasoning": ai_result.get("confidence_reasoning", "") if ai_result else "",
+        "percentage": ai_result.get("percentage", 0) if ai_result else 0,
+        "grading_hash": ai_result.get("grading_hash", "") if ai_result else "",
+        "transparency": ai_result.get("transparency") if ai_result else None,
+        "ingestion_report": ingestion_report,
+        "is_relevant": is_relevant,
+        "relevance_flags": relevance_flags,
+        "is_flagged": is_flagged,
+        "flag_reason": flag_reason,
+        "flagged_by": flagged_by,
+        "flagged_at": flagged_at.isoformat() if flagged_at else None,
     }
 
 
@@ -120,6 +176,265 @@ def _compute_grade_distribution(submissions) -> dict:
         if grade:
             grades.append(grade)
     return dict(Counter(grades))
+
+
+def _safe_json_load(value: Any) -> dict:
+    """Safely decode JSON text/object to dict."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _build_results_tables(submissions: list[StudentSubmission], max_score: int) -> dict:
+    """Build detailed table datasets for the results dashboard."""
+    marks_rows = []
+    rubric_rollup: dict[str, dict[str, Any]] = {}
+    ingestion_rows = []
+    llm_rows = []
+
+    ingestion_overview = {
+        "students_with_report": 0,
+        "files_received": 0,
+        "files_parsed": 0,
+        "files_failed": 0,
+        "total_text_chars": 0,
+        "total_images": 0,
+        "warnings": 0,
+        "errors": 0,
+    }
+
+    for sub in submissions:
+        ai = _safe_json_load(sub.ai_result)
+        ingestion = _safe_json_load(sub.ingestion_report)
+        final_score = sub.override_score if (sub.is_overridden and sub.override_score is not None) else sub.ai_score
+        delta = None
+        if sub.is_overridden and sub.override_score is not None and sub.ai_score is not None:
+            delta = round(float(sub.override_score) - float(sub.ai_score), 2)
+
+        marks_rows.append({
+            "student_identifier": sub.student_identifier,
+            "status": sub.status,
+            "ai_score": float(sub.ai_score) if sub.ai_score is not None else None,
+            "final_score": float(final_score) if final_score is not None else None,
+            "delta": delta,
+            "letter_grade": sub.ai_letter_grade or "",
+            "confidence": sub.ai_confidence or "",
+            "is_reviewed": bool(sub.is_reviewed),
+            "is_overridden": bool(sub.is_overridden),
+            "percentage": round((float(final_score) / max_score) * 100, 2) if (final_score is not None and max_score > 0) else None,
+        })
+
+        rubric_breakdown = ai.get("rubric_breakdown", [])
+        if isinstance(rubric_breakdown, list):
+            for item in rubric_breakdown:
+                if not isinstance(item, dict):
+                    continue
+                criterion = str(item.get("criterion", "")).strip() or "Unlabeled Criterion"
+                try:
+                    score_val = float(item.get("score", 0) or 0)
+                except (TypeError, ValueError):
+                    score_val = 0.0
+                try:
+                    max_val = float(item.get("max", item.get("max_score", 0)) or 0)
+                except (TypeError, ValueError):
+                    max_val = 0.0
+
+                if criterion not in rubric_rollup:
+                    rubric_rollup[criterion] = {
+                        "criterion": criterion,
+                        "students_graded": 0,
+                        "score_sum": 0.0,
+                        "max_sum": 0.0,
+                        "min_score": None,
+                        "max_score": None,
+                    }
+                roll = rubric_rollup[criterion]
+                roll["students_graded"] += 1
+                roll["score_sum"] += score_val
+                roll["max_sum"] += max_val
+                roll["min_score"] = score_val if roll["min_score"] is None else min(roll["min_score"], score_val)
+                roll["max_score"] = score_val if roll["max_score"] is None else max(roll["max_score"], score_val)
+
+        if ingestion:
+            summary = ingestion.get("summary", {}) if isinstance(ingestion.get("summary", {}), dict) else {}
+            warnings = ingestion.get("warnings", [])
+            errors = ingestion.get("errors", [])
+            warnings_count = len(warnings) if isinstance(warnings, list) else 0
+            errors_count = len(errors) if isinstance(errors, list) else 0
+
+            received = int(summary.get("received", 0) or 0)
+            parsed = int(summary.get("parsed", 0) or 0)
+            failed = int(summary.get("failed", 0) or 0)
+            text_chars = int(ingestion.get("total_text_chars", 0) or 0)
+            images = int(ingestion.get("total_images", 0) or 0)
+
+            ingestion_rows.append({
+                "student_identifier": sub.student_identifier,
+                "received": received,
+                "parsed": parsed,
+                "failed": failed,
+                "total_text_chars": text_chars,
+                "total_images": images,
+                "warnings_count": warnings_count,
+                "errors_count": errors_count,
+                "content_truncated": bool(ingestion.get("content_truncated", False)),
+                "timestamp": ingestion.get("timestamp", ""),
+            })
+
+            ingestion_overview["students_with_report"] += 1
+            ingestion_overview["files_received"] += received
+            ingestion_overview["files_parsed"] += parsed
+            ingestion_overview["files_failed"] += failed
+            ingestion_overview["total_text_chars"] += text_chars
+            ingestion_overview["total_images"] += images
+            ingestion_overview["warnings"] += warnings_count
+            ingestion_overview["errors"] += errors_count
+
+        transparency = ai.get("transparency", {})
+        if isinstance(transparency, dict) and transparency:
+            llm_call = transparency.get("llm_call", {}) if isinstance(transparency.get("llm_call", {}), dict) else {}
+            usage = llm_call.get("usage", {}) if isinstance(llm_call.get("usage", {}), dict) else {}
+            llm_rows.append({
+                "student_identifier": sub.student_identifier,
+                "model": llm_call.get("model", ""),
+                "provider": llm_call.get("provider", ""),
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+                "text_chars_sent": int(transparency.get("text_chars_sent", 0) or 0),
+                "images_sent": int(transparency.get("images_sent", 0) or 0),
+                "fallback_used": bool(llm_call.get("fallback_used", False)),
+                "consistency_alert": bool(llm_call.get("consistency_alert", False)),
+                "confidence": sub.ai_confidence or "",
+            })
+
+    rubric_rows = []
+    for _, item in sorted(rubric_rollup.items(), key=lambda kv: kv[0].lower()):
+        students_graded = item["students_graded"] or 1
+        max_sum = item["max_sum"] or 0.0
+        rubric_rows.append({
+            "criterion": item["criterion"],
+            "students_graded": item["students_graded"],
+            "avg_score": round(item["score_sum"] / students_graded, 2),
+            "avg_max": round(max_sum / students_graded, 2) if students_graded > 0 else 0.0,
+            "attainment_pct": round((item["score_sum"] / max_sum) * 100, 2) if max_sum > 0 else 0.0,
+            "min_score": round(item["min_score"], 2) if item["min_score"] is not None else 0.0,
+            "max_score": round(item["max_score"], 2) if item["max_score"] is not None else 0.0,
+        })
+
+    llm_overview = {
+        "calls": len(llm_rows),
+        "prompt_tokens": sum(r["prompt_tokens"] for r in llm_rows),
+        "completion_tokens": sum(r["completion_tokens"] for r in llm_rows),
+        "total_tokens": sum(r["total_tokens"] for r in llm_rows),
+        "text_chars_sent": sum(r["text_chars_sent"] for r in llm_rows),
+        "images_sent": sum(r["images_sent"] for r in llm_rows),
+        "fallback_used_calls": sum(1 for r in llm_rows if r["fallback_used"]),
+        "consistency_alerts": sum(1 for r in llm_rows if r["consistency_alert"]),
+    }
+
+    return {
+        "marks_rows": marks_rows,
+        "rubric_rows": rubric_rows,
+        "ingestion_rows": ingestion_rows,
+        "ingestion_overview": ingestion_overview,
+        "llm_rows": llm_rows,
+        "llm_overview": llm_overview,
+    }
+
+
+def _find_cached_result_by_hash(
+    db: Session,
+    session_id: int,
+    grading_hash: str,
+    exclude_submission_id: Optional[int] = None,
+) -> Optional[dict]:
+    """Find a prior successful grade with identical input hash."""
+    if not grading_hash:
+        return None
+
+    candidates = db.query(StudentSubmission).filter(
+        StudentSubmission.session_id == session_id,
+    ).all()
+
+    for cand in candidates:
+        if exclude_submission_id is not None and cand.id == exclude_submission_id:
+            continue
+        parsed = _safe_json_load(cand.ai_result)
+        if not parsed or parsed.get("error"):
+            continue
+        if parsed.get("grading_hash") != grading_hash:
+            continue
+        if str(parsed.get("confidence", "")).lower() == "low":
+            continue
+
+        reused = json.loads(json.dumps(parsed))
+        transparency = reused.get("transparency")
+        if not isinstance(transparency, dict):
+            transparency = {}
+            reused["transparency"] = transparency
+        llm_call = transparency.get("llm_call")
+        if not isinstance(llm_call, dict):
+            llm_call = {}
+            transparency["llm_call"] = llm_call
+        llm_call["cache_reused_from_student"] = cand.student_identifier
+        llm_call["cache_reused_at_utc"] = datetime.now(timezone.utc).isoformat()
+        reused["reused_from_cache"] = True
+        return reused
+
+    return None
+
+
+def _annotate_regrade_consistency(result: dict[str, Any], previous_score: Optional[float]) -> dict[str, Any]:
+    """Attach explicit consistency metadata for regrades."""
+    if not isinstance(result, dict):
+        return result
+    if result.get("error"):
+        return result
+    if previous_score is None:
+        return result
+
+    try:
+        previous_value = float(previous_score)
+        current_value = float(result.get("total_score", 0) or 0)
+    except (TypeError, ValueError):
+        return result
+
+    delta = round(abs(current_value - previous_value), 3)
+    threshold = float(SCORING_CONSISTENCY_ALERT_DELTA)
+    alert = delta > threshold
+
+    transparency = result.get("transparency")
+    if not isinstance(transparency, dict):
+        transparency = {}
+        result["transparency"] = transparency
+
+    llm_call = transparency.get("llm_call")
+    if not isinstance(llm_call, dict):
+        llm_call = {}
+        transparency["llm_call"] = llm_call
+
+    llm_call["regrade_previous_score"] = previous_value
+    llm_call["regrade_score_delta"] = delta
+    llm_call["consistency_alert_threshold"] = threshold
+    llm_call["consistency_alert"] = alert
+
+    result["consistency"] = {
+        "previous_score": previous_value,
+        "current_score": current_value,
+        "absolute_delta": delta,
+        "threshold": threshold,
+        "alert": alert,
+    }
+    return result
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -163,6 +478,22 @@ async def create_session(
     db.refresh(session)
     return RedirectResponse(url=f"/session/{session.id}", status_code=303)
 
+
+@app.post("/api/generate-rubric")
+async def api_generate_rubric(
+    description: str = Form(...),
+    max_score: int = Form(100),
+    strictness: str = Form("balanced"),
+):
+    """Generate a rubric from assignment description."""
+    try:
+        result = await generate_rubric_from_description(description, max_score, strictness)
+        return JSONResponse(result)
+    except Exception as e:
+        logger.exception("Rubric generation failed")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 @app.get("/session/{session_id}", response_class=HTMLResponse)
 def session_detail(session_id: int, request: Request, db: Session = Depends(get_db)):
     session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
@@ -173,7 +504,6 @@ def session_detail(session_id: int, request: Request, db: Session = Depends(get_
         StudentSubmission.session_id == session_id
     ).all()
     
-    # Serialize submissions for JSON use in Alpine.js
     serialized = [_serialize_submission(sub) for sub in submissions]
     
     return templates.TemplateResponse("session.html", {
@@ -192,6 +522,37 @@ async def upload_zip(
     session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    if session.status == "grading":
+        raise HTTPException(status_code=409, detail="Cannot upload while grading is in progress")
+
+    # Replace existing upload content for this session to avoid stale/test-data contamination.
+    _stop_grading_flags.pop(session_id, None)
+    _active_grading.pop(session_id, None)
+    _sse_queues.pop(session_id, None)
+
+    old_submissions = db.query(StudentSubmission).filter(
+        StudentSubmission.session_id == session_id
+    ).all()
+    for sub in old_submissions:
+        db.delete(sub)
+
+    old_progress = db.query(GradingProgress).filter(
+        GradingProgress.session_id == session_id
+    ).all()
+    for progress in old_progress:
+        db.delete(progress)
+
+    session.total_students = 0
+    session.graded_count = 0
+    session.error_count = 0
+    session.status = "pending"
+    session.started_at = None
+    session.completed_at = None
+    session.current_student_index = 0
+    session.grading_progress = {}
+    db.commit()
+
+    cleanup_session_files(session_id)
     
     tmp_path = UPLOAD_DIR / f"master_{session_id}_{zip_file.filename}"
     with open(tmp_path, "wb") as f:
@@ -231,6 +592,77 @@ async def upload_zip(
     
     return RedirectResponse(url=f"/session/{session_id}", status_code=303)
 
+
+@app.get("/session/{session_id}/student/{student_id}/ingestion-report")
+def get_ingestion_report(session_id: int, student_id: int, db: Session = Depends(get_db)):
+    """Get the ingestion report for a specific student."""
+    sub = db.query(StudentSubmission).filter(
+        StudentSubmission.id == student_id,
+        StudentSubmission.session_id == session_id
+    ).first()
+    
+    if not sub:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    if sub.ingestion_report:
+        try:
+            report = json.loads(sub.ingestion_report)
+            return JSONResponse(report)
+        except:
+            pass
+    
+    return JSONResponse({"error": "No ingestion report available"}, status_code=404)
+
+
+@app.post("/session/{session_id}/student/{student_id}/flag")
+async def flag_anomaly(
+    session_id: int,
+    student_id: int,
+    reason: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Flag a student submission as anomalous."""
+    sub = db.query(StudentSubmission).filter(
+        StudentSubmission.id == student_id,
+        StudentSubmission.session_id == session_id
+    ).first()
+    
+    if not sub:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    sub.is_flagged = True
+    sub.flag_reason = reason
+    sub.flagged_by = "user"
+    sub.flagged_at = datetime.now(timezone.utc)
+    db.commit()
+    
+    return JSONResponse({"message": "Submission flagged", "student_id": student_id})
+
+
+@app.post("/session/{session_id}/student/{student_id}/unflag")
+async def unflag_anomaly(
+    session_id: int,
+    student_id: int,
+    db: Session = Depends(get_db),
+):
+    """Remove anomaly flag from a student submission."""
+    sub = db.query(StudentSubmission).filter(
+        StudentSubmission.id == student_id,
+        StudentSubmission.session_id == session_id
+    ).first()
+    
+    if not sub:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    sub.is_flagged = False
+    sub.flag_reason = None
+    sub.flagged_by = None
+    sub.flagged_at = None
+    db.commit()
+    
+    return JSONResponse({"message": "Flag removed", "student_id": student_id})
+
+
 @app.post("/session/{session_id}/grade")
 async def start_grading(session_id: int, db: Session = Depends(get_db)):
     session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
@@ -244,6 +676,9 @@ async def start_grading(session_id: int, db: Session = Depends(get_db)):
     session.graded_count = 0
     db.commit()
     
+    # Reset stop flag
+    _stop_grading_flags[session_id] = False
+    
     # Initialize progress tracking
     _active_grading[session_id] = {
         "status": "grading",
@@ -251,17 +686,123 @@ async def start_grading(session_id: int, db: Session = Depends(get_db)):
         "graded_count": 0,
         "failed_count": 0,
         "total": session.total_students,
-        "stage": "Initializing...",
+        "stage": "Initializing pipeline (upload/extract/OCR/vision/grading/moderation)...",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     
-    # Start background grading in a thread pool so DB I/O doesn't block the event loop
+    # Start background grading
     asyncio.get_event_loop().run_in_executor(None, _grade_all_students_sync, session_id)
     
     return JSONResponse({
         "message": "Grading started",
         "session_id": session_id
     })
+
+
+@app.post("/session/{session_id}/stop-grading")
+async def stop_grading(session_id: int, db: Session = Depends(get_db)):
+    """Stop an in-progress grading job."""
+    session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.status != "grading":
+        return JSONResponse({"message": "Not currently grading"})
+    
+    # Set stop flag
+    _stop_grading_flags[session_id] = True
+    
+    # Update session status
+    session.status = "paused"
+    db.commit()
+    
+    # Update progress tracking
+    if session_id in _active_grading:
+        _active_grading[session_id]["status"] = "stopped"
+        _active_grading[session_id]["stage"] = "Stopped by user"
+    
+    # Broadcast stop event
+    _broadcast_sse(session_id, {
+        "type": "stopped",
+        "graded_count": session.graded_count or 0,
+        "failed_count": session.error_count or 0,
+        "total": session.total_students or 0,
+        "message": "Grading stopped by user"
+    })
+    
+    return JSONResponse({"message": "Grading stopped"})
+
+
+@app.post("/session/{session_id}/regrade-all")
+async def regrade_all(session_id: int, db: Session = Depends(get_db)):
+    """Re-grade all students in the session."""
+    session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Reset all submissions to pending
+    submissions = db.query(StudentSubmission).filter(
+        StudentSubmission.session_id == session_id
+    ).all()
+    
+    for sub in submissions:
+        sub.status = "pending"
+        sub.error_message = None
+        sub.is_relevant = True
+        sub.relevance_flags = None
+    
+    session.graded_count = 0
+    session.error_count = 0
+    session.status = "pending"
+    db.commit()
+    
+    # Start grading
+    return await start_grading(session_id, db)
+
+
+@app.post("/session/{session_id}/student/{student_id}/regrade")
+async def regrade_student(
+    session_id: int,
+    student_id: int,
+    db: Session = Depends(get_db),
+):
+    """Re-grade a single student."""
+    session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    sub = db.query(StudentSubmission).filter(
+        StudentSubmission.id == student_id,
+        StudentSubmission.session_id == session_id
+    ).first()
+    
+    if not sub:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    # Reset submission
+    sub.status = "pending"
+    sub.error_message = None
+    sub.is_relevant = True
+    sub.relevance_flags = None
+    db.commit()
+
+    # Track a lightweight active job so SSE remains open for single re-grade.
+    _stop_grading_flags[session_id] = False
+    _active_grading[session_id] = {
+        "status": "grading",
+        "current_student": sub.student_identifier,
+        "graded_count": session.graded_count or 0,
+        "failed_count": session.error_count or 0,
+        "total": session.total_students or 0,
+        "stage": f"Extraction + OCR (regrade) {sub.student_identifier}",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    # Grade this student immediately
+    asyncio.get_event_loop().run_in_executor(None, _grade_single_student_sync, session_id, student_id)
+    
+    return JSONResponse({"message": "Re-grading started", "student_id": student_id})
+
 
 def _broadcast_sse(session_id: int, event: dict):
     """Push an SSE event to all connected clients for a session."""
@@ -273,14 +814,275 @@ def _broadcast_sse(session_id: int, event: dict):
             pass
 
 
-def _grade_all_students_sync(session_id: int):
-    """Background grading task — runs in a thread pool, NOT in the event loop."""
-    import asyncio as _asyncio
+def _grade_single_student_sync(session_id: int, student_id: int):
+    """Grade a single student in background."""
     db = SessionLocal()
+    sub = None
+    
     try:
-        from app.services.ai_grader import grade_student
-        from app.services.file_parser import parse_file
+        session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
+        sub = db.query(StudentSubmission).filter(
+            StudentSubmission.id == student_id,
+            StudentSubmission.session_id == session_id
+        ).first()
+        
+        if not session or not sub:
+            return
+        
+        previous_ai_score = float(sub.ai_score) if sub.ai_score is not None else None
+        sub.status = "grading"
+        db.commit()
 
+        if session_id in _active_grading:
+            _active_grading[session_id].update({
+                "status": "grading",
+                "current_student": sub.student_identifier,
+                "stage": f"Extraction + OCR (regrade) {sub.student_identifier}",
+            })
+        
+        _broadcast_sse(session_id, {
+            "type": "progress",
+            "student": sub.student_identifier,
+            "student_id": sub.id,
+            "graded_count": session.graded_count or 0,
+            "failed_count": session.error_count or 0,
+            "total": session.total_students or 0,
+            "stage": "Extraction + OCR (single regrade)"
+        })
+        
+        # Load and process files
+        session_dir = UPLOAD_DIR / str(session_id)
+        
+        possible_dirs = [
+            session_dir / sub.student_identifier,
+            session_dir / "_master" / sub.student_identifier,
+        ]
+        
+        student_dir = None
+        for d in possible_dirs:
+            if d.exists() and d.is_dir():
+                student_dir = d
+                break
+        
+        student_files = []
+        ingestion_report_dict = None
+        if student_dir:
+            extracted_contents, ingestion_report = process_student_submission(
+                student_dir, sub.student_identifier, session_id
+            )
+            student_files = extracted_contents
+            ingestion_report_dict = ingestion_report.to_dict()
+            sub.ingestion_report = json.dumps(ingestion_report_dict)
+            db.commit()
+            _broadcast_sse(session_id, {
+                "type": "ingestion_complete",
+                "student_id": sub.id,
+                "student_identifier": sub.student_identifier,
+                "ingestion_report": ingestion_report_dict,
+            })
+        
+        # Validate relevance
+        _broadcast_sse(session_id, {
+            "type": "progress",
+            "student": sub.student_identifier,
+            "student_id": sub.id,
+            "graded_count": session.graded_count or 0,
+            "failed_count": session.error_count or 0,
+            "total": session.total_students or 0,
+            "stage": "Relevance check (single regrade)",
+        })
+        relevance = _run_coro_sync(validate_submission_relevance(
+            title=str(session.title),
+            description=str(session.description) if session.description else "",
+            student_files=student_files,
+            rubric=str(session.rubric) if session.rubric else ""
+        ))
+        
+        sub.is_relevant = relevance.get("is_relevant", True)
+        sub.relevance_flags = json.dumps(relevance.get("flags", []))
+        db.commit()
+        
+        # Grade (reuse cached deterministic result if an identical grading hash already exists)
+        questions = []
+        if session.questions:
+            try:
+                questions = json.loads(session.questions)
+            except:
+                pass
+
+        rubric_text = str(session.rubric) if session.rubric else ""
+        max_score_value = int(session.max_score) if session.max_score else 100
+        grading_hash = compute_grading_hash(student_files, rubric_text, max_score_value)
+
+        if ACMAG_ENABLED:
+            _broadcast_sse(session_id, {
+                "type": "progress",
+                "student": sub.student_identifier,
+                "student_id": sub.id,
+                "graded_count": session.graded_count or 0,
+                "failed_count": session.error_count or 0,
+                "total": session.total_students or 0,
+                "stage": "Vision + ACMAG grading (single regrade)",
+            })
+            acmag_pack = _run_coro_sync(grade_submission_acmag(
+                title=str(session.title),
+                description=str(session.description) if session.description else "",
+                rubric=rubric_text,
+                max_score=max_score_value,
+                student_files=student_files,
+                questions=questions,
+                student_identifier=str(sub.student_identifier),
+                anchor_context="",
+                run_secondary=True,
+                moderation_delta=1.0,
+            ))
+            result = dict(acmag_pack.get("result") or {})
+            if acmag_pack.get("moderation"):
+                _broadcast_sse(session_id, {
+                    "type": "progress",
+                    "student": sub.student_identifier,
+                    "student_id": sub.id,
+                    "graded_count": session.graded_count or 0,
+                    "failed_count": session.error_count or 0,
+                    "total": session.total_students or 0,
+                    "stage": "Moderation review (single regrade)",
+                })
+        else:
+            cached_result = _find_cached_result_by_hash(db, session_id, grading_hash, exclude_submission_id=sub.id)
+
+            if cached_result:
+                result = cached_result
+                _broadcast_sse(session_id, {
+                    "type": "progress",
+                    "student": sub.student_identifier,
+                    "student_id": sub.id,
+                    "graded_count": session.graded_count or 0,
+                    "failed_count": session.error_count or 0,
+                    "total": session.total_students or 0,
+                    "stage": "Deterministic cache reuse (single regrade)",
+                })
+            else:
+                _broadcast_sse(session_id, {
+                    "type": "progress",
+                    "student": sub.student_identifier,
+                    "student_id": sub.id,
+                    "graded_count": session.graded_count or 0,
+                    "failed_count": session.error_count or 0,
+                    "total": session.total_students or 0,
+                    "stage": "Vision + grading (single regrade)",
+                })
+                result = _run_coro_sync(grade_student(
+                    title=str(session.title),
+                    description=str(session.description) if session.description else "",
+                    rubric=rubric_text,
+                    max_score=max_score_value,
+                    student_files=student_files,
+                    questions=questions
+                ))
+
+        if isinstance(result, dict) and not result.get("grading_hash"):
+            result["grading_hash"] = grading_hash
+        if isinstance(result, dict):
+            result = _annotate_regrade_consistency(result, previous_ai_score)
+        
+        if result.get("error"):
+            sub.status = "error"
+            sub.error_message = result.get('error')
+            sub.ai_result = json.dumps(result)
+        else:
+            sub.ai_result = json.dumps(result)
+            sub.ai_score = result.get("total_score")
+            sub.ai_letter_grade = result.get("letter_grade")
+            sub.ai_confidence = result.get("confidence")
+            sub.status = "graded"
+            sub.graded_at = datetime.now(timezone.utc)
+        
+        session.graded_count = db.query(StudentSubmission).filter(
+            StudentSubmission.session_id == session_id,
+            StudentSubmission.status == "graded"
+        ).count()
+        session.error_count = db.query(StudentSubmission).filter(
+            StudentSubmission.session_id == session_id,
+            StudentSubmission.status == "error"
+        ).count()
+        db.commit()
+        
+        if sub.status == "error":
+            _broadcast_sse(session_id, {
+                "type": "student_error",
+                "student_id": sub.id,
+                "student_identifier": sub.student_identifier,
+                "error": sub.error_message or "Grading failed",
+                "graded_count": session.graded_count or 0,
+                "failed_count": session.error_count or 0,
+                "total": session.total_students or 0,
+                "result": result,
+                "ingestion_report": ingestion_report_dict,
+                "relevance": relevance,
+            })
+        else:
+            _broadcast_sse(session_id, {
+                "type": "student_complete",
+                "student_id": sub.id,
+                "student_identifier": sub.student_identifier,
+                "score": sub.ai_score,
+                "grade": sub.ai_letter_grade or "",
+                "confidence": sub.ai_confidence or "",
+                "graded_count": session.graded_count or 0,
+                "failed_count": session.error_count or 0,
+                "total": session.total_students or 0,
+                "result": result,
+                "ingestion_report": ingestion_report_dict,
+                "relevance": relevance,
+            })
+
+        if session_id in _active_grading:
+            _active_grading[session_id].update({
+                "status": "completed",
+                "current_student": "",
+                "graded_count": session.graded_count or 0,
+                "failed_count": session.error_count or 0,
+                "stage": "Single student re-grade complete",
+            })
+        _broadcast_sse(session_id, {
+            "type": "complete",
+            "graded_count": session.graded_count or 0,
+            "failed_count": session.error_count or 0,
+            "total": session.total_students or 0,
+            "message": f"Re-grade completed for {sub.student_identifier}",
+        })
+        
+    except Exception as e:
+        logger.exception(f"Failed to regrade student {student_id}")
+        try:
+            if sub is not None:
+                sub.status = "error"
+                sub.error_message = str(e)
+                db.commit()
+        except:
+            pass
+        _broadcast_sse(session_id, {
+            "type": "student_error",
+            "student_id": student_id,
+            "error": str(e),
+        })
+    finally:
+        db.close()
+        _stop_grading_flags.pop(session_id, None)
+        def _cleanup():
+            import time
+            time.sleep(3)
+            _active_grading.pop(session_id, None)
+            _sse_queues.pop(session_id, None)
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+
+def _grade_all_students_sync(session_id: int):
+    """Background grading task - runs in a thread pool."""
+    db = SessionLocal()
+    session = None
+    
+    try:
         session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
         if not session:
             return
@@ -288,121 +1090,298 @@ def _grade_all_students_sync(session_id: int):
         submissions = db.query(StudentSubmission).filter(
             StudentSubmission.session_id == session_id,
             StudentSubmission.status.in_(["pending", "error"])
-        ).all()
+        ).order_by(StudentSubmission.processing_order, StudentSubmission.id).all()
 
         total = len(submissions)
-        graded = 0
-        failed = 0
+        graded = session.graded_count or 0
+        failed = session.error_count or 0
 
         questions = []
         if session.questions:
             try:
                 questions = json.loads(session.questions)
-            except Exception:
+            except:
                 pass
 
+        rubric_text = str(session.rubric) if session.rubric else ""
+        max_score_value = int(session.max_score) if session.max_score else 100
+
         session_dir = UPLOAD_DIR / str(session_id)
+        stop_requested = False
+
+        acmag_runtime = ACMAGRuntime(
+            session_id=session_id,
+            max_score=max_score_value,
+            submission_ids=[int(s.id) for s in submissions],
+            submission_identifiers={int(s.id): str(s.student_identifier) for s in submissions},
+        )
+        if acmag_runtime.enabled:
+            _broadcast_sse(session_id, {
+                "type": "acmag_init",
+                "calibration_target": len(acmag_runtime.calibration_ids),
+                "blind_review_ratio": acmag_runtime.blind_review_ratio,
+                "kappa_threshold": acmag_runtime.kappa_threshold,
+            })
 
         for i, sub in enumerate(submissions):
+            # Check stop flag
+            if _stop_grading_flags.get(session_id, False):
+                logger.info(f"Grading stopped for session {session_id}")
+                stop_requested = True
+                break
+            
             try:
+                previous_ai_score = float(sub.ai_score) if sub.ai_score is not None else None
                 sub.status = "grading"
                 db.commit()
 
-                # Update progress tracking
                 if session_id in _active_grading:
                     _active_grading[session_id].update({
                         "current_student": sub.student_identifier,
                         "graded_count": graded,
                         "failed_count": failed,
-                        "stage": f"Grading {i+1}/{total}",
+                        "stage": f"Extraction + OCR {i+1}/{total}",
                     })
 
-                # Broadcast progress event
                 _broadcast_sse(session_id, {
                     "type": "progress",
                     "student": sub.student_identifier,
                     "graded_count": graded,
                     "failed_count": failed,
                     "total": total,
-                    "stage": f"Grading {i+1}/{total}",
+                    "stage": f"Extraction + OCR {i+1}/{total}",
                 })
 
-                # Load files
-                file_meta = json.loads(sub.files) if sub.files else []
+                # Load files and build ingestion report.
+                possible_dirs = [
+                    session_dir / sub.student_identifier,
+                    session_dir / "_master" / sub.student_identifier,
+                ]
+                
+                student_dir = None
+                for d in possible_dirs:
+                    if d.exists() and d.is_dir():
+                        student_dir = d
+                        break
+                
                 student_files = []
+                ingestion_report_dict = None
+                if student_dir:
+                    try:
+                        extracted_contents, ingestion_report = process_student_submission(
+                            student_dir, sub.student_identifier, session_id
+                        )
+                        student_files = extracted_contents
+                        ingestion_report_dict = ingestion_report.to_dict()
+                        sub.ingestion_report = json.dumps(ingestion_report_dict)
+                        db.commit()
+                        _broadcast_sse(session_id, {
+                            "type": "ingestion_complete",
+                            "student_id": sub.id,
+                            "student_identifier": sub.student_identifier,
+                            "ingestion_report": ingestion_report_dict,
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to process student files: {e}")
+                
+                _broadcast_sse(session_id, {
+                    "type": "progress",
+                    "student": sub.student_identifier,
+                    "graded_count": graded,
+                    "failed_count": failed,
+                    "total": total,
+                    "stage": f"Relevance check {i+1}/{total}",
+                })
 
-                student_dir = session_dir / "_master" / sub.student_identifier
-                if not student_dir.exists():
-                    student_dir = session_dir / sub.student_identifier
-                if student_dir.exists():
-                    for f_meta in file_meta:
-                        rel_path = f_meta.get('relative_path', f_meta.get('filename', ''))
-                        file_path = student_dir / rel_path
-                        if file_path.exists():
-                            try:
-                                parsed = parse_file(file_path)
-                                student_files.append(parsed)
-                            except Exception:
-                                student_files.append(f_meta)
-                        else:
-                            student_files.append(f_meta)
-                else:
-                    student_files = file_meta
-
-                # Grade — run the async function from this sync thread
-                loop = _asyncio.new_event_loop()
+                # Validate relevance.
+                relevance = {"is_relevant": True, "flags": []}
                 try:
-                    result = loop.run_until_complete(grade_student(
+                    relevance = _run_coro_sync(validate_submission_relevance(
                         title=str(session.title),
                         description=str(session.description) if session.description else "",
-                        rubric=str(session.rubric) if session.rubric else "",
-                        max_score=int(session.max_score) if session.max_score else 100,
                         student_files=student_files,
-                        questions=questions
+                        rubric=str(session.rubric) if session.rubric else ""
                     ))
-                finally:
-                    loop.close()
+                    
+                    sub.is_relevant = relevance.get("is_relevant", True)
+                    sub.relevance_flags = json.dumps(relevance.get("flags", []))
+                    db.commit()
+                    
+                    if not sub.is_relevant:
+                        logger.warning(f"Submission from {sub.student_identifier} flagged as irrelevant")
+                except Exception as e:
+                    logger.warning(f"Relevance validation failed: {e}")
+                
+                grading_hash = compute_grading_hash(student_files, rubric_text, max_score_value)
+                result: dict[str, Any]
+
+                if acmag_runtime.enabled:
+                    run_secondary = acmag_runtime.should_run_secondary(sub.id, str(sub.student_identifier))
+                    anchor_context = acmag_runtime.anchor_context_text() if acmag_runtime.calibration_complete else ""
+                    phase = "calibration" if acmag_runtime.is_calibration_submission(sub.id) else "main"
+                    _broadcast_sse(session_id, {
+                        "type": "progress",
+                        "student": sub.student_identifier,
+                        "graded_count": graded,
+                        "failed_count": failed,
+                        "total": total,
+                        "stage": f"Vision + ACMAG {phase} grading {i+1}/{total}",
+                    })
+
+                    acmag_pack = _run_coro_sync(grade_submission_acmag(
+                        title=str(session.title),
+                        description=str(session.description) if session.description else "",
+                        rubric=rubric_text,
+                        max_score=max_score_value,
+                        student_files=student_files,
+                        questions=questions,
+                        student_identifier=str(sub.student_identifier),
+                        anchor_context=anchor_context,
+                        run_secondary=run_secondary,
+                        moderation_delta=acmag_runtime.moderation_delta,
+                    ))
+                    result = dict(acmag_pack.get("result") or {})
+
+                    if acmag_pack.get("moderation"):
+                        _broadcast_sse(session_id, {
+                            "type": "progress",
+                            "student": sub.student_identifier,
+                            "graded_count": graded,
+                            "failed_count": failed,
+                            "total": total,
+                            "stage": f"Moderation review {i+1}/{total}",
+                        })
+
+                    if not result.get("error"):
+                        acmag_runtime.register_anchor(sub.id, str(sub.student_identifier), result)
+                        secondary_result = acmag_pack.get("secondary_result")
+                        if (
+                            acmag_pack.get("secondary_executed")
+                            and isinstance(secondary_result, dict)
+                            and not secondary_result.get("error")
+                        ):
+                            acmag_runtime.record_secondary_pair(
+                                primary=acmag_pack.get("primary_result") or result,
+                                secondary=secondary_result,
+                                from_calibration=acmag_runtime.is_calibration_submission(sub.id),
+                            )
+                        result.setdefault("acmag", {})
+                        result["acmag"]["runtime"] = acmag_runtime.reliability_snapshot()
+
+                    if acmag_runtime.halted:
+                        stop_requested = True
+                        _stop_grading_flags[session_id] = True
+                        _broadcast_sse(session_id, {
+                            "type": "acmag_halt",
+                            "reason": acmag_runtime.halt_reason,
+                            "reliability": acmag_runtime.reliability_snapshot(),
+                        })
+                else:
+                    cached_result = _find_cached_result_by_hash(db, session_id, grading_hash, exclude_submission_id=sub.id)
+                    if cached_result:
+                        _broadcast_sse(session_id, {
+                            "type": "progress",
+                            "student": sub.student_identifier,
+                            "graded_count": graded,
+                            "failed_count": failed,
+                            "total": total,
+                            "stage": f"Deterministic cache reuse {i+1}/{total}",
+                        })
+                        result = cached_result
+                    else:
+                        _broadcast_sse(session_id, {
+                            "type": "progress",
+                            "student": sub.student_identifier,
+                            "graded_count": graded,
+                            "failed_count": failed,
+                            "total": total,
+                            "stage": f"Vision + grading {i+1}/{total}",
+                        })
+
+                        # Grade with LLM.
+                        result = _run_coro_sync(grade_student(
+                            title=str(session.title),
+                            description=str(session.description) if session.description else "",
+                            rubric=rubric_text,
+                            max_score=max_score_value,
+                            student_files=student_files,
+                            questions=questions
+                        ))
+
+                if isinstance(result, dict) and not result.get("grading_hash"):
+                    result["grading_hash"] = grading_hash
+                if isinstance(result, dict):
+                    result = _annotate_regrade_consistency(result, previous_ai_score)
 
                 if result.get("error"):
                     sub.status = "error"
                     sub.error_message = result.get('error')
-                    sub.ai_result = json.dumps(result, default=str)
-                    failed += 1
+                    sub.ai_result = json.dumps(result)
                 else:
-                    sub.ai_result = json.dumps(result, default=str)
+                    sub.ai_result = json.dumps(result)
                     sub.ai_score = result.get("total_score")
                     sub.ai_letter_grade = result.get("letter_grade")
                     sub.ai_confidence = result.get("confidence")
                     sub.status = "graded"
                     sub.graded_at = datetime.now(timezone.utc)
-                    graded += 1
 
+                graded = db.query(StudentSubmission).filter(
+                    StudentSubmission.session_id == session_id,
+                    StudentSubmission.status == "graded"
+                ).count()
+                failed = db.query(StudentSubmission).filter(
+                    StudentSubmission.session_id == session_id,
+                    StudentSubmission.status == "error"
+                ).count()
                 session.graded_count = graded
                 session.error_count = failed
                 db.commit()
 
-                # Broadcast student_complete event with full result
-                _broadcast_sse(session_id, {
-                    "type": "student_complete",
-                    "student_id": sub.id,
-                    "student_identifier": sub.student_identifier,
-                    "score": sub.ai_score,
-                    "grade": sub.ai_letter_grade or "",
-                    "confidence": sub.ai_confidence or "",
-                    "graded_count": graded,
-                    "failed_count": failed,
-                    "total": total,
-                    "result": result,
-                })
+                if sub.status == "error":
+                    _broadcast_sse(session_id, {
+                        "type": "student_error",
+                        "student_id": sub.id,
+                        "student_identifier": sub.student_identifier,
+                        "error": sub.error_message or "Grading failed",
+                        "graded_count": graded,
+                        "failed_count": failed,
+                        "total": total,
+                        "result": result,
+                        "ingestion_report": ingestion_report_dict,
+                        "relevance": relevance,
+                    })
+                else:
+                    _broadcast_sse(session_id, {
+                        "type": "student_complete",
+                        "student_id": sub.id,
+                        "student_identifier": sub.student_identifier,
+                        "score": sub.ai_score,
+                        "grade": sub.ai_letter_grade or "",
+                        "confidence": sub.ai_confidence or "",
+                        "graded_count": graded,
+                        "failed_count": failed,
+                        "total": total,
+                        "result": result,
+                        "ingestion_report": ingestion_report_dict,
+                        "relevance": relevance,
+                    })
 
             except Exception as e:
                 logger.exception(f"Failed to grade {sub.student_identifier}")
                 sub.status = "error"
                 sub.error_message = str(e)
-                failed += 1
+                graded = db.query(StudentSubmission).filter(
+                    StudentSubmission.session_id == session_id,
+                    StudentSubmission.status == "graded"
+                ).count()
+                failed = db.query(StudentSubmission).filter(
+                    StudentSubmission.session_id == session_id,
+                    StudentSubmission.status == "error"
+                ).count()
+                session.graded_count = graded
+                session.error_count = failed
                 db.commit()
 
-                # Broadcast error for this student
                 _broadcast_sse(session_id, {
                     "type": "student_error",
                     "student_id": sub.id,
@@ -413,12 +1392,40 @@ def _grade_all_students_sync(session_id: int):
                     "total": total,
                 })
 
-        session.status = "completed" if failed == 0 else "completed_with_errors"
+        graded = db.query(StudentSubmission).filter(
+            StudentSubmission.session_id == session_id,
+            StudentSubmission.status == "graded"
+        ).count()
+        failed = db.query(StudentSubmission).filter(
+            StudentSubmission.session_id == session_id,
+            StudentSubmission.status == "error"
+        ).count()
         session.graded_count = graded
         session.error_count = failed
+
+        if stop_requested:
+            session.status = "paused"
+            if session_id in _active_grading:
+                _active_grading[session_id].update({
+                    "status": "stopped",
+                    "current_student": "",
+                    "graded_count": graded,
+                    "failed_count": failed,
+                    "stage": "Stopped by user",
+                })
+            db.commit()
+            _broadcast_sse(session_id, {
+                "type": "stopped",
+                "graded_count": graded,
+                "failed_count": failed,
+                "total": total,
+                "message": f"Grading stopped: {graded} graded, {failed} failed",
+            })
+            return
+
+        session.status = "completed" if failed == 0 else "completed_with_errors"
         db.commit()
 
-        # Update progress tracking
         if session_id in _active_grading:
             _active_grading[session_id].update({
                 "status": "completed",
@@ -428,7 +1435,6 @@ def _grade_all_students_sync(session_id: int):
                 "stage": "Complete",
             })
 
-        # Broadcast completion
         _broadcast_sse(session_id, {
             "type": "complete",
             "graded_count": graded,
@@ -440,9 +1446,10 @@ def _grade_all_students_sync(session_id: int):
     except Exception as e:
         logger.exception(f"Critical error grading session {session_id}")
         try:
-            session.status = "failed"
-            db.commit()
-        except Exception:
+            if session is not None:
+                session.status = "failed"
+                db.commit()
+        except:
             pass
         if session_id in _active_grading:
             _active_grading[session_id]["status"] = "failed"
@@ -455,7 +1462,7 @@ def _grade_all_students_sync(session_id: int):
         })
     finally:
         db.close()
-        # Clean up queues after a delay
+        _stop_grading_flags.pop(session_id, None)
         def _cleanup():
             import time
             time.sleep(5)
@@ -464,14 +1471,9 @@ def _grade_all_students_sync(session_id: int):
         threading.Thread(target=_cleanup, daemon=True).start()
 
 
-# ── SSE / Polling for grading progress ───────────────────────────
-
 @app.get("/session/{session_id}/grade-stream")
 async def grade_stream(session_id: int):
-    """Server-Sent Events endpoint for real-time grading progress.
-    Uses a per-client queue so events are pushed instantly from the grading thread."""
-
-    # Create a queue for this client
+    """Server-Sent Events endpoint for real-time grading progress."""
     client_queue: Queue = Queue()
     if session_id not in _sse_queues:
         _sse_queues[session_id] = []
@@ -481,28 +1483,33 @@ async def grade_stream(session_id: int):
         idle_count = 0
         try:
             while True:
-                # Try to get an event from the queue (non-blocking)
                 try:
                     event = client_queue.get_nowait()
                     idle_count = 0
                     yield f"data: {json.dumps(event, default=str)}\n\n"
-                    if event.get("type") == "complete":
+                    if event.get("type") in {"complete", "stopped"}:
                         return
                 except Empty:
                     pass
 
-                # If no event, check if grading is still active
                 progress = _active_grading.get(session_id)
                 if progress is None:
                     db = SessionLocal()
                     try:
                         session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
-                        if session and session.status in ("completed", "completed_with_errors", "failed"):
+                        if session and session.status in ("completed", "completed_with_errors", "failed", "paused"):
+                            event_type = "stopped" if session.status == "paused" else "complete"
+                            message = (
+                                "Grading paused"
+                                if session.status == "paused"
+                                else f"Grading finished: {session.graded_count} graded"
+                            )
                             data = {
-                                "type": "complete",
+                                "type": event_type,
                                 "graded_count": session.graded_count or 0,
+                                "failed_count": session.error_count or 0,
                                 "total": session.total_students or 0,
-                                "message": f"Grading finished: {session.graded_count} graded",
+                                "message": message,
                             }
                             yield f"data: {json.dumps(data)}\n\n"
                             return
@@ -514,7 +1521,6 @@ async def grade_stream(session_id: int):
 
                 await asyncio.sleep(0.3)
         finally:
-            # Remove this client's queue on disconnect
             try:
                 _sse_queues.get(session_id, []).remove(client_queue)
             except ValueError:
@@ -537,7 +1543,6 @@ def get_session_status(session_id: int, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # Merge with live progress if available
     progress = _active_grading.get(session_id, {})
     
     return {
@@ -549,6 +1554,7 @@ def get_session_status(session_id: int, db: Session = Depends(get_db)):
         "current_student": progress.get("current_student", ""),
         "progress_percentage": (session.graded_count / session.total_students * 100) if session.total_students > 0 else 0
     }
+
 
 @app.get("/session/{session_id}/results", response_class=HTMLResponse)
 def results_dashboard(session_id: int, request: Request, db: Session = Depends(get_db)):
@@ -577,8 +1583,8 @@ def results_dashboard(session_id: int, request: Request, db: Session = Depends(g
             "max": round(max(scores), 2),
         }
     
-    # Compute grade distribution
     grade_dist = _compute_grade_distribution(submissions)
+    tables = _build_results_tables(submissions, int(session.max_score or 100))
     
     return templates.TemplateResponse("results.html", {
         "request": request,
@@ -586,7 +1592,14 @@ def results_dashboard(session_id: int, request: Request, db: Session = Depends(g
         "submissions": submissions,
         "stats": stats,
         "grade_dist": grade_dist,
+        "marks_rows": tables["marks_rows"],
+        "rubric_rows": tables["rubric_rows"],
+        "ingestion_rows": tables["ingestion_rows"],
+        "ingestion_overview": tables["ingestion_overview"],
+        "llm_rows": tables["llm_rows"],
+        "llm_overview": tables["llm_overview"],
     })
+
 
 @app.get("/session/{session_id}/export/csv")
 def export_csv_endpoint(session_id: int, db: Session = Depends(get_db)):
@@ -601,6 +1614,7 @@ def export_csv_endpoint(session_id: int, db: Session = Depends(get_db)):
         logger.exception("CSV export failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/session/{session_id}/export/json")
 def export_json_endpoint(session_id: int, db: Session = Depends(get_db)):
     try:
@@ -612,6 +1626,7 @@ def export_json_endpoint(session_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         logger.exception("JSON export failed")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/session/{session_id}/student/{student_id}/override")
 async def override_grade(
@@ -642,6 +1657,7 @@ async def override_grade(
         "student_id": student_id,
         "final_score": final
     }
+
 
 @app.post("/session/{session_id}/retry-failed")
 async def retry_failed(session_id: int, db: Session = Depends(get_db)):
@@ -686,7 +1702,6 @@ def delete_session(session_id: int, db: Session = Depends(get_db)):
     
     return RedirectResponse(url="/", status_code=303)
 
-# ── File serving endpoints ────────────────────────────────────────
 
 @app.get("/session/{session_id}/student/{student_id}/files")
 def list_student_files(session_id: int, student_id: int, db: Session = Depends(get_db)):
@@ -705,19 +1720,24 @@ def list_student_files(session_id: int, student_id: int, db: Session = Depends(g
         except Exception:
             pass
 
-    # Determine the actual directory for this student
     session_dir = UPLOAD_DIR / str(session_id)
-    student_dir = session_dir / "_master" / sub.student_identifier
-    if not student_dir.exists():
-        student_dir = session_dir / sub.student_identifier
+    
+    possible_dirs = [
+        session_dir / sub.student_identifier,
+        session_dir / "_master" / sub.student_identifier,
+    ]
+    
+    student_dir = None
+    for d in possible_dirs:
+        if d.exists() and d.is_dir():
+            student_dir = d
+            break
 
     result = []
     for f in file_meta:
         rel_path = f.get('relative_path', f.get('filename', ''))
-        file_path = student_dir / rel_path if student_dir.exists() else None
         ext = Path(rel_path).suffix.lower()
 
-        # Determine display type
         CODE_EXTS = {".py", ".java", ".cpp", ".c", ".js", ".ts", ".cs", ".go", ".rb",
                      ".php", ".swift", ".kt", ".scala", ".rs", ".sh", ".sql", ".html",
                      ".css", ".r", ".m", ".h"}
@@ -739,8 +1759,11 @@ def list_student_files(session_id: int, student_id: int, db: Session = Depends(g
         else:
             display_type = "binary"
 
+        file_path = student_dir / rel_path if student_dir else None
         exists = file_path.exists() if file_path else False
-        view_url = f"/session/{session_id}/student/{student_id}/file/{rel_path}" if exists else None
+        
+        encoded_path = urllib.parse.quote(rel_path, safe='')
+        view_url = f"/session/{session_id}/student/{student_id}/file/{encoded_path}" if exists else None
 
         result.append({
             "filename": f.get('filename', Path(rel_path).name),
@@ -767,13 +1790,25 @@ def serve_student_file(session_id: int, student_id: int, file_path: str, db: Ses
         raise HTTPException(status_code=404, detail="Student not found")
 
     session_dir = UPLOAD_DIR / str(session_id)
-    student_dir = session_dir / "_master" / sub.student_identifier
-    if not student_dir.exists():
-        student_dir = session_dir / sub.student_identifier
+    
+    decoded_file_path = urllib.parse.unquote(file_path)
+    
+    possible_dirs = [
+        session_dir / sub.student_identifier,
+        session_dir / "_master" / sub.student_identifier,
+    ]
+    
+    student_dir = None
+    for d in possible_dirs:
+        if d.exists() and d.is_dir():
+            student_dir = d
+            break
+    
+    if not student_dir:
+        raise HTTPException(status_code=404, detail="Student directory not found")
 
-    full_path = student_dir / file_path
+    full_path = student_dir / decoded_file_path
 
-    # Security: ensure the resolved path is within the student directory
     try:
         full_path = full_path.resolve()
         student_dir_resolved = student_dir.resolve()
@@ -783,11 +1818,11 @@ def serve_student_file(session_id: int, student_id: int, file_path: str, db: Ses
         raise HTTPException(status_code=403, detail="Invalid path")
 
     if not full_path.exists():
+        logger.warning(f"File not found: {full_path}")
         raise HTTPException(status_code=404, detail="File not found")
 
     ext = full_path.suffix.lower()
 
-    # For code/text files, return raw text with proper content type
     CODE_EXTS = {".py", ".java", ".cpp", ".c", ".js", ".ts", ".cs", ".go", ".rb",
                  ".php", ".swift", ".kt", ".scala", ".rs", ".sh", ".sql", ".html",
                  ".css", ".r", ".m", ".h"}
@@ -807,7 +1842,6 @@ def serve_student_file(session_id: int, student_id: int, file_path: str, db: Ses
         except Exception:
             pass
 
-    # For docx, extract text and return
     if ext == ".docx":
         try:
             from app.services.file_parser import _parse_docx
@@ -816,11 +1850,10 @@ def serve_student_file(session_id: int, student_id: int, file_path: str, db: Ses
         except Exception:
             pass
 
-    # For images, PDFs, and other binary files — serve directly
     media_type = mimetypes.guess_type(str(full_path))[0] or "application/octet-stream"
     return FileResponse(str(full_path), media_type=media_type)
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "4.0.0"}
+    return {"status": "healthy", "version": "5.0.0"}

@@ -93,6 +93,19 @@ class StudentSubmission(Base):
     # Processing order
     processing_order = Column(Integer, default=0)
     
+    # Ingestion report for transparency
+    ingestion_report = Column(Text, nullable=True)  # JSON string
+    
+    # Relevance validation
+    is_relevant = Column(Boolean, default=True)
+    relevance_flags = Column(Text, nullable=True)  # JSON array of flags
+    
+    # Anomaly flagging
+    is_flagged = Column(Boolean, default=False)
+    flag_reason = Column(Text, nullable=True)
+    flagged_by = Column(String(50), nullable=True)  # 'user' or 'system'
+    flagged_at = Column(DateTime, nullable=True)
+    
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     

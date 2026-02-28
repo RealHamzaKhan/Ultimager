@@ -19,12 +19,10 @@ def export_csv(db: "Session", session_id: int, include_pending: bool = False) ->
     if not session:
         raise ValueError(f"Session {session_id} not found")
     
-    # Build query
     query = db.query(StudentSubmission).filter(
         StudentSubmission.session_id == session_id
     )
     
-    # Filter out pending if not requested
     if not include_pending:
         query = query.filter(StudentSubmission.status.in_(["graded", "error", "overridden"]))
     
@@ -33,30 +31,38 @@ def export_csv(db: "Session", session_id: int, include_pending: bool = False) ->
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Header
     header = [
         "Student ID", "AI Score", "Override Score", "Final Score",
         "Letter Grade", "Confidence", "Status", "Is Reviewed",
         "Is Overridden", "Graded At", "Feedback Summary",
     ]
 
-    # Try to extract rubric criteria from the first successful submission
     rubric_criteria: list[str] = []
+    question_numbers: list[int] = []
+    
     for sub in submissions:
         if sub.ai_result:
             try:
                 result = json.loads(sub.ai_result)
                 breakdown = result.get("rubric_breakdown", [])
                 rubric_criteria = [item["criterion"] for item in breakdown]
+                
+                qm = result.get("question_mapping", [])
+                for q in qm:
+                    qnum = q.get("question_number")
+                    if qnum and qnum not in question_numbers:
+                        question_numbers.append(qnum)
                 break
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
 
     header.extend(rubric_criteria)
+    question_headers = [f"Q{q}_Score" for q in sorted(question_numbers)]
+    question_headers.extend([f"Q{q}_Max" for q in sorted(question_numbers)])
+    header.extend(question_headers)
     header.append("Override Comments")
     writer.writerow(header)
 
-    # Rows
     for sub in submissions:
         row: list[Any] = [
             sub.student_identifier,
@@ -71,23 +77,35 @@ def export_csv(db: "Session", session_id: int, include_pending: bool = False) ->
             sub.graded_at.strftime("%Y-%m-%d %H:%M:%S") if sub.graded_at else "",
         ]
 
-        # Feedback summary
         feedback = ""
         criterion_scores: dict[str, str] = {}
+        question_scores: dict[int, tuple] = {}
+        
         if sub.ai_result:
             try:
                 result = json.loads(sub.ai_result)
                 feedback = result.get("overall_feedback", "")
                 for item in result.get("rubric_breakdown", []):
-                    criterion_scores[item["criterion"]] = f"{item['score']}/{item['max']}"
+                    criterion_scores[item["criterion"]] = f"{item.get('score', 0)}/{item.get('max', 0)}"
+                
+                for q in result.get("question_mapping", []):
+                    qnum = q.get("question_number")
+                    if qnum:
+                        question_scores[qnum] = (q.get("score", 0), q.get("max_points", 0))
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
         row.append(feedback)
 
-        # Add rubric scores in order
         for crit in rubric_criteria:
             row.append(criterion_scores.get(crit, ""))
+
+        for q in sorted(question_numbers):
+            scores = question_scores.get(q, (0, 0))
+            row.append(scores[0])
+        for q in sorted(question_numbers):
+            scores = question_scores.get(q, (0, 0))
+            row.append(scores[1])
 
         row.append(sub.override_comments or "")
         writer.writerow(row)

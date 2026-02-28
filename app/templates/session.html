@@ -3,6 +3,44 @@
 
 {% block content %}
 <div x-data="gradingSession()" x-init="init()" class="space-y-6 animate-fade-in">
+    <div x-show="globalLoading" x-cloak
+        class="fixed inset-0 z-[110] bg-slate-950/55 backdrop-blur-sm flex items-center justify-center px-4">
+        <div class="w-full max-w-md rounded-2xl border border-primary-300/40 dark:border-primary-700/50 bg-white/95 dark:bg-gray-900/95 p-5 shadow-2xl">
+            <div class="flex items-center gap-3">
+                <div class="relative h-11 w-11 rounded-full bg-gradient-to-br from-primary-500 to-purple-600 flex items-center justify-center">
+                    <span class="absolute h-11 w-11 rounded-full border-2 border-primary-200/80 animate-ping"></span>
+                    <svg class="h-5 w-5 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                        <circle cx="12" cy="12" r="10" class="opacity-30" stroke="currentColor" stroke-width="3"></circle>
+                        <path d="M22 12a10 10 0 0 1-10 10" class="opacity-100" stroke="currentColor" stroke-width="3"></path>
+                    </svg>
+                </div>
+                <div>
+                    <p class="text-sm font-semibold text-gray-900 dark:text-gray-100" x-text="globalLoadingTitle"></p>
+                    <p class="text-xs text-gray-600 dark:text-gray-400" x-text="globalLoadingMessage"></p>
+                </div>
+            </div>
+            <div class="mt-4 h-1.5 rounded-full bg-gray-200 dark:bg-gray-800 overflow-hidden">
+                <div class="h-full bg-gradient-to-r from-primary-500 via-cyan-400 to-purple-500 animate-pulse"></div>
+            </div>
+        </div>
+    </div>
+    <div x-show="isGrading || status === 'grading'" x-cloak
+        class="fixed bottom-5 right-5 z-[100] rounded-2xl border border-emerald-300/50 dark:border-emerald-700/60 bg-emerald-50/95 dark:bg-emerald-950/85 px-4 py-3 shadow-xl backdrop-blur-sm">
+        <div class="flex items-center gap-3">
+            <div class="relative h-8 w-8 rounded-full bg-emerald-500/15 flex items-center justify-center">
+                <span class="absolute h-8 w-8 rounded-full border border-emerald-400/60 animate-ping"></span>
+                <svg class="h-4 w-4 text-emerald-600 dark:text-emerald-300 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                    <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor" stroke-width="3"></path>
+                </svg>
+            </div>
+            <div>
+                <p class="text-xs font-semibold text-emerald-800 dark:text-emerald-300">Grading in progress</p>
+                <p class="text-[11px] text-emerald-700/80 dark:text-emerald-400/80" x-text="currentStage || 'Running ingestion + AI analysis'"></p>
+            </div>
+        </div>
+    </div>
+
     <!-- Breadcrumb -->
     <div>
         <a href="/"
@@ -71,6 +109,7 @@
         x-data="uploadWidget()">
         <h2 class="text-lg font-semibold mb-4">Upload Student Submissions</h2>
         <form action="/session/{{ session.id }}/upload" method="post" enctype="multipart/form-data" class="space-y-4"
+            @submit="submitUpload($event)"
             x-ref="uploadForm">
             <div class="border-2 border-dashed rounded-2xl p-10 text-center transition cursor-pointer"
                 :class="dragging ? 'border-primary-400 bg-primary-50 dark:bg-primary-900/20' : 'border-gray-300 dark:border-gray-700 hover:border-primary-400 hover:bg-primary-50/50 dark:hover:bg-primary-900/10'"
@@ -93,10 +132,43 @@
             </div>
             <button type="submit"
                 class="px-6 py-3 bg-gradient-to-r from-primary-600 to-purple-600 text-white font-semibold rounded-xl hover:from-primary-700 hover:to-purple-700 transition-all shadow-lg shadow-primary-500/25 disabled:opacity-50 disabled:cursor-not-allowed"
-                :disabled="!fileName" x-text="uploading ? 'Uploading...' : 'Upload and Extract'">
+                :disabled="!fileName || uploading" x-text="uploading ? 'Uploading...' : 'Upload and Extract'">
                 Upload and Extract
             </button>
         </form>
+        <div x-show="uploading" x-cloak
+            class="fixed inset-0 z-[120] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center px-4">
+            <div class="w-full max-w-lg rounded-2xl border border-cyan-300/40 dark:border-cyan-700/50 bg-white/95 dark:bg-gray-900/95 p-6 shadow-2xl">
+                <div class="flex items-center gap-4">
+                    <div class="relative h-14 w-14 rounded-2xl bg-gradient-to-br from-cyan-500 to-indigo-600 flex items-center justify-center">
+                        <span class="absolute h-14 w-14 rounded-2xl border border-cyan-200/80 animate-ping"></span>
+                        <svg class="h-7 w-7 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                            <path d="M22 12a10 10 0 0 1-10 10" class="opacity-95" stroke="currentColor" stroke-width="3"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-base font-semibold text-gray-900 dark:text-gray-100">Processing ZIP and student files</p>
+                        <p class="text-xs text-gray-600 dark:text-gray-400">Extracting archives, parsing documents, and preparing ingestion metadata...</p>
+                    </div>
+                </div>
+                <div class="mt-5 space-y-2">
+                    <div class="h-2 rounded-full bg-gray-200 dark:bg-gray-800 overflow-hidden">
+                        <div class="h-full bg-gradient-to-r from-cyan-500 via-blue-500 to-indigo-500 animate-pulse"></div>
+                    </div>
+                    <div class="grid grid-cols-3 gap-2">
+                        <div class="h-2 rounded-full bg-cyan-200/80 dark:bg-cyan-900/60 animate-pulse"></div>
+                        <div class="h-2 rounded-full bg-blue-200/80 dark:bg-blue-900/60 animate-pulse [animation-delay:180ms]"></div>
+                        <div class="h-2 rounded-full bg-indigo-200/80 dark:bg-indigo-900/60 animate-pulse [animation-delay:360ms]"></div>
+                    </div>
+                    <div class="grid grid-cols-3 gap-2 text-[11px] pt-1">
+                        <div class="rounded-md border border-cyan-200/70 dark:border-cyan-800/70 px-2 py-1 text-cyan-700 dark:text-cyan-300 animate-pulse">Upload</div>
+                        <div class="rounded-md border border-blue-200/70 dark:border-blue-800/70 px-2 py-1 text-blue-700 dark:text-blue-300 animate-pulse [animation-delay:140ms]">Extract + OCR</div>
+                        <div class="rounded-md border border-indigo-200/70 dark:border-indigo-800/70 px-2 py-1 text-indigo-700 dark:text-indigo-300 animate-pulse [animation-delay:280ms]">Ingestion Report</div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
     {% endif %}
 
@@ -110,11 +182,11 @@
                     <span x-text="totalStudents"></span> graded)</span>
             </h2>
             <div class="flex gap-3 flex-wrap">
-                <template x-if="status !== 'grading' && status !== 'completed' && status !== 'completed_with_errors'">
+                <template x-if="status === 'pending' || status === 'paused'">
                     <button @click="startGrading()"
                         class="px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white text-sm font-semibold rounded-xl hover:from-emerald-600 hover:to-emerald-700 transition-all shadow-lg shadow-emerald-500/25 disabled:opacity-50"
                         :disabled="isGrading">
-                        <span x-show="!isGrading">Start AI Grading</span>
+                        <span x-show="!isGrading" x-text="status === 'paused' ? 'Resume Grading' : 'Start AI Grading'"></span>
                         <span x-show="isGrading" x-cloak class="flex items-center gap-2">
                             <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
                                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
@@ -124,6 +196,18 @@
                             </svg>
                             Starting...
                         </span>
+                    </button>
+                </template>
+                <template x-if="status === 'grading'">
+                    <button @click="stopGrading()"
+                        class="px-4 py-2 text-sm font-medium text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700 rounded-xl hover:bg-red-50 dark:hover:bg-red-900/20 transition">
+                        Stop Grading
+                    </button>
+                </template>
+                <template x-if="status !== 'grading' && hasResults">
+                    <button @click="regradeAll()"
+                        class="px-4 py-2 text-sm font-medium text-indigo-700 dark:text-indigo-300 border border-indigo-300 dark:border-indigo-700 rounded-xl hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition">
+                        Regrade All
                     </button>
                 </template>
                 <template x-if="failedCount > 0">
@@ -157,6 +241,30 @@
 
         <!-- Progress bar -->
         <div x-show="isGrading || status === 'grading'" x-cloak class="mb-6">
+            <div class="mb-3 rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-900/20 p-3 flex items-center gap-3">
+                <span class="inline-flex h-8 w-8 items-center justify-center rounded-full bg-emerald-500/15">
+                    <span class="h-3 w-3 rounded-full bg-emerald-500 animate-ping"></span>
+                </span>
+                <div class="flex-1">
+                    <p class="text-sm font-semibold text-emerald-800 dark:text-emerald-300">Processing submissions</p>
+                    <p class="text-xs text-emerald-700/80 dark:text-emerald-400/80" x-text="currentStage || 'Preparing ingestion and grading steps...'"></p>
+                </div>
+            </div>
+            <div class="mb-3 grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px]">
+                <template x-for="(step, idx) in gradingPipelineSteps" :key="step.key">
+                    <div class="rounded-lg border px-2 py-1.5 transition"
+                        :class="{
+                            'border-emerald-300 bg-emerald-50 dark:border-emerald-700 dark:bg-emerald-900/25': isPipelineStepDone(step.key),
+                            'border-cyan-300 bg-cyan-50 dark:border-cyan-700 dark:bg-cyan-900/25 animate-pulse': isPipelineStepActive(step.key),
+                            'border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800': !isPipelineStepDone(step.key) && !isPipelineStepActive(step.key)
+                        }">
+                        <p class="font-semibold"
+                            :class="isPipelineStepActive(step.key) ? 'text-cyan-700 dark:text-cyan-300' : isPipelineStepDone(step.key) ? 'text-emerald-700 dark:text-emerald-300' : 'text-gray-500 dark:text-gray-400'"
+                            x-text="step.label"></p>
+                        <p class="text-[10px] text-gray-400 dark:text-gray-500" x-text="step.hint"></p>
+                    </div>
+                </template>
+            </div>
             <div class="flex items-center justify-between text-sm text-gray-500 dark:text-gray-400 mb-2">
                 <span class="flex items-center gap-2">
                     <span x-show="currentStudent">
@@ -212,17 +320,23 @@
                                     </p>
                                 </div>
                             </div>
-                            <div class="flex items-center gap-4">
-                                <template x-if="student.status === 'graded' && student.final_score !== null">
-                                    <div class="text-right">
-                                        <div class="text-2xl font-bold"
-                                            :class="getGradeColorClass(student.ai_letter_grade)"
-                                            x-text="student.final_score + '%'"></div>
-                                        <div class="text-sm font-medium"
-                                            :class="getGradeColorClass(student.ai_letter_grade)"
-                                            x-text="student.ai_letter_grade"></div>
-                                    </div>
-                                </template>
+                            <div class="flex items-center gap-3">
+                                 <button @click.stop="regradeStudent(student)"
+                                     class="px-2.5 py-1 text-xs font-medium rounded-lg border border-indigo-200 text-indigo-700 dark:border-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 transition">
+                                     Regrade
+                                 </button>
+                                 <template x-if="student.status === 'graded' && student.final_score !== null && student.final_score !== undefined">
+                                     <div class="text-right">
+                                         <div class="text-2xl font-bold"
+                                             :class="getGradeColorClass(student.ai_letter_grade)"
+                                             x-text="(student.percentage || (student.final_score !== null ? student.final_score.toFixed(1) : '0')) + '%'"></div>
+                                         <div class="text-sm font-medium"
+                                             :class="getGradeColorClass(student.ai_letter_grade)"
+                                             x-text="student.ai_letter_grade || 'N/A'"></div>
+                                         <div class="text-xs text-gray-500"
+                                             x-text="(student.final_score !== null ? student.final_score.toFixed(1) : '0') + ' / ' + {{ session.max_score }} + ' pts'"></div>
+                                     </div>
+                                 </template>
                                 <svg class="w-5 h-5 text-gray-400 transform transition-transform duration-200"
                                     :class="student.expanded ? 'rotate-180' : ''" fill="none" stroke="currentColor"
                                     viewBox="0 0 24 24">
@@ -261,6 +375,16 @@
                                         Files
                                         <span class="text-xs bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded-full"
                                             x-text="(student.files && student.files.length) || student.file_count || 0"></span>
+                                    </span>
+                                </button>
+                                <button @click="student.activeTab = 'ingestion'; loadIngestionReport(student)"
+                                    class="px-4 py-2.5 text-sm font-medium rounded-t-lg transition-colors"
+                                    :class="student.activeTab === 'ingestion' ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 border-b-2 border-primary-500' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'">
+                                    <span class="flex items-center gap-1.5">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                        </svg>
+                                        Ingestion Report
                                     </span>
                                 </button>
                             </div>
@@ -303,40 +427,95 @@
                                         </div>
 
                                         <!-- Rubric Breakdown -->
-                                        <div x-show="student.rubric_breakdown && student.rubric_breakdown.length > 0">
-                                            <h4
-                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
-                                                <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor"
-                                                    viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round"
-                                                        stroke-width="2"
-                                                        d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-                                                </svg>
-                                                Rubric Breakdown
-                                            </h4>
-                                            <div class="space-y-2">
-                                                <template x-for="(item, idx) in student.rubric_breakdown" :key="idx">
-                                                    <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
-                                                        <div class="flex items-center justify-between mb-1">
-                                                            <span
-                                                                class="text-sm font-medium text-gray-700 dark:text-gray-300 capitalize"
-                                                                x-text="item.criterion || 'Criterion ' + (idx + 1)"></span>
-                                                            <span class="text-sm font-bold"
-                                                                x-text="(item.score || 0) + '/' + (item.max || item.max_score || 0)"></span>
-                                                        </div>
-                                                        <div
-                                                            class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 mt-1 mb-2">
-                                                            <div class="bg-gradient-to-r from-primary-500 to-purple-500 h-full rounded-full transition-all duration-500"
-                                                                :style="'width: ' + ((item.score || 0) / (item.max || item.max_score || 1) * 100) + '%'">
-                                                            </div>
-                                                        </div>
-                                                        <p x-show="item.feedback || item.justification"
-                                                            x-text="item.feedback || item.justification"
-                                                            class="text-xs text-gray-500 dark:text-gray-400"></p>
-                                                    </div>
-                                                </template>
-                                            </div>
-                                        </div>
+                                         <div x-show="student.rubric_breakdown && student.rubric_breakdown.length > 0">
+                                             <h4
+                                                 class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                 <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor"
+                                                     viewBox="0 0 24 24">
+                                                     <path stroke-linecap="round" stroke-linejoin="round"
+                                                         stroke-width="2"
+                                                         d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                                                 </svg>
+                                                 Rubric Breakdown
+                                             </h4>
+                                             <div class="space-y-2">
+                                                 <template x-for="(item, idx) in student.rubric_breakdown" :key="idx">
+                                                     <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                                         <div class="flex items-center justify-between mb-1">
+                                                             <span
+                                                                 class="text-sm font-medium text-gray-700 dark:text-gray-300 capitalize"
+                                                                 x-text="item.criterion || 'Criterion ' + (idx + 1)"></span>
+                                                             <span class="text-sm font-bold"
+                                                                 x-text="(item.score || 0) + '/' + (item.max || item.max_score || 0)"></span>
+                                                         </div>
+                                                         <div
+                                                             class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 mt-1 mb-2">
+                                                             <div class="bg-gradient-to-r from-primary-500 to-purple-500 h-full rounded-full transition-all duration-500"
+                                                                 :style="'width: ' + ((item.score || 0) / (item.max || item.max_score || 1) * 100) + '%'">
+                                                             </div>
+                                                         </div>
+                                                         <p x-show="item.feedback || item.justification"
+                                                             x-text="item.feedback || item.justification"
+                                                             class="text-xs text-gray-500 dark:text-gray-400"></p>
+                                                         <div x-show="item.citations && item.citations.length > 0" class="mt-2 flex flex-wrap gap-1.5">
+                                                             <template x-for="(citation, cidx) in (item.citations || [])" :key="cidx">
+                                                                 <span class="inline-flex items-center gap-1 rounded-full bg-indigo-100 dark:bg-indigo-900/35 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 text-[10px]">
+                                                                     <span x-text="citation.image_id || citation.source || 'evidence'"></span>
+                                                                     <span x-show="citation.filename" class="opacity-80" x-text="'(' + citation.filename + (citation.page ? ' p' + citation.page : '') + ')'"></span>
+                                                                 </span>
+                                                             </template>
+                                                         </div>
+                                                     </div>
+                                                 </template>
+                                             </div>
+                                         </div>
+
+                                         <!-- Question Mapping -->
+                                         <div x-show="student.question_mapping && student.question_mapping.length > 0">
+                                             <h4
+                                                 class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                 <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor"
+                                                     viewBox="0 0 24 24">
+                                                     <path stroke-linecap="round" stroke-linejoin="round"
+                                                         stroke-width="2"
+                                                         d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                                                 </svg>
+                                                 Question Breakdown
+                                             </h4>
+                                             <div class="space-y-2">
+                                                 <template x-for="(q, qidx) in student.question_mapping" :key="qidx">
+                                                     <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                                         <div class="flex items-center justify-between mb-1">
+                                                             <span class="text-sm font-medium text-gray-700 dark:text-gray-300"
+                                                                 x-text="'Q' + (q.question_number || (qidx + 1)) + ': ' + (q.question_text || 'Question ' + (qidx + 1))"></span>
+                                                             <div class="flex items-center gap-2">
+                                                                 <span class="text-xs px-2 py-0.5 rounded-full font-medium"
+                                                                     :class="{
+                                                                         'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300': (q.correctness || '').toLowerCase() === 'correct',
+                                                                         'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300': (q.correctness || '').toLowerCase() === 'partially_correct',
+                                                                         'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300': (q.correctness || '').toLowerCase() === 'incorrect',
+                                                                         'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300': !['correct', 'partially_correct', 'incorrect'].includes((q.correctness || '').toLowerCase())
+                                                                     }"
+                                                                     x-text="q.correctness || 'Not assessed'"></span>
+                                                                 <span class="text-sm font-bold"
+                                                                     x-text="(q.score || 0) + '/' + (q.max_points || 0)"></span>
+                                                             </div>
+                                                         </div>
+                                                         <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 mt-1 mb-2">
+                                                             <div class="bg-gradient-to-r from-blue-500 to-cyan-500 h-full rounded-full transition-all duration-500"
+                                                                 :style="'width: ' + (((q.score || 0) / Math.max(q.max_points || 1, 1)) * 100) + '%'"></div>
+                                                         </div>
+                                                         <p x-show="q.files_addressing && q.files_addressing.length > 0"
+                                                             class="text-xs text-gray-500 dark:text-gray-400 mb-1"
+                                                             x-text="'Files: ' + (q.files_addressing || []).join(', ')"></p>
+                                                         <p x-show="q.feedback" x-text="q.feedback"
+                                                             class="text-xs text-gray-500 dark:text-gray-400"></p>
+                                                         <p x-show="q.response_summary" x-text="q.response_summary"
+                                                             class="text-xs text-gray-400 dark:text-gray-500 mt-1 italic"></p>
+                                                     </div>
+                                                 </template>
+                                             </div>
+                                         </div>
 
                                         <!-- Strengths -->
                                         <div x-show="student.strengths && student.strengths.length > 0">
@@ -414,24 +593,63 @@
                                             </div>
                                         </div>
 
-                                        <!-- Suggestions -->
-                                        <div x-show="student.suggestions_for_improvement">
-                                            <h4
-                                                class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
-                                                <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor"
-                                                    viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round"
-                                                        stroke-width="2"
-                                                        d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                                                </svg>
-                                                Suggestions for Improvement
-                                            </h4>
-                                            <div
-                                                class="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-xl p-4">
-                                                <p class="text-sm text-indigo-800 dark:text-indigo-200 whitespace-pre-wrap leading-relaxed"
-                                                    x-text="student.suggestions_for_improvement"></p>
-                                            </div>
-                                        </div>
+                                         <!-- Suggestions -->
+                                         <div x-show="student.suggestions_for_improvement">
+                                             <h4
+                                                 class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                 <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor"
+                                                     viewBox="0 0 24 24">
+                                                     <path stroke-linecap="round" stroke-linejoin="round"
+                                                         stroke-width="2"
+                                                         d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                                                 </svg>
+                                                 Suggestions for Improvement
+                                             </h4>
+                                             <div
+                                                 class="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-xl p-4">
+                                                 <p class="text-sm text-indigo-800 dark:text-indigo-200 whitespace-pre-wrap leading-relaxed"
+                                                     x-text="student.suggestions_for_improvement"></p>
+                                             </div>
+                                         </div>
+
+                                         <!-- Visual Content Analysis -->
+                                         <div x-show="student.visual_content_analysis">
+                                             <h4
+                                                 class="font-semibold text-gray-900 dark:text-gray-100 mb-2 flex items-center gap-2">
+                                                 <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor"
+                                                     viewBox="0 0 24 24">
+                                                     <path stroke-linecap="round" stroke-linejoin="round"
+                                                         stroke-width="2"
+                                                         d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                                 </svg>
+                                                 Visual Content Analysis
+                                             </h4>
+                                             <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-4">
+                                                 <p class="text-xs text-gray-500 dark:text-gray-400"
+                                                     x-show="student.visual_content_analysis && student.visual_content_analysis.images_reviewed"
+                                                     x-text="'Images reviewed: ' + student.visual_content_analysis.images_reviewed"></p>
+                                                 <p class="text-xs text-gray-500 dark:text-gray-400"
+                                                     x-show="student.visual_content_analysis && student.visual_content_analysis.visual_accuracy"
+                                                     x-text="'Visual accuracy: ' + student.visual_content_analysis.visual_accuracy"></p>
+                                                 <div x-show="student.visual_content_analysis && student.visual_content_analysis.key_observations && student.visual_content_analysis.key_observations.length > 0"
+                                                     class="mt-2">
+                                                     <template x-for="(obs, oi) in (student.visual_content_analysis.key_observations || [])" :key="oi">
+                                                         <p class="text-xs text-gray-500 dark:text-gray-400 flex items-start gap-1">
+                                                             <span class="text-purple-500 mt-0.5">•</span>
+                                                             <span x-text="obs"></span>
+                                                         </p>
+                                                     </template>
+                                                 </div>
+                                             </div>
+                                         </div>
+
+                                         <!-- Confidence Reasoning -->
+                                         <div x-show="student.confidence_reasoning" class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                             <p class="text-xs text-gray-500 dark:text-gray-400">
+                                                 <span class="font-medium">Confidence reasoning:</span>
+                                                 <span x-text="student.confidence_reasoning"></span>
+                                             </p>
+                                         </div>
 
                                         <!-- Override -->
                                         <div class="border-t border-gray-200 dark:border-gray-800 pt-4">
@@ -463,7 +681,13 @@
                                                 <button @click="saveOverride(student)" :disabled="student.saving"
                                                     class="px-4 py-1.5 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 transition disabled:opacity-50">
                                                     <span x-show="!student.saving">Save Override</span>
-                                                    <span x-show="student.saving" x-cloak>Saving...</span>
+                                                    <span x-show="student.saving" x-cloak class="inline-flex items-center gap-1.5">
+                                                        <svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+                                                            <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                                                            <path d="M22 12a10 10 0 0 1-10 10" class="opacity-85" stroke="currentColor" stroke-width="3"></path>
+                                                        </svg>
+                                                        Saving...
+                                                    </span>
                                                 </button>
                                                 <span x-show="student.overrideSaved"
                                                     class="text-emerald-600 text-sm">Saved!</span>
@@ -538,7 +762,13 @@
                                                 <div class="p-4 border-t border-gray-200 dark:border-gray-700">
                                                     <!-- Loading -->
                                                     <div x-show="file.loading"
-                                                        class="text-center py-4 text-sm text-gray-400">Loading...</div>
+                                                        class="text-center py-4 text-sm text-gray-400 inline-flex items-center gap-2">
+                                                        <svg class="w-4 h-4 animate-spin text-primary-500" viewBox="0 0 24 24" fill="none">
+                                                            <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
+                                                            <path d="M22 12a10 10 0 0 1-10 10" class="opacity-85" stroke="currentColor" stroke-width="3"></path>
+                                                        </svg>
+                                                        Loading preview...
+                                                    </div>
                                                     <!-- Code / Text -->
                                                     <div
                                                         x-show="!file.loading && (file.display_type === 'code' || file.display_type === 'text' || file.display_type === 'notebook' || file.display_type === 'docx')">
@@ -577,6 +807,258 @@
                                         class="text-center py-6 text-sm text-gray-400">
                                         No files found for this student.
                                     </div>
+                                </div>
+                            </div>
+
+                            <!-- ===== INGESTION REPORT TAB ===== -->
+                            <div x-show="student.activeTab === 'ingestion'">
+                                <div x-show="student.ingestionLoading" class="flex items-center gap-2 text-sm text-gray-500 py-2">
+                                    <svg class="animate-spin h-4 w-4 text-primary-500" fill="none" viewBox="0 0 24 24">
+                                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+                                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                    </svg>
+                                    Loading latest ingestion report...
+                                </div>
+                                <div x-show="(student.ingestion_report && Object.keys(student.ingestion_report).length > 0) || (student.ai_result && student.ai_result.transparency)" class="space-y-4">
+                                    <!-- What Was Sent to LLM -->
+                                    <div class="bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-xl p-4" x-show="student.ai_result && student.ai_result.transparency">
+                                        <h4 class="font-semibold text-purple-800 dark:text-purple-300 mb-3 flex items-center gap-2">
+                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                            </svg>
+                                            What Was Sent to AI for Grading
+                                        </h4>
+                                        <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-3">
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-purple-600" x-text="(student.ai_result && student.ai_result.transparency && student.ai_result.transparency.text_chars_sent) ? student.ai_result.transparency.text_chars_sent.toLocaleString() : 0"></div>
+                                                <div class="text-xs text-purple-600/70">Text Characters</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-purple-600"
+                                                    x-text="(student.ai_result && student.ai_result.transparency) ? ((student.ai_result.transparency.images_sent || 0) + ((student.ai_result.transparency.images_selected_total && student.ai_result.transparency.images_selected_total > (student.ai_result.transparency.images_sent || 0)) ? (' / ' + student.ai_result.transparency.images_selected_total) : '')) : 0"></div>
+                                                <div class="text-xs text-purple-600/70">Final Images Sent</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-purple-600"
+                                                    x-text="(student.ai_result && student.ai_result.transparency && student.ai_result.transparency.images_processed_in_batches) ? student.ai_result.transparency.images_processed_in_batches : 0"></div>
+                                                <div class="text-xs text-purple-600/70">Images Analyzed</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-purple-600" x-text="(student.ai_result && student.ai_result.transparency && student.ai_result.transparency.files_processed) ? student.ai_result.transparency.files_processed.length : 0"></div>
+                                                <div class="text-xs text-purple-600/70">Files Processed</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xs font-semibold text-purple-700 dark:text-purple-300 truncate" x-text="(student.ai_result && student.ai_result.transparency && student.ai_result.transparency.llm_call && student.ai_result.transparency.llm_call.model) ? student.ai_result.transparency.llm_call.model : 'N/A'"></div>
+                                                <div class="text-xs text-purple-600/70 mt-1">Model</div>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- Images Sent Detail -->
+                                        <div x-show="student.ai_result && student.ai_result.transparency && student.ai_result.transparency.images_info && student.ai_result.transparency.images_info.length > 0" class="mt-3">
+                                            <h5 class="text-sm font-semibold text-purple-700 dark:text-purple-400 mb-2">Final-call Images Sent to AI:</h5>
+                                            <div class="space-y-1 max-h-40 overflow-y-auto">
+                                                <template x-for="(img, idx) in (student.ai_result && student.ai_result.transparency && student.ai_result.transparency.images_info) ? student.ai_result.transparency.images_info : []" :key="idx">
+                                                    <div class="flex items-center gap-2 text-xs bg-white dark:bg-gray-800 rounded p-2">
+                                                        <span class="text-purple-500 font-mono">#<span x-text="idx + 1"></span></span>
+                                                        <span class="font-medium" x-text="img.filename"></span>
+                                                        <span class="text-gray-400">-</span>
+                                                        <span x-text="img.description"></span>
+                                                        <span class="text-gray-400 ml-auto" x-text="(img.size_bytes / 1024).toFixed(1) + ' KB'"></span>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </div>
+                                        <div x-show="student.ai_result && student.ai_result.transparency && student.ai_result.transparency.images_analyzed_info && student.ai_result.transparency.images_analyzed_info.length > 0" class="mt-3">
+                                            <h5 class="text-sm font-semibold text-purple-700 dark:text-purple-400 mb-2">Images Processed in Vision Batches:</h5>
+                                            <div class="space-y-1 max-h-44 overflow-y-auto">
+                                                <template x-for="(img, idx) in (student.ai_result && student.ai_result.transparency && student.ai_result.transparency.images_analyzed_info) ? student.ai_result.transparency.images_analyzed_info : []" :key="idx">
+                                                    <div class="flex items-center gap-2 text-xs bg-white dark:bg-gray-800 rounded p-2">
+                                                        <span class="text-purple-500 font-mono" x-text="img.image_id || ('img_' + (idx + 1))"></span>
+                                                        <span class="font-medium" x-text="img.filename"></span>
+                                                        <span class="text-gray-400" x-text="img.page ? ('p' + img.page) : ''"></span>
+                                                        <span class="text-gray-500 truncate" x-text="img.description"></span>
+                                                        <span class="ml-auto text-[10px] px-1.5 py-0.5 rounded-full"
+                                                            :class="img.substantive ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300'"
+                                                            x-text="img.substantive ? 'substantive' : 'low-signal'"></span>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </div>
+
+                                        <!-- Prompt Preview -->
+                                        <div class="mt-3" x-show="student.ai_result && student.ai_result.transparency && student.ai_result.transparency.prompt_preview">
+                                            <h5 class="text-sm font-semibold text-purple-700 dark:text-purple-400 mb-2">Prompt Preview (first 500 chars):</h5>
+                                            <div class="bg-gray-900 text-gray-100 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap overflow-x-auto" x-text="student.ai_result.transparency.prompt_preview"></div>
+                                        </div>
+                                        <div class="mt-3" x-show="student.ai_result && student.ai_result.transparency && student.ai_result.transparency.llm_call">
+                                            <h5 class="text-sm font-semibold text-purple-700 dark:text-purple-400 mb-2">LLM Call Overview:</h5>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-3 text-xs space-y-1">
+                                                <p><span class="font-semibold">Provider:</span> <span x-text="student.ai_result.transparency.llm_call.provider || 'N/A'"></span></p>
+                                                <p><span class="font-semibold">Model:</span> <span x-text="student.ai_result.transparency.llm_call.model || 'N/A'"></span></p>
+                                                <p><span class="font-semibold">Primary Provider:</span> <span x-text="student.ai_result.transparency.llm_call.preferred_provider || 'auto'"></span></p>
+                                                <p><span class="font-semibold">Fallback Used:</span> <span x-text="student.ai_result.transparency.llm_call.fallback_used ? 'Yes' : 'No'"></span></p>
+                                                <p x-show="student.ai_result.transparency.llm_call.consistency_alert_threshold !== undefined">
+                                                    <span class="font-semibold">Regrade Delta:</span>
+                                                    <span x-text="((student.ai_result.transparency.llm_call.regrade_score_delta !== undefined) ? student.ai_result.transparency.llm_call.regrade_score_delta : 0) + ' (threshold ' + student.ai_result.transparency.llm_call.consistency_alert_threshold + ')'"></span>
+                                                </p>
+                                                <p x-show="student.ai_result.transparency.llm_call.consistency_alert" class="text-amber-600 dark:text-amber-400">
+                                                    <span class="font-semibold">Consistency Alert:</span> Score shifted beyond threshold.
+                                                </p>
+                                                <p><span class="font-semibold">Temperature:</span> <span x-text="student.ai_result.transparency.llm_call.temperature"></span></p>
+                                                <p><span class="font-semibold">Timestamp:</span> <span x-text="student.ai_result.transparency.llm_call.timestamp_utc || 'N/A'"></span></p>
+                                                <p x-show="student.ai_result.transparency.llm_call.usage"><span class="font-semibold">Token Usage:</span>
+                                                    <span x-text="(student.ai_result.transparency.llm_call.usage && student.ai_result.transparency.llm_call.usage.total_tokens) ? student.ai_result.transparency.llm_call.usage.total_tokens + ' total' : 'N/A'"></span>
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <div class="mt-3" x-show="student.ai_result && student.ai_result.transparency && student.ai_result.transparency.vision_preanalysis">
+                                            <h5 class="text-sm font-semibold text-purple-700 dark:text-purple-400 mb-2">Vision Pre-Analysis:</h5>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-3 text-xs space-y-1">
+                                                <p><span class="font-semibold">Enabled:</span> <span x-text="student.ai_result.transparency.vision_preanalysis.enabled ? 'Yes' : 'No'"></span></p>
+                                                <p><span class="font-semibold">Model:</span> <span x-text="student.ai_result.transparency.vision_preanalysis.model || 'N/A'"></span></p>
+                                                <p><span class="font-semibold">Images Analyzed:</span> <span x-text="student.ai_result.transparency.vision_preanalysis.images_analyzed || 0"></span></p>
+                                                <p><span class="font-semibold">Batches:</span> <span x-text="student.ai_result.transparency.vision_preanalysis.chunks || 0"></span></p>
+                                                <p x-show="student.ai_result.transparency.vision_preanalysis.error" class="text-red-500"><span class="font-semibold">Error:</span> <span x-text="student.ai_result.transparency.vision_preanalysis.error"></span></p>
+                                            </div>
+                                            <div x-show="student.ai_result.transparency.vision_preanalysis.notes_preview" class="mt-2 bg-gray-900 text-gray-100 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap"
+                                                x-text="student.ai_result.transparency.vision_preanalysis.notes_preview"></div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Evidence Used -->
+                                    <div class="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-xl p-4"
+                                        x-show="(student.ai_result && student.ai_result.evidence_map && student.ai_result.evidence_map.length > 0) || (student.ai_result && student.ai_result.evidence_trail && student.ai_result.evidence_trail.length > 0)">
+                                        <h4 class="font-semibold text-indigo-800 dark:text-indigo-300 mb-3 flex items-center gap-2">
+                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                                            </svg>
+                                            What Evidence Was Used
+                                        </h4>
+                                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-indigo-600" x-text="(student.ai_result && student.ai_result.evidence_map) ? student.ai_result.evidence_map.length : 0"></div>
+                                                <div class="text-xs text-indigo-600/70">Evidence Map Rows</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-indigo-600" x-text="(student.ai_result && student.ai_result.evidence_trail) ? student.ai_result.evidence_trail.length : 0"></div>
+                                                <div class="text-xs text-indigo-600/70">Criterion Trails</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xl font-bold text-indigo-600"
+                                                    x-text="(student.ai_result && student.ai_result.transparency && student.ai_result.transparency.images_processed_in_batches) ? student.ai_result.transparency.images_processed_in_batches : 0"></div>
+                                                <div class="text-xs text-indigo-600/70">Images Batches</div>
+                                            </div>
+                                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 text-center">
+                                                <div class="text-xs font-semibold text-indigo-700 dark:text-indigo-300 truncate"
+                                                    x-text="(student.ai_result && student.ai_result.transparency && student.ai_result.transparency.llm_call) ? (student.ai_result.transparency.llm_call.provider || 'N/A') : 'N/A'"></div>
+                                                <div class="text-xs text-indigo-600/70 mt-1">Final Provider</div>
+                                            </div>
+                                        </div>
+                                        <div x-show="student.ai_result && student.ai_result.evidence_map && student.ai_result.evidence_map.length > 0" class="space-y-1 max-h-52 overflow-y-auto">
+                                            <template x-for="(ev, eidx) in (student.ai_result && student.ai_result.evidence_map) ? student.ai_result.evidence_map : []" :key="eidx">
+                                                <div class="text-xs bg-white dark:bg-gray-800 rounded p-2 flex items-center gap-2">
+                                                    <span class="font-mono text-indigo-600" x-text="ev.image_id"></span>
+                                                    <span class="font-medium" x-text="ev.filename"></span>
+                                                    <span class="text-gray-400" x-text="ev.page ? ('p' + ev.page) : ''"></span>
+                                                    <span class="text-gray-500 truncate" x-text="ev.summary || ev.description"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </div>
+
+                                    <!-- File Processing Summary -->
+                                    <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-4" x-show="student.ingestion_report && Object.keys(student.ingestion_report).length > 0">
+                                        <h4 class="font-semibold text-blue-800 dark:text-blue-300 mb-2 flex items-center gap-2">
+                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                            </svg>
+                                            File Processing Summary
+                                        </h4>
+                                        <div class="grid grid-cols-3 gap-4 text-sm">
+                                            <div class="text-center">
+                                                <div class="text-2xl font-bold text-blue-600" x-text="student.ingestion_report?.summary?.received || 0"></div>
+                                                <div class="text-blue-600/70">Files Received</div>
+                                            </div>
+                                            <div class="text-center">
+                                                <div class="text-2xl font-bold text-emerald-600" x-text="student.ingestion_report?.summary?.parsed || 0"></div>
+                                                <div class="text-emerald-600/70">Successfully Parsed</div>
+                                            </div>
+                                            <div class="text-center">
+                                                <div class="text-2xl font-bold" :class="(student.ingestion_report?.summary?.failed || 0) > 0 ? 'text-red-600' : 'text-gray-400'" x-text="student.ingestion_report?.summary?.failed || 0"></div>
+                                                <div :class="(student.ingestion_report?.summary?.failed || 0) > 0 ? 'text-red-600/70' : 'text-gray-400/70'">Failed</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div x-show="student.ingestion_report?.total_text_chars > 0 || student.ingestion_report?.total_images > 0" class="grid grid-cols-2 gap-4">
+                                        <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                            <div class="text-xs text-gray-500 uppercase tracking-wider">Text Content Extracted</div>
+                                            <div class="text-lg font-semibold" x-text="(student.ingestion_report?.total_text_chars || 0).toLocaleString() + ' chars'"></div>
+                                        </div>
+                                        <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+                                            <div class="text-xs text-gray-500 uppercase tracking-wider">Images Extracted</div>
+                                            <div class="text-lg font-semibold" x-text="(student.ingestion_report?.total_images || 0) + ' images'"></div>
+                                        </div>
+                                    </div>
+
+                                    <div x-show="student.ingestion_report?.files_parsed?.length > 0" class="space-y-3">
+                                        <h5 class="font-semibold text-gray-700 dark:text-gray-300 text-sm">Per-File Parsing Details</h5>
+                                        <template x-for="(parsedFile, pidx) in (student.ingestion_report?.files_parsed || [])" :key="pidx">
+                                            <div class="border border-gray-200 dark:border-gray-700 rounded-xl p-3 bg-white dark:bg-gray-800/40">
+                                                <div class="flex items-center justify-between gap-3">
+                                                    <div>
+                                                        <p class="text-sm font-semibold" x-text="parsedFile.filename"></p>
+                                                        <p class="text-xs text-gray-500" x-text="(parsedFile.file_type || parsedFile.extension || 'unknown') + ' • ' + (parsedFile.extraction_method || 'n/a')"></p>
+                                                    </div>
+                                                    <div class="text-xs text-gray-500 text-right">
+                                                        <p x-text="(parsedFile.text_length || 0).toLocaleString() + ' chars'"></p>
+                                                        <p x-text="(parsedFile.image_count || 0) + ' images'"></p>
+                                                    </div>
+                                                </div>
+                                                <p class="mt-2 text-xs text-gray-600 dark:text-gray-400 whitespace-pre-wrap" x-show="parsedFile.text_preview" x-text="parsedFile.text_preview"></p>
+                                                <div class="mt-2 grid grid-cols-2 md:grid-cols-3 gap-2" x-show="parsedFile.image_previews && parsedFile.image_previews.length > 0">
+                                                    <template x-for="(preview, pi) in (parsedFile.image_previews || [])" :key="pi">
+                                                        <div class="rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-900">
+                                                            <img :src="preview.data_url" class="w-full h-28 object-contain bg-gray-50 dark:bg-gray-900" alt="Extracted preview">
+                                                            <p class="px-2 py-1 text-[11px] text-gray-600 dark:text-gray-400 truncate" x-text="preview.description || ('Page ' + (preview.page || '?'))"></p>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+
+                                    <div x-show="student.ingestion_report?.content_truncated" class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-3">
+                                        <p class="text-sm text-amber-800 dark:text-amber-300 flex items-center gap-2">
+                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.27 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                                            </svg>
+                                            Content was truncated due to size limits
+                                        </p>
+                                    </div>
+
+                                    <div x-show="student.ingestion_report?.warnings?.length > 0" class="space-y-2">
+                                        <h5 class="font-semibold text-amber-700 dark:text-amber-400 text-sm">Warnings</h5>
+                                        <template x-for="warning in (student.ingestion_report?.warnings || [])" :key="warning">
+                                            <p class="text-sm text-amber-600 dark:text-amber-400 flex items-start gap-2">
+                                                <span class="text-amber-500">⚠</span>
+                                                <span x-text="warning"></span>
+                                            </p>
+                                        </template>
+                                    </div>
+
+                                    <div x-show="student.ingestion_report?.errors?.length > 0" class="space-y-2">
+                                        <h5 class="font-semibold text-red-700 dark:text-red-400 text-sm">Errors</h5>
+                                        <template x-for="error in (student.ingestion_report?.errors || [])" :key="error">
+                                            <p class="text-sm text-red-600 dark:text-red-400 flex items-start gap-2">
+                                                <span class="text-red-500">✗</span>
+                                                <span x-text="error"></span>
+                                            </p>
+                                        </template>
+                                    </div>
+                                </div>
+                                    <div x-show="!(student.ingestion_report && Object.keys(student.ingestion_report).length > 0) && !(student.ai_result && student.ai_result.transparency)" class="text-center py-6 text-sm text-gray-400">
+                                    No ingestion report available. This student was graded before the transparency feature was added.
                                 </div>
                             </div>
                         </div>
@@ -623,318 +1105,505 @@
             handleFileSelect(event) {
                 var files = event.target.files;
                 this.fileName = files.length > 0 ? files[0].name : '';
+            },
+            async submitUpload(event) {
+                if (this.uploading) {
+                    event.preventDefault();
+                    return;
+                }
+                if (!this.fileName) {
+                    event.preventDefault();
+                    return;
+                }
+                event.preventDefault();
+                this.uploading = true;
+                var form = event.target;
+                try {
+                    var response = await fetch(form.action, {
+                        method: 'POST',
+                        body: new FormData(form),
+                        redirect: 'follow'
+                    });
+                    if (!response.ok) {
+                        throw new Error('Upload failed with status ' + response.status);
+                    }
+                    if (response.redirected && response.url) {
+                        window.location.href = response.url;
+                    } else {
+                        window.location.reload();
+                    }
+                } catch (err) {
+                    this.uploading = false;
+                    if (typeof showToast === 'function') {
+                        showToast(err.message || 'Upload failed', 'error');
+                    } else {
+                        alert(err.message || 'Upload failed');
+                    }
+                }
             }
         };
     }
 
     function gradingSession() {
         var sid = {{ session.id }};
-    var initStatus = '{{ session.status }}';
-    var initTotal = {{ session.total_students or 0 }};
-    var initGraded = {{ session.graded_count or 0 }};
-    var initIsGrading = {% if session.status == 'grading' %}true{% else %} false{% endif %};
-    var initHasResults = {% if (session.graded_count or 0) > 0 %}true{% else %} false{% endif %};
-    var initSubmissions = {{ submissions_json| safe }};
+        var initStatus = '{{ session.status }}';
+        var initTotal = {{ session.total_students or 0 }};
+        var initGraded = {{ session.graded_count or 0 }};
+        var initIsGrading = {% if session.status == 'grading' %}true{% else %} false{% endif %};
+        var initHasResults = {% if (session.graded_count or 0) > 0 %}true{% else %} false{% endif %};
+        var initSubmissions = {{ submissions_json| safe }};
 
-    return {
-        sessionId: sid,
-        status: initStatus,
-        totalStudents: initTotal,
-        gradedCount: initGraded,
-        currentStudent: '',
-        currentStage: '',
-        isGrading: initIsGrading,
-        sseStatus: 'disconnected',
-        failedCount: 0,
-        hasResults: initHasResults,
-        students: [],
-        eventSource: null,
-        reconnectAttempts: 0,
-        maxReconnectAttempts: 5,
+        return {
+            sessionId: sid,
+            status: initStatus,
+            totalStudents: initTotal,
+            gradedCount: initGraded,
+            currentStudent: '',
+            currentStage: '',
+            isGrading: initIsGrading,
+            sseStatus: 'disconnected',
+            failedCount: 0,
+            hasResults: initHasResults,
+            students: [],
+            eventSource: null,
+            reconnectAttempts: 0,
+            maxReconnectAttempts: 5,
+            globalLoading: false,
+            globalLoadingTitle: 'Working...',
+            globalLoadingMessage: 'Preparing request',
+            gradingPipelineSteps: [
+                { key: 'extract', label: 'Extraction', hint: 'ZIP + file unpack' },
+                { key: 'ocr', label: 'OCR/Text', hint: 'Parse + OCR' },
+                { key: 'vision', label: 'Vision', hint: 'Batch image analysis' },
+                { key: 'grading', label: 'Grading', hint: 'Rubric scoring' },
+                { key: 'moderation', label: 'Moderation', hint: 'Disagreement checks' },
+            ],
 
-        init() {
-            try {
-                this.students = initSubmissions.map(function (s) {
-                    return Object.assign({}, s, {
-                        expanded: false,
-                        overrideScore: s.is_overridden ? s.override_score : (s.ai_score || 0),
-                        overrideComments: s.override_comments || '',
-                        isReviewed: s.is_reviewed || false,
-                        saving: false,
-                        overrideSaved: false,
-                        files: s.files || [],
-                        activeTab: 'feedback',
-                        loadedFiles: null,
-                        filesLoading: false
-                    });
-                });
-            } catch (e) {
-                console.error('Failed to parse submissions:', e);
-                this.students = [];
-            }
-
-            this.hasResults = this.students.some(function (s) { return s.status === 'graded'; });
-            this.failedCount = this.students.filter(function (s) { return s.status === 'error'; }).length;
-
-            if (this.status === 'grading') {
-                this.isGrading = true;
-                this.connectSSE();
-            }
-        },
-
-        startGrading: function () {
-            var self = this;
-            self.isGrading = true;
-            self.sseStatus = 'connecting';
-            fetch('/session/' + self.sessionId + '/grade', { method: 'POST' })
-                .then(function (resp) { return resp.json().then(function (data) { return { ok: resp.ok, data: data }; }); })
-                .then(function (result) {
-                    if (result.ok) {
-                        showToast('Grading started!', 'success');
-                        self.connectSSE();
-                    } else {
-                        showToast(result.data.message || 'Failed to start grading', 'error');
-                        self.isGrading = false;
-                        self.sseStatus = 'error';
-                    }
-                })
-                .catch(function () {
-                    showToast('Network error', 'error');
-                    self.isGrading = false;
-                    self.sseStatus = 'error';
-                });
-        },
-
-        retryFailed: function () {
-            var self = this;
-            fetch('/session/' + self.sessionId + '/retry-failed', { method: 'POST' })
-                .then(function (resp) { return resp.json().then(function (data) { return { ok: resp.ok, data: data }; }); })
-                .then(function (result) {
-                    if (result.ok) {
-                        showToast(result.data.message, 'success');
-                        setTimeout(function () { location.reload(); }, 500);
-                    } else {
-                        showToast(result.data.message || 'Failed to retry', 'error');
-                    }
-                })
-                .catch(function () { showToast('Network error', 'error'); });
-        },
-
-        connectSSE: function () {
-            var self = this;
-            if (self.eventSource) self.eventSource.close();
-
-            self.sseStatus = 'connecting';
-            self.eventSource = new EventSource('/session/' + self.sessionId + '/grade-stream');
-
-            self.eventSource.onopen = function () {
-                self.sseStatus = 'connected';
-                self.reconnectAttempts = 0;
-            };
-
-            self.eventSource.onmessage = function (event) {
+            init() {
                 try {
-                    var data = JSON.parse(event.data);
-                    self.handleSSEMessage(data);
+                    this.students = initSubmissions.map(function (s) {
+                        return Object.assign({}, s, {
+                            expanded: false,
+                            overrideScore: s.is_overridden ? s.override_score : (s.ai_score || 0),
+                            overrideComments: s.override_comments || '',
+                            isReviewed: s.is_reviewed || false,
+                            saving: false,
+                            overrideSaved: false,
+                            files: s.files || [],
+                            activeTab: 'feedback',
+                            loadedFiles: null,
+                            filesLoading: false,
+                            ingestionLoading: false,
+                        });
+                    });
                 } catch (e) {
-                    console.error('SSE parse error:', e);
+                    console.error('Failed to parse submissions:', e);
+                    this.students = [];
                 }
-            };
 
-            self.eventSource.onerror = function () {
-                self.sseStatus = 'error';
-                self.eventSource.close();
-                if (self.isGrading && self.reconnectAttempts < self.maxReconnectAttempts) {
-                    self.reconnectAttempts++;
-                    setTimeout(function () { self.connectSSE(); }, 2000 * self.reconnectAttempts);
+                this.hasResults = this.students.some(function (s) { return s.status === 'graded'; });
+                this.failedCount = this.students.filter(function (s) { return s.status === 'error'; }).length;
+
+                if (this.status === 'grading') {
+                    this.isGrading = true;
+                    this.connectSSE();
                 }
-            };
-        },
+            },
 
-        handleSSEMessage: function (data) {
-            var self = this;
-            switch (data.type) {
-                case 'progress':
-                    self.gradedCount = data.graded_count || self.gradedCount;
-                    self.totalStudents = data.total || self.totalStudents;
-                    self.currentStudent = data.student || '';
-                    self.currentStage = data.stage || '';
-                    self.failedCount = data.failed_count || 0;
-                    self.status = 'grading';
-                    // Update the specific student card to show "grading" status
-                    for (var i = 0; i < self.students.length; i++) {
-                        if (self.students[i].student_identifier === data.student) {
-                            self.students[i].status = 'grading';
-                        }
-                    }
-                    break;
-                case 'student_complete':
-                    self.updateStudentFromResult(data);
-                    self.gradedCount = Math.max(self.gradedCount, data.graded_count || 0);
-                    self.failedCount = data.failed_count || 0;
-                    self.hasResults = true;
-                    break;
-                case 'student_error':
-                    // Mark the student as errored in real-time
-                    for (var j = 0; j < self.students.length; j++) {
-                        if (self.students[j].id === data.student_id) {
-                            self.students[j].status = 'error';
-                            self.students[j].error_message = data.error || 'Grading failed';
-                            break;
-                        }
-                    }
-                    self.gradedCount = data.graded_count || self.gradedCount;
-                    self.failedCount = data.failed_count || 0;
-                    break;
-                case 'complete':
-                    self.status = 'completed';
-                    self.isGrading = false;
-                    self.gradedCount = data.graded_count || self.totalStudents;
-                    self.failedCount = data.failed_count || 0;
-                    self.currentStudent = '';
-                    self.currentStage = '';
-                    self.hasResults = true;
-                    showToast(data.message || 'Grading completed!', 'success');
-                    self.closeSSE();
-                    break;
-                case 'error':
-                    showToast(data.message || 'Grading error occurred', 'error');
-                    break;
-            }
-        },
+            startGrading: async function () {
+                this.setGlobalLoading('Starting AI grading', 'Connecting to backend and opening live stream');
+                this.isGrading = true;
+                this.sseStatus = 'connecting';
+                try {
+                    var resp = await fetch('/session/' + this.sessionId + '/grade', { method: 'POST' });
+                    var payload = await resp.json();
+                    if (!resp.ok) throw new Error(payload.message || 'Failed to start grading');
+                    this.status = 'grading';
+                    this.connectSSE();
+                    showToast('Grading started', 'success');
+                } catch (err) {
+                    this.isGrading = false;
+                    this.sseStatus = 'error';
+                    showToast(err.message || 'Network error', 'error');
+                } finally {
+                    this.clearGlobalLoading();
+                }
+            },
 
-        updateStudentFromResult: function (data) {
-            var self = this;
-            for (var i = 0; i < self.students.length; i++) {
-                if (self.students[i].id === data.student_id) {
+            stopGrading: async function () {
+                this.setGlobalLoading('Stopping grading', 'Waiting for current operation to stop safely');
+                try {
+                    var resp = await fetch('/session/' + this.sessionId + '/stop-grading', { method: 'POST' });
+                    var payload = await resp.json();
+                    if (!resp.ok) throw new Error(payload.message || 'Failed to stop grading');
+                    this.status = 'paused';
+                    this.isGrading = false;
+                    this.currentStage = 'Stopped by user';
+                    showToast(payload.message || 'Grading stopped', 'warning');
+                } catch (err) {
+                    showToast(err.message || 'Network error', 'error');
+                } finally {
+                    this.clearGlobalLoading();
+                }
+            },
+
+            regradeAll: async function () {
+                this.setGlobalLoading('Regrading all students', 'Resetting state and scheduling grading jobs');
+                this.isGrading = true;
+                this.status = 'grading';
+                this.currentStage = 'Resetting and regrading all submissions';
+                try {
+                    var resp = await fetch('/session/' + this.sessionId + '/regrade-all', { method: 'POST' });
+                    var payload = await resp.json();
+                    if (!resp.ok) throw new Error(payload.message || 'Failed to regrade all');
+                    this.students.forEach(function (s) {
+                        s.status = 'pending';
+                        s.error_message = '';
+                    });
+                    this.gradedCount = 0;
+                    this.failedCount = 0;
+                    this.connectSSE();
+                    showToast('Regrading all students', 'info');
+                } catch (err) {
+                    this.isGrading = false;
+                    showToast(err.message || 'Network error', 'error');
+                } finally {
+                    this.clearGlobalLoading();
+                }
+            },
+
+            regradeStudent: async function (student) {
+                this.setGlobalLoading('Regrading ' + student.student_identifier, 'Refreshing ingestion and LLM evaluation');
+                student.status = 'grading';
+                this.currentStudent = student.student_identifier;
+                this.currentStage = 'Re-grading single student';
+                try {
+                    var resp = await fetch('/session/' + this.sessionId + '/student/' + student.id + '/regrade', { method: 'POST' });
+                    var payload = await resp.json();
+                    if (!resp.ok) throw new Error(payload.message || 'Failed to regrade student');
+                    this.isGrading = true;
+                    this.status = 'grading';
+                    this.connectSSE();
+                    showToast('Regrading ' + student.student_identifier, 'info');
+                } catch (err) {
+                    student.status = 'error';
+                    student.error_message = err.message;
+                    this.isGrading = false;
+                    showToast(err.message || 'Network error', 'error');
+                } finally {
+                    this.clearGlobalLoading();
+                }
+            },
+
+            retryFailed: async function () {
+                this.setGlobalLoading('Retrying failed submissions', 'Resetting error states before rerun');
+                try {
+                    var resp = await fetch('/session/' + this.sessionId + '/retry-failed', { method: 'POST' });
+                    var payload = await resp.json();
+                    if (!resp.ok) throw new Error(payload.message || 'Failed to retry failed');
+                    showToast(payload.message, 'success');
+                    setTimeout(function () { location.reload(); }, 500);
+                } catch (err) {
+                    showToast(err.message || 'Network error', 'error');
+                } finally {
+                    this.clearGlobalLoading();
+                }
+            },
+
+            connectSSE: function () {
+                var self = this;
+                if (self.eventSource) self.eventSource.close();
+                self.sseStatus = 'connecting';
+                self.eventSource = new EventSource('/session/' + self.sessionId + '/grade-stream');
+
+                self.eventSource.onopen = function () {
+                    self.sseStatus = 'connected';
+                    self.reconnectAttempts = 0;
+                };
+
+                self.eventSource.onmessage = function (event) {
+                    try {
+                        self.handleSSEMessage(JSON.parse(event.data));
+                    } catch (e) {
+                        console.error('SSE parse error:', e);
+                    }
+                };
+
+                self.eventSource.onerror = function () {
+                    self.sseStatus = 'error';
+                    self.eventSource.close();
+                    if (self.isGrading && self.reconnectAttempts < self.maxReconnectAttempts) {
+                        self.reconnectAttempts++;
+                        setTimeout(function () { self.connectSSE(); }, 1500 * self.reconnectAttempts);
+                    }
+                };
+            },
+
+            handleSSEMessage: function (data) {
+                switch (data.type) {
+                    case 'progress':
+                        this.gradedCount = data.graded_count ?? this.gradedCount;
+                        this.totalStudents = data.total ?? this.totalStudents;
+                        this.currentStudent = data.student || '';
+                        this.currentStage = data.stage || '';
+                        this.failedCount = data.failed_count ?? this.failedCount;
+                        this.status = 'grading';
+                        this.isGrading = true;
+                        for (var i = 0; i < this.students.length; i++) {
+                            if (this.students[i].student_identifier === data.student) {
+                                this.students[i].status = 'grading';
+                            }
+                        }
+                        break;
+                    case 'ingestion_complete':
+                        for (var ii = 0; ii < this.students.length; ii++) {
+                            if (this.students[ii].id === data.student_id) {
+                                this.students[ii].ingestion_report = data.ingestion_report || null;
+                                break;
+                            }
+                        }
+                        break;
+                    case 'student_complete':
+                        this.updateStudentFromResult(data);
+                        this.gradedCount = Math.max(this.gradedCount, data.graded_count ?? this.gradedCount);
+                        this.failedCount = data.failed_count ?? this.failedCount;
+                        this.hasResults = true;
+                        break;
+                    case 'student_error':
+                        for (var j = 0; j < this.students.length; j++) {
+                            if (this.students[j].id === data.student_id) {
+                                this.students[j].status = 'error';
+                                this.students[j].error_message = data.error || 'Grading failed';
+                                if (data.ingestion_report) this.students[j].ingestion_report = data.ingestion_report;
+                                if (data.relevance) {
+                                    this.students[j].is_relevant = data.relevance.is_relevant;
+                                    this.students[j].relevance_flags = data.relevance.flags || [];
+                                }
+                                break;
+                            }
+                        }
+                        this.failedCount = data.failed_count ?? this.failedCount;
+                        break;
+                    case 'stopped':
+                        this.status = 'paused';
+                        this.isGrading = false;
+                        this.currentStudent = '';
+                        this.currentStage = 'Stopped by user';
+                        this.gradedCount = data.graded_count ?? this.gradedCount;
+                        this.failedCount = data.failed_count ?? this.failedCount;
+                        showToast(data.message || 'Grading paused', 'warning');
+                        this.closeSSE();
+                        break;
+                    case 'complete':
+                        this.status = (data.failed_count && data.failed_count > 0) ? 'completed_with_errors' : 'completed';
+                        this.isGrading = false;
+                        this.gradedCount = data.graded_count ?? this.totalStudents;
+                        this.failedCount = data.failed_count ?? this.failedCount;
+                        this.currentStudent = '';
+                        this.currentStage = '';
+                        this.hasResults = true;
+                        showToast(data.message || 'Grading completed', 'success');
+                        this.closeSSE();
+                        break;
+                    case 'error':
+                        showToast(data.message || 'Grading error occurred', 'error');
+                        break;
+                }
+            },
+
+            updateStudentFromResult: function (data) {
+                for (var i = 0; i < this.students.length; i++) {
+                    if (this.students[i].id !== data.student_id) continue;
                     var result = data.result || {};
-                    var s = self.students[i];
+                    var s = this.students[i];
                     s.status = 'graded';
-                    s.ai_score = data.score;
-                    s.ai_letter_grade = data.grade;
-                    s.ai_confidence = data.confidence;
-                    s.final_score = s.is_overridden ? s.override_score : data.score;
-                    s.ai_feedback = result.overall_feedback;
-                    s.rubric_breakdown = result.rubric_breakdown;
-                    s.strengths = result.strengths;
-                    s.weaknesses = result.weaknesses;
-                    s.suggestions_for_improvement = result.suggestions_for_improvement;
+                    s.ai_score = data.score !== null && data.score !== undefined ? parseFloat(data.score) : null;
+                    s.ai_letter_grade = data.grade || '';
+                    s.ai_confidence = data.confidence || '';
+                    s.percentage = result.percentage !== undefined ? parseFloat(result.percentage) : (s.ai_score !== null ? (s.ai_score / {{ session.max_score }} * 100) : 0);
+                    s.final_score = s.is_overridden ? s.override_score : s.ai_score;
+                    s.ai_feedback = result.overall_feedback || '';
+                    s.rubric_breakdown = result.rubric_breakdown || [];
+                    s.question_mapping = result.question_mapping || [];
+                    s.file_analysis = result.file_analysis || [];
+                    s.strengths = result.strengths || [];
+                    s.weaknesses = result.weaknesses || [];
+                    s.critical_errors = result.critical_errors || [];
+                    s.suggestions_for_improvement = result.suggestions_for_improvement || '';
+                    s.visual_content_analysis = result.visual_content_analysis || null;
+                    s.confidence_reasoning = result.confidence_reasoning || '';
+                    s.grading_hash = result.grading_hash || '';
+                    s.images_processed = result.images_processed || 0;
+                    s.text_chars_processed = result.text_chars_processed || 0;
+                    s.ai_result = Object.assign({}, result);
+                    if (data.ingestion_report) s.ingestion_report = data.ingestion_report;
+                    if (data.relevance) {
+                        s.is_relevant = data.relevance.is_relevant;
+                        s.relevance_flags = data.relevance.flags || [];
+                    }
                     break;
                 }
-            }
-        },
+            },
 
-        saveOverride: function (student) {
-            var self = this;
-            student.saving = true;
-            student.overrideSaved = false;
-            fetch('/session/' + self.sessionId + '/student/' + student.id + '/override', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ score: parseFloat(student.overrideScore), comments: student.overrideComments, is_reviewed: student.isReviewed })
-            })
-                .then(function (resp) {
+            loadIngestionReport: async function (student) {
+                if (student.ingestionLoading) return;
+                student.ingestionLoading = true;
+                try {
+                    var resp = await fetch('/session/' + this.sessionId + '/student/' + student.id + '/ingestion-report');
                     if (resp.ok) {
+                        student.ingestion_report = await resp.json();
+                    }
+                } catch (err) {
+                    console.warn('Failed to load ingestion report', err);
+                } finally {
+                    student.ingestionLoading = false;
+                }
+            },
+
+            saveOverride: function (student) {
+                student.saving = true;
+                student.overrideSaved = false;
+                fetch('/session/' + this.sessionId + '/student/' + student.id + '/override', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ score: parseFloat(student.overrideScore), comments: student.overrideComments, is_reviewed: student.isReviewed })
+                })
+                    .then(function (resp) {
+                        if (!resp.ok) throw new Error('Failed to save override');
                         student.is_overridden = true;
                         student.override_score = parseFloat(student.overrideScore);
                         student.final_score = parseFloat(student.overrideScore);
                         student.overrideSaved = true;
-                        showToast('Override saved!', 'success');
+                        showToast('Override saved', 'success');
                         setTimeout(function () { student.overrideSaved = false; }, 3000);
-                    } else {
-                        showToast('Failed to save override', 'error');
-                    }
-                })
-                .catch(function () { showToast('Network error', 'error'); })
-                .finally(function () { student.saving = false; });
-        },
+                    })
+                    .catch(function (err) { showToast(err.message || 'Network error', 'error'); })
+                    .finally(function () { student.saving = false; });
+            },
 
-        closeSSE: function () {
-            if (this.eventSource) { this.eventSource.close(); this.eventSource = null; }
-            this.sseStatus = 'disconnected';
-        },
+            closeSSE: function () {
+                if (this.eventSource) {
+                    this.eventSource.close();
+                    this.eventSource = null;
+                }
+                this.sseStatus = 'disconnected';
+            },
 
-        getGradeColorClass: function (grade) {
-            if (!grade) return 'text-gray-500';
-            if (grade.startsWith('A')) return 'text-emerald-600 dark:text-emerald-400';
-            if (grade.startsWith('B')) return 'text-blue-600 dark:text-blue-400';
-            if (grade.startsWith('C')) return 'text-amber-600 dark:text-amber-400';
-            if (grade.startsWith('D')) return 'text-orange-600 dark:text-orange-400';
-            return 'text-red-600 dark:text-red-400';
-        },
+            getGradeColorClass: function (grade) {
+                if (!grade) return 'text-gray-500';
+                if (grade.startsWith('A')) return 'text-emerald-600 dark:text-emerald-400';
+                if (grade.startsWith('B')) return 'text-blue-600 dark:text-blue-400';
+                if (grade.startsWith('C')) return 'text-amber-600 dark:text-amber-400';
+                if (grade.startsWith('D')) return 'text-orange-600 dark:text-orange-400';
+                return 'text-red-600 dark:text-red-400';
+            },
 
-        getConfidenceColor: function (confidence) {
-            if (!confidence) return 'text-gray-500';
-            if (confidence === 'high') return 'text-emerald-600 dark:text-emerald-400';
-            if (confidence === 'medium') return 'text-amber-600 dark:text-amber-400';
-            return 'text-red-600 dark:text-red-400';
-        },
+            getConfidenceColor: function (confidence) {
+                if (!confidence) return 'text-gray-500';
+                if (confidence === 'high') return 'text-emerald-600 dark:text-emerald-400';
+                if (confidence === 'medium') return 'text-amber-600 dark:text-amber-400';
+                return 'text-red-600 dark:text-red-400';
+            },
 
-        loadStudentFiles: function (student) {
-            if (student.loadedFiles !== null) return; // already loaded
-            student.filesLoading = true;
-            var self = this;
-            fetch('/session/' + self.sessionId + '/student/' + student.id + '/files')
-                .then(function (resp) { return resp.json(); })
-                .then(function (files) {
-                    student.loadedFiles = files.map(function (f) {
-                        f.open = false;
-                        f.loading = false;
-                        f.loaded = false;
-                        f.content = null;
-                        return f;
+            loadStudentFiles: function (student) {
+                if (student.loadedFiles !== null) return;
+                student.filesLoading = true;
+                fetch('/session/' + this.sessionId + '/student/' + student.id + '/files')
+                    .then(function (resp) { return resp.json(); })
+                    .then(function (files) {
+                        student.loadedFiles = files.map(function (f) {
+                            f.open = false;
+                            f.loading = false;
+                            f.loaded = false;
+                            f.content = null;
+                            return f;
+                        });
+                        student.filesLoading = false;
+                    })
+                    .catch(function () {
+                        student.loadedFiles = [];
+                        student.filesLoading = false;
                     });
-                    student.filesLoading = false;
-                })
-                .catch(function () {
-                    student.loadedFiles = [];
-                    student.filesLoading = false;
-                });
-        },
+            },
 
-        loadFileContent: function (student, file) {
-            if (file.loaded || !file.view_url) return;
-            if (file.display_type === 'image' || file.display_type === 'pdf') {
-                file.loaded = true;
-                return; // images and PDFs load via direct URL in img/embed tags
+            setGlobalLoading: function (title, message) {
+                this.globalLoadingTitle = title || 'Working...';
+                this.globalLoadingMessage = message || '';
+                this.globalLoading = true;
+            },
+
+            clearGlobalLoading: function () {
+                this.globalLoading = false;
+            },
+
+            getPipelineStageIndex: function () {
+                var s = (this.currentStage || '').toLowerCase();
+                if (!s) return -1;
+                if (s.includes('moderation')) return 4;
+                if (s.includes('grading') || s.includes('acmag') || s.includes('calling llm') || s.includes('cache reuse')) return 3;
+                if (s.includes('vision')) return 2;
+                if (s.includes('ocr') || s.includes('relevance') || s.includes('parsing')) return 1;
+                if (s.includes('extract') || s.includes('ingest')) return 0;
+                return -1;
+            },
+
+            isPipelineStepActive: function (stepKey) {
+                var map = { extract: 0, ocr: 1, vision: 2, grading: 3, moderation: 4 };
+                var idx = map[stepKey];
+                return this.getPipelineStageIndex() === idx && (this.isGrading || this.status === 'grading');
+            },
+
+            isPipelineStepDone: function (stepKey) {
+                var map = { extract: 0, ocr: 1, vision: 2, grading: 3, moderation: 4 };
+                var idx = map[stepKey];
+                var current = this.getPipelineStageIndex();
+                if (this.status === 'completed' || this.status === 'completed_with_errors') return true;
+                return current > idx;
+            },
+
+            loadFileContent: function (student, file) {
+                if (file.loaded || !file.view_url) return;
+                if (file.display_type === 'image' || file.display_type === 'pdf') {
+                    file.loaded = true;
+                    return;
+                }
+                file.loading = true;
+                fetch(file.view_url)
+                    .then(function (resp) { return resp.text(); })
+                    .then(function (text) {
+                        file.content = text;
+                        file.loaded = true;
+                        file.loading = false;
+                    })
+                    .catch(function () {
+                        file.content = 'Error loading file content';
+                        file.loaded = true;
+                        file.loading = false;
+                    });
+            },
+
+            getFileIcon: function (displayType) {
+                var icons = {
+                    'code': '📄',
+                    'text': '📝',
+                    'image': '🖼️',
+                    'pdf': '📕',
+                    'docx': '📘',
+                    'notebook': '📓',
+                    'binary': '📦'
+                };
+                return icons[displayType] || '📄';
+            },
+
+            formatFileSize: function (bytes) {
+                if (!bytes || bytes === 0) return '0 B';
+                var units = ['B', 'KB', 'MB', 'GB'];
+                var i = 0;
+                var size = bytes;
+                while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
+                return size.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
             }
-            file.loading = true;
-            fetch(file.view_url)
-                .then(function (resp) { return resp.text(); })
-                .then(function (text) {
-                    file.content = text;
-                    file.loaded = true;
-                    file.loading = false;
-                })
-                .catch(function () {
-                    file.content = 'Error loading file content';
-                    file.loaded = true;
-                    file.loading = false;
-                });
-        },
-
-        getFileIcon: function (displayType) {
-            var icons = {
-                'code': '📄',
-                'text': '📝',
-                'image': '🖼️',
-                'pdf': '📕',
-                'docx': '📘',
-                'notebook': '📓',
-                'binary': '📦'
-            };
-            return icons[displayType] || '📄';
-        },
-
-        formatFileSize: function (bytes) {
-            if (!bytes || bytes === 0) return '0 B';
-            var units = ['B', 'KB', 'MB', 'GB'];
-            var i = 0;
-            var size = bytes;
-            while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
-            return size.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
-        }
-    };
-}
+        };
+    }
 </script>
 {% endblock %}
