@@ -28,7 +28,7 @@ from app.models import GradingSession, StudentSubmission, GradingProgress
 from app.schemas import OverridePayload
 from app.services.zip_processor import extract_master_archive_with_verification, cleanup_session_files
 from app.services.exporter import export_csv, export_json
-from app.services.file_parser_fixed import process_student_submission, ExtractedContent
+from app.services.file_parser_enhanced import process_student_submission, ExtractedContent
 from app.services.ai_grader_fixed import (
     grade_student,
     generate_rubric_from_description,
