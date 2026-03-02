@@ -17,7 +17,7 @@ NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
 
 # Vision capabilities for the model
-NVIDIA_MAX_IMAGES_PER_REQUEST: int = int(os.getenv("NVIDIA_MAX_IMAGES_PER_REQUEST", "14"))
+NVIDIA_MAX_IMAGES_PER_REQUEST: int = int(os.getenv("NVIDIA_MAX_IMAGES_PER_REQUEST", "8"))
 
 # Only use NVIDIA as the single provider
 LLM_PROVIDER_ORDER: str = os.getenv("LLM_PROVIDER_ORDER", "nvidia")
@@ -33,7 +33,7 @@ MAX_IMAGES_SELECTION_POOL: int = int(os.getenv("MAX_IMAGES_SELECTION_POOL", "220
 # 0 means "use full selection pool"; positive values apply a cap with diversity sampling.
 MAX_IMAGES_FOR_PREANALYSIS: int = int(os.getenv("MAX_IMAGES_FOR_PREANALYSIS", "200"))
 VISION_PREANALYSIS_CHUNK_SIZE: int = int(os.getenv("VISION_PREANALYSIS_CHUNK_SIZE", "6"))
-MAX_IMAGES_FOR_FINAL_GRADE: int = int(os.getenv("MAX_IMAGES_FOR_FINAL_GRADE", "14"))
+MAX_IMAGES_FOR_FINAL_GRADE: int = int(os.getenv("MAX_IMAGES_FOR_FINAL_GRADE", "8"))
 MAX_FINAL_IMAGE_BYTES: int = int(os.getenv("MAX_FINAL_IMAGE_BYTES", "8000000"))
 RATE_LIMIT_RPM: int = 40  # requests per minute — hard limit
 
