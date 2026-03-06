@@ -15,14 +15,411 @@ import io
 import json
 import logging
 import mimetypes
+import re
 import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Union
 import hashlib
+from collections import defaultdict
+import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# INTELLIGENT CODE CHUNKING - Respects function/class boundaries
+# ============================================================================
+
+# Language-specific patterns for detecting code boundaries
+CODE_BOUNDARY_PATTERNS: Dict[str, Dict[str, re.Pattern]] = {
+    "python": {
+        "class": re.compile(r'^class\s+\w+.*?:\s*$', re.MULTILINE),
+        "function": re.compile(r'^def\s+\w+.*?:\s*$', re.MULTILINE),
+        "async_function": re.compile(r'^async\s+def\s+\w+.*?:\s*$', re.MULTILINE),
+        "import": re.compile(r'^(?:from\s+[\w.]+\s+)?import\s+[\w.,\s]+', re.MULTILINE),
+    },
+    "java": {
+        "class": re.compile(r'^(?:public\s+|private\s+|protected\s+)?(?:static\s+)?class\s+\w+', re.MULTILINE),
+        "method": re.compile(r'^(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:void|int|String|boolean|double|float|long|char|byte|short|Object)\s+\w+\s*\([^)]*\)\s*(?:throws\s+\w+(?:,\s*\w+)*)?\s*\{', re.MULTILINE),
+        "import": re.compile(r'^import\s+[\w.*]+;', re.MULTILINE),
+    },
+    "javascript": {
+        "class": re.compile(r'^class\s+\w+.*?\{', re.MULTILINE),
+        "function": re.compile(r'^(?:const|let|var|function)\s+\w+\s*=.*?(?:=>|\bfunction\b)', re.MULTILINE),
+        "function_decl": re.compile(r'^function\s+\w+\s*\(', re.MULTILINE),
+        "import": re.compile(r'^(?:import\s+.*?from\s+[\'"].*?[\'"]|require\s*\(\s*[\'"].*?[\'"]\s*\))', re.MULTILINE),
+    },
+    "typescript": {
+        "class": re.compile(r'^class\s+\w+.*?\{', re.MULTILINE),
+        "function": re.compile(r'^(?:const|let|var|function)\s+\w+\s*[:(].*?(?:=>|\bfunction\b)', re.MULTILINE),
+        "interface": re.compile(r'^interface\s+\w+.*?\{', re.MULTILINE),
+        "import": re.compile(r'^import\s+.*?from\s+[\'"].*?[\'"]', re.MULTILINE),
+    },
+    "cpp": {
+        "class": re.compile(r'^(?:class|struct)\s+\w+.*?\{', re.MULTILINE),
+        "function": re.compile(r'^(?:void|int|double|float|char|bool|string|auto)\s+\w+\s*\([^)]*\)\s*(?:const)?\s*\{', re.MULTILINE),
+        "include": re.compile(r'^#include\s*<[^>]+>', re.MULTILINE),
+    },
+    "c": {
+        "class": re.compile(r'^(?:struct|union|enum)\s+\w+.*?\{', re.MULTILINE),
+        "function": re.compile(r'^(?:void|int|double|float|char|bool|long|short)\s+\w+\s*\([^)]*\)\s*\{', re.MULTILINE),
+        "include": re.compile(r'^#include\s*[<"][^>"]+[>"]', re.MULTILINE),
+    },
+    "go": {
+        "function": re.compile(r'^func\s+(?:\(\w+\s+\*?\w+\)\s+)?\w+\s*\(', re.MULTILINE),
+        "type": re.compile(r'^type\s+\w+\s+(?:struct|interface)\s*\{', re.MULTILINE),
+        "import": re.compile(r'^import\s+(?:\(|[\'"])', re.MULTILINE),
+    },
+    "rust": {
+        "function": re.compile(r'^fn\s+\w+.*?\{', re.MULTILINE),
+        "struct": re.compile(r'^struct\s+\w+.*?\{', re.MULTILINE),
+        "impl": re.compile(r'^impl(?:\s+\w+)?.*?\{', re.MULTILINE),
+        "use": re.compile(r'^use\s+[\w:]+', re.MULTILINE),
+    },
+    "ruby": {
+        "class": re.compile(r'^class\s+\w+.*$', re.MULTILINE),
+        "def": re.compile(r'^def\s+\w+.*$', re.MULTILINE),
+        "module": re.compile(r'^module\s+\w+.*$', re.MULTILINE),
+        "require": re.compile(r'^(?:require|require_relative)\s+[\'"].*?[\'"]', re.MULTILINE),
+    },
+    "php": {
+        "class": re.compile(r'^(?:abstract\s+)?class\s+\w+.*?\{', re.MULTILINE),
+        "function": re.compile(r'^(?:public|private|protected|static)\s+function\s+\w+\s*\(', re.MULTILINE),
+        "use": re.compile(r'^use\s+[\w\\]+;', re.MULTILINE),
+    },
+    "swift": {
+        "class": re.compile(r'^(?:class|struct|enum|protocol)\s+\w+.*?\{', re.MULTILINE),
+        "func": re.compile(r'^func\s+\w+.*?\{', re.MULTILINE),
+        "import": re.compile(r'^import\s+(?:struct|class|func|typealias|protocol)?\s*\w+', re.MULTILINE),
+    },
+    "kotlin": {
+        "class": re.compile(r'^(?:class|interface|object)\s+\w+.*?\{', re.MULTILINE),
+        "fun": re.compile(r'^fun\s+\w+.*?\{', re.MULTILINE),
+        "import": re.compile(r'^import\s+[\w.]+', re.MULTILINE),
+    },
+}
+
+# Default fallback patterns for unknown languages
+DEFAULT_BOUNDARY_PATTERNS = {
+    "function": re.compile(r'^func\s+', re.MULTILINE),
+    "import": re.compile(r'^(?:import|require|include)\s+', re.MULTILINE),
+}
+
+
+def _get_language_patterns(language: str) -> Dict[str, re.Pattern]:
+    """Get code boundary patterns for a specific language."""
+    return CODE_BOUNDARY_PATTERNS.get(language.lower(), DEFAULT_BOUNDARY_PATTERNS)
+
+
+def _smart_chunk_code(text: str, language: str, max_chars: int) -> Tuple[str, Dict[str, Any]]:
+    """
+    Intelligently chunk code content respecting function/class boundaries.
+
+    Returns (chunked_content, chunk_metadata) where chunk_metadata contains:
+    - total_chunks: total number of chunks
+    - chunk_boundaries: list of (chunk_id, start_pos, end_pos, code_unit_name)
+    - truncated: whether content was truncated
+    - truncated_at: position where truncation happened
+    - missing_code_units: list of code units that were cut off
+    """
+    if len(text) <= max_chars:
+        return text, {
+            "total_chunks": 1,
+            "chunk_boundaries": [(0, 0, len(text), "full_file")],
+            "truncated": False,
+            "truncated_at": None,
+            "missing_code_units": [],
+            "original_length": len(text),
+        }
+
+    patterns = _get_language_patterns(language)
+
+    # Find all code unit positions
+    code_units = []
+
+    # Find function/class definitions
+    for unit_type, pattern in patterns.items():
+        if unit_type == "import":
+            continue  # Handle imports separately
+        for match in pattern.finditer(text):
+            # Extract the name if possible
+            name = match.group(0).strip()[:50]
+            code_units.append((match.start(), match.end(), unit_type, name))
+
+    # Sort by position
+    code_units.sort(key=lambda x: x[0])
+
+    # Find import statements
+    import_pattern = patterns.get("import")
+    imports = []
+    if import_pattern:
+        for match in import_pattern.finditer(text):
+            imports.append(match.group(0).strip())
+
+    # Chunk content
+    chunks = []
+    current_pos = 0
+    chunk_boundaries = []
+    missing_code_units = []
+
+    while current_pos < len(text):
+        # Calculate remaining space
+        remaining = max_chars - len("\n[...TRUNCATED CONTENT...]\n")
+
+        if current_pos + remaining >= len(text):
+            # Fits in remaining space
+            chunk_text = text[current_pos:]
+            chunks.append(chunk_text)
+            chunk_boundaries.append((len(chunks) - 1, current_pos, len(text), "final"))
+            break
+
+        # Find the best break point
+        # Look for code units that end before the max point
+        best_break = -1
+        best_unit_name = "chunk_end"
+
+        for pos, end_pos, unit_type, name in code_units:
+            if current_pos <= pos < current_pos + remaining:
+                if pos > best_break:
+                    best_break = pos
+                    best_unit_name = name or f"{unit_type}_boundary"
+
+        if best_break > current_pos:
+            chunk_text = text[current_pos:best_break]
+            chunks.append(chunk_text)
+            chunk_boundaries.append((len(chunks) - 1, current_pos, best_break, best_unit_name))
+            current_pos = best_break
+        else:
+            # No natural break point, hard break at max_chars
+            chunk_text = text[current_pos:current_pos + remaining]
+            chunks.append(chunk_text)
+            chunk_boundaries.append((len(chunks) - 1, current_pos, current_pos + remaining, "hard_break"))
+            current_pos += remaining
+
+    # Check for incomplete code units
+    last_chunk_end = chunk_boundaries[-1][2] if chunk_boundaries else 0
+    for pos, end_pos, unit_type, name in code_units:
+        if pos < last_chunk_end and end_pos > last_chunk_end:
+            missing_code_units.append({
+                "type": unit_type,
+                "name": name,
+                "started_at": pos,
+                "unfinished": True
+            })
+
+    # Assemble final content with proper annotations
+    final_parts = []
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            final_parts.append("\n[...CONTINUED FROM PREVIOUS SECTION...]\n")
+
+        # Add structure summary at chunk boundaries
+        if chunk_boundaries[i][3] not in ("full_file", "final"):
+            final_parts.append(f"\n### Code continues: {chunk_boundaries[i][3]} ###\n")
+
+        final_parts.append(chunk)
+
+    # Add truncation warning if needed
+    if len(text) > max_chars:
+        final_parts.append(f"\n\n[WARNING: CONTENT TRUNCATED at {max_chars} chars. Original: {len(text)} chars]")
+        if missing_code_units:
+            unit_names = [u["name"][:30] for u in missing_code_units]
+            final_parts.append(f"\n[TRUNCATED UNFINISHED CODE: {', '.join(unit_names)}]")
+
+    result = "".join(final_parts)
+
+    return result, {
+        "total_chunks": len(chunks),
+        "chunk_boundaries": chunk_boundaries,
+        "truncated": len(text) > max_chars,
+        "truncated_at": len(text) if len(text) > max_chars else None,
+        "missing_code_units": missing_code_units,
+        "imports_found": imports,
+        "original_length": len(text),
+    }
+
+
+# ============================================================================
+# FILE DEPENDENCY DETECTION
+# ============================================================================
+
+def detect_file_dependencies(file_contents: List['ExtractedContent']) -> Dict[str, Dict[str, Any]]:
+    """
+    Detect dependencies between files based on imports, requires, includes, etc.
+
+    Returns a dictionary mapping filenames to their dependencies:
+    {
+        "main.py": {
+            "imports": ["helper.py", "utils.py"],
+            "imported_by": ["app.py"],
+            "dependency_type": "python_import"
+        },
+        ...
+    }
+    """
+    dependency_map = {}
+    all_files = {fc.filename.lower(): fc for fc in file_contents if fc.filename}
+
+    # Patterns for detecting dependencies
+    dependency_patterns = {
+        # Python: from X import Y / import X
+        "python": [
+            re.compile(r'from\s+([\w./]+)\s+import', re.MULTILINE),
+            re.compile(r'import\s+([\w.,\s]+)', re.MULTILINE),
+        ],
+        # JavaScript/TypeScript: import X from 'Y' / require('Y')
+        "javascript": [
+            re.compile(r"import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]", re.MULTILINE),
+            re.compile(r"import\s+['\"]([^'\"]+)['\"]", re.MULTILINE),
+            re.compile(r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", re.MULTILINE),
+        ],
+        # Java: import com.package.Class
+        "java": [
+            re.compile(r'import\s+([\w.]+);', re.MULTILINE),
+        ],
+        # C/C++: #include "file.h" / <file.h>
+        "cpp": [
+            re.compile(r'#include\s*["<]([^">]+)[">]', re.MULTILINE),
+        ],
+        # Go: import "package"
+        "go": [
+            re.compile(r'import\s+["\（]([^"\）]+)["\）]', re.MULTILINE),
+        ],
+        # Ruby: require 'file'
+        "ruby": [
+            re.compile(r"require\s+['\"]([^'\"]+)['\"]", re.MULTILINE),
+            re.compile(r"require_relative\s+['\"]([^'\"]+)['\"]", re.MULTILINE),
+        ],
+        # PHP: require 'file.php'
+        "php": [
+            re.compile(r"(?:require|include|require_once|include_once)\s+['\"]([^'\"]+)['\"]", re.MULTILINE),
+        ],
+    }
+
+    for content in file_contents:
+        if not content.text_content or content.file_type not in ("code", "notebook"):
+            continue
+
+        lang = content.metadata.get("language", "unknown")
+        filename = content.filename.lower()
+
+        dependencies = {
+            "imports": [],
+            "imported_by": [],
+            "dependency_type": None,
+            "has_local_imports": False,
+            "missing_imports": [],
+        }
+
+        # Get patterns for this language
+        patterns = dependency_patterns.get(lang.lower(), [])
+
+        # Also check for JS/TS in .js/.ts files
+        if not patterns and content.filename:
+            ext = content.filename.rsplit('.', 1)[-1] if '.' in content.filename else ''
+            if ext in ('js', 'jsx', 'ts', 'tsx', 'mjs'):
+                patterns = dependency_patterns.get("javascript", [])
+
+        # Extract dependencies
+        for pattern in patterns:
+            for match in pattern.finditer(content.text_content):
+                matched_text = match.group(1).strip() if match.groups() else match.group(0)
+                # Clean up the matched text
+                matched_text = re.sub(r'[{}\s,;].*', '', matched_text)  # Remove { }, commas, semicolons
+
+                if matched_text and not matched_text.startswith(('http', 'www', '//', '#')):
+                    # Handle relative paths
+                    base_name = matched_text.rsplit('/', 1)[-1]  # Get last component
+
+                    # Try to match with actual files
+                    for fname in all_files:
+                        if (base_name in fname or
+                            base_name.replace('.py', '') in fname or
+                            base_name.replace('.js', '') in fname or
+                            base_name.replace('.ts', '') in fname):
+                            if fname != filename and fname not in dependencies["imports"]:
+                                dependencies["imports"].append(fname)
+
+                    # Check if it's a local import (not a standard library/package)
+                    if matched_text and not matched_text.startswith(('sys', 'os', 're', 'json', 'math', 'typing')):
+                        if matched_text not in dependencies["imports"]:
+                            # Check if it could be a local file
+                            dependencies["has_local_imports"] = True
+
+        # Check for missing imports
+        for imp in dependencies["imports"]:
+            if imp not in all_files:
+                dependencies["missing_imports"].append(imp)
+                dependencies["imports"].remove(imp)
+
+        dependency_map[content.filename.lower()] = dependencies
+
+    # Build reverse relationship (imported_by)
+    for fname, deps in dependency_map.items():
+        for imp in deps.get("imports", []):
+            if imp in dependency_map:
+                if fname not in dependency_map[imp]["imported_by"]:
+                    dependency_map[imp]["imported_by"].append(fname)
+
+    return dependency_map
+
+
+def detect_image_sequences(file_contents: List['ExtractedContent']) -> List[Dict[str, Any]]:
+    """
+    Detect image sequences that might form a complete picture (e.g., numbered files).
+
+    Returns list of image sequence groups:
+    [
+        {
+            "base_name": "diagram",
+            "extension": ".png",
+            "files": ["diagram1.png", "diagram2.png", "diagram3.png"],
+            "sequence": [1, 2, 3],
+            "total_count": 3
+        },
+        ...
+    ]
+    """
+    # Group images by base name and extension
+    image_files: Dict[Tuple[str, str], List[Tuple[str, int]]] = defaultdict(list)
+
+    for content in file_contents:
+        if content.file_type != "image":
+            continue
+
+        filename = content.filename
+        # Match pattern: nameNNN.ext or name_NNN.ext
+        match = re.match(r'^(.+?)[_ ]?(\d+)\.(\w+)$', filename, re.IGNORECASE)
+        if match:
+            base_name = match.group(1).lower()
+            num = int(match.group(2))
+            ext = match.group(3).lower()
+            image_files[(base_name, ext)].append((filename, num))
+        else:
+            # Also check for pageNNN pattern (like scanned docs)
+            match = re.match(r'^(.+?)page[-_]?(\d+)\.(\w+)$', filename, re.IGNORECASE)
+            if match:
+                base_name = match.group(1).lower()
+                num = int(match.group(2))
+                ext = match.group(3).lower()
+                image_files[(base_name, ext)].append((filename, num))
+
+    sequences = []
+    for (base_name, ext), files in image_files.items():
+        if len(files) > 1:  # Only groups with multiple images
+            sorted_files = sorted(files, key=lambda x: x[1])
+            sequences.append({
+                "base_name": base_name,
+                "extension": f".{ext}",
+                "files": [f[0] for f in sorted_files],
+                "sequence": [f[1] for f in sorted_files],
+                "total_count": len(files),
+                "is_complete": all(i in [f[1] for f in sorted_files] for i in range(1, len(files) + 1))
+            })
+
+    return sequences
 
 # Extended file type support
 CODE_EXTENSIONS: set[str] = {
@@ -49,6 +446,20 @@ DOCUMENT_EXTENSIONS: set[str] = {
 ARCHIVE_EXTENSIONS: set[str] = {
     ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz"
 }
+
+TRANSIENT_FILE_PREFIXES: tuple[str, ...] = ("~$", "._")
+TRANSIENT_FILE_NAMES: set[str] = {".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def _is_transient_or_system_file(file_path: Path) -> bool:
+    """Return True for editor/OS/Office transient files that should never be parsed."""
+    name = file_path.name
+    lower_name = name.lower()
+
+    if name.startswith(TRANSIENT_FILE_PREFIXES):
+        return True
+
+    return lower_name in TRANSIENT_FILE_NAMES
 
 @dataclass
 class ExtractedContent:
@@ -143,6 +554,17 @@ def parse_file_with_report(file_path: Path, max_text_chars: int = 50000,
                 error="File not found",
                 size_bytes=0
             ), report
+
+        if _is_transient_or_system_file(file_path):
+            report["status"] = "skipped"
+            report["warning"] = "Transient/system file skipped"
+            return ExtractedContent(
+                filename=filename,
+                file_type="skipped",
+                extraction_method="skipped",
+                size_bytes=size,
+                metadata={"reason": "transient_system_file"},
+            ), report
         
         # Route to appropriate parser
         if ext in CODE_EXTENSIONS:
@@ -191,16 +613,24 @@ def parse_file_with_report(file_path: Path, max_text_chars: int = 50000,
             
         elif ext in [".xlsx", ".xls"]:
             content = _parse_excel_file(file_path)
-            report["status"] = "parsed"
-            report["extraction_method"] = "pandas"
-            report["text_length"] = len(content.text_content) if content.text_content else 0
+            if content.file_type == "error":
+                report["status"] = "failed"
+                report["error"] = content.error or "Excel parsing failed"
+            else:
+                report["status"] = "parsed"
+                report["extraction_method"] = content.extraction_method
+                report["text_length"] = len(content.text_content) if content.text_content else 0
             return content, report
             
         elif ext in [".pptx", ".ppt"]:
             content = _parse_powerpoint_file(file_path)
-            report["status"] = "parsed"
-            report["extraction_method"] = "python-pptx"
-            report["text_length"] = len(content.text_content) if content.text_content else 0
+            if content.file_type == "error":
+                report["status"] = "failed"
+                report["error"] = content.error or "PowerPoint parsing failed"
+            else:
+                report["status"] = "parsed"
+                report["extraction_method"] = content.extraction_method
+                report["text_length"] = len(content.text_content) if content.text_content else 0
             return content, report
             
         elif ext in ARCHIVE_EXTENSIONS:
@@ -247,7 +677,7 @@ def parse_file_with_report(file_path: Path, max_text_chars: int = 50000,
 
 
 def _parse_code_file(file_path: Path, max_chars: int) -> ExtractedContent:
-    """Parse code files with syntax preservation."""
+    """Parse code files with intelligent chunking that respects function/class boundaries."""
     text = file_path.read_text(encoding="utf-8", errors="replace")
     truncated = len(text) > max_chars
     
@@ -581,36 +1011,78 @@ def _parse_notebook_file(file_path: Path, max_chars: int) -> ExtractedContent:
 
 
 def _parse_excel_file(file_path: Path) -> ExtractedContent:
-    """Parse Excel files."""
-    try:
-        import pandas as pd
-        df = pd.read_excel(file_path, sheet_name=None)
-        parts = []
-        
-        for sheet_name, sheet_df in df.items():
-            parts.append(f"=== Sheet: {sheet_name} ===")
-            parts.append(sheet_df.to_string())
-        
-        return ExtractedContent(
-            filename=file_path.name,
-            file_type="excel",
-            text_content="\n".join(parts),
-            extraction_method="pandas",
-            size_bytes=file_path.stat().st_size,
-            metadata={"sheets": list(df.keys())}
-        )
-    except Exception as e:
-        return ExtractedContent(
-            filename=file_path.name,
-            file_type="error",
-            error=str(e),
-            extraction_method="failed",
-            size_bytes=file_path.stat().st_size
-        )
+    """Parse Excel files with openpyxl/xlrd fallback and clear failures."""
+    ext = file_path.suffix.lower()
+    errors: list[str] = []
+
+    if ext == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(filename=str(file_path), data_only=True, read_only=True)
+            parts: list[str] = []
+            sheet_names: list[str] = []
+
+            for sheet in workbook.worksheets:
+                sheet_names.append(sheet.title)
+                parts.append(f"=== Sheet: {sheet.title} ===")
+                for row in sheet.iter_rows(values_only=True):
+                    values = ["" if value is None else str(value) for value in row]
+                    if any(value.strip() for value in values):
+                        parts.append(" | ".join(values))
+
+            workbook.close()
+            return ExtractedContent(
+                filename=file_path.name,
+                file_type="excel",
+                text_content="\n".join(parts),
+                extraction_method="openpyxl",
+                size_bytes=file_path.stat().st_size,
+                metadata={"sheets": sheet_names},
+            )
+        except Exception as exc:
+            errors.append(f"openpyxl: {exc}")
+
+    if ext == ".xls":
+        try:
+            import xlrd
+
+            workbook = xlrd.open_workbook(str(file_path))
+            parts: list[str] = []
+            sheet_names: list[str] = []
+
+            for sheet in workbook.sheets():
+                sheet_names.append(sheet.name)
+                parts.append(f"=== Sheet: {sheet.name} ===")
+                for row_idx in range(sheet.nrows):
+                    values = [str(sheet.cell_value(row_idx, col_idx)) for col_idx in range(sheet.ncols)]
+                    if any(value.strip() for value in values):
+                        parts.append(" | ".join(values))
+
+            return ExtractedContent(
+                filename=file_path.name,
+                file_type="excel",
+                text_content="\n".join(parts),
+                extraction_method="xlrd",
+                size_bytes=file_path.stat().st_size,
+                metadata={"sheets": sheet_names},
+            )
+        except Exception as exc:
+            errors.append(f"xlrd: {exc}")
+
+    return ExtractedContent(
+        filename=file_path.name,
+        file_type="error",
+        error="; ".join(errors) if errors else "Unsupported or corrupted Excel file",
+        extraction_method="failed",
+        size_bytes=file_path.stat().st_size,
+    )
 
 
 def _parse_powerpoint_file(file_path: Path) -> ExtractedContent:
-    """Parse PowerPoint files."""
+    """Parse PowerPoint files with python-pptx and XML fallback."""
+    pptx_error: Optional[Exception] = None
+
     try:
         from pptx import Presentation
         prs = Presentation(str(file_path))
@@ -630,14 +1102,60 @@ def _parse_powerpoint_file(file_path: Path) -> ExtractedContent:
             size_bytes=file_path.stat().st_size,
             metadata={"slides": len(prs.slides)}
         )
-    except Exception as e:
-        return ExtractedContent(
-            filename=file_path.name,
-            file_type="error",
-            error=str(e),
-            extraction_method="failed",
-            size_bytes=file_path.stat().st_size
-        )
+    except Exception as exc:
+        pptx_error = exc
+
+    xml_error: Optional[Exception] = None
+    if file_path.suffix.lower() == ".pptx":
+        try:
+            with zipfile.ZipFile(file_path, "r") as archive:
+                slide_paths = sorted(
+                    [
+                        name for name in archive.namelist()
+                        if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+                    ],
+                    key=lambda name: int(re.search(r"slide(\d+)\.xml$", name).group(1))
+                    if re.search(r"slide(\d+)\.xml$", name) else 10**9,
+                )
+
+                parts: list[str] = []
+                for idx, slide_path in enumerate(slide_paths, 1):
+                    xml_data = archive.read(slide_path)
+                    root = ET.fromstring(xml_data)
+                    texts = [
+                        node.text.strip()
+                        for node in root.iter()
+                        if node.tag.endswith("}t") and node.text and node.text.strip()
+                    ]
+                    parts.append(f"=== Slide {idx} ===")
+                    if texts:
+                        parts.append("\n".join(texts))
+
+                if slide_paths:
+                    return ExtractedContent(
+                        filename=file_path.name,
+                        file_type="powerpoint",
+                        text_content="\n".join(parts),
+                        extraction_method="pptx_xml_fallback",
+                        size_bytes=file_path.stat().st_size,
+                        metadata={"slides": len(slide_paths)},
+                    )
+        except Exception as exc:
+            xml_error = exc
+
+    messages: list[str] = []
+    if pptx_error:
+        messages.append(f"python-pptx: {pptx_error}")
+    if xml_error:
+        messages.append(f"xml_fallback: {xml_error}")
+
+    return ExtractedContent(
+        filename=file_path.name,
+        file_type="error",
+        error="; ".join(messages) if messages else "Unsupported or corrupted PowerPoint file",
+        extraction_method="failed",
+        size_bytes=file_path.stat().st_size,
+    )
 
 
 def _detect_language(ext: str) -> str:
@@ -700,6 +1218,8 @@ def process_student_submission(student_dir: Path, student_id: str,
             if any(part.startswith(".") or part.startswith("__") for part in file_path.parts):
                 continue
             if file_path.name in {".DS_Store", "Thumbs.db", ".gitignore"}:
+                continue
+            if _is_transient_or_system_file(file_path):
                 continue
             all_files.append(file_path)
     

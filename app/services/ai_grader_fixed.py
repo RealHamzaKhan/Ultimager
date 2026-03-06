@@ -43,6 +43,9 @@ from app.config import (
     SCORING_ALLOW_FALLBACK,
 )
 
+# Import SOTA multi-turn features from ai_grader_enhanced
+
+
 logger = logging.getLogger(__name__)
 GRADER_CACHE_VERSION = "2026-02-28-nvidia-qwen-v1"
 PROVIDER_COOLDOWN_SECONDS = {
@@ -932,19 +935,141 @@ async def validate_submission_relevance(
 ) -> dict:
     """Validate that a submission is relevant to the assignment."""
     await _rate_limiter.acquire()
-    
-    total_text = ""
-    for content in student_files:
-        if hasattr(content, 'text_content') and content.text_content:
-            total_text += content.text_content + "\n"
-    
-    if len(total_text.strip()) < 50 and not any(hasattr(c, 'images') and c.images for c in student_files):
+
+    def _extract_file_entries(files: List[Any]) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        for idx, content in enumerate(files or [], 1):
+            filename = f"file_{idx}"
+            text_content = ""
+            if hasattr(content, "filename"):
+                filename = str(getattr(content, "filename", "") or filename)
+                text_content = str(getattr(content, "text_content", "") or "")
+            elif isinstance(content, dict):
+                filename = str(content.get("filename", filename) or filename)
+                text_content = str(content.get("text_content", content.get("content", "")) or "")
+            text_norm = text_content.strip()
+            if text_norm:
+                entries.append((filename, text_norm))
+        return entries
+
+    _relevance_stopwords = {
+        "the", "and", "for", "with", "from", "that", "this", "have", "has", "was", "were",
+        "question", "questions", "problem", "problems", "assignment", "task", "tasks",
+        "section", "part", "criterion", "criteria", "score", "points", "marks",
+        "student", "submission", "solution", "code", "system", "algorithm", "analysis",
+        "design", "implementation", "implement", "develop",
+    }
+
+    def _relevance_token_set(text: str) -> set[str]:
+        toks = re.findall(r"[a-zA-Z][a-zA-Z0-9_+\-*]{2,}", str(text or "").lower())
+        return {tok for tok in toks if tok not in _relevance_stopwords}
+
+    def _build_relevance_text_sample(entries: list[tuple[str, str]], max_chars: int = 9000) -> str:
+        if not entries:
+            return ""
+        blocks: list[str] = []
+        for filename, raw in entries:
+            text = _normalize_space(raw)
+            if not text:
+                continue
+            segments: list[str] = []
+            if len(text) <= 420:
+                segments = [text]
+            else:
+                head = text[:320]
+                mid_start = max(0, (len(text) // 2) - 160)
+                mid = text[mid_start:mid_start + 320]
+                tail = text[-320:]
+                segments = [head, mid, tail]
+            compact = []
+            seen_seg = set()
+            for seg in segments:
+                seg_norm = _normalize_space(seg)
+                if seg_norm and seg_norm not in seen_seg:
+                    compact.append(seg_norm)
+                    seen_seg.add(seg_norm)
+            if compact:
+                blocks.append(f"[{filename}] " + " ... ".join(compact)[:980])
+
+        if not blocks:
+            return ""
+        if len(blocks) > 12:
+            picks = sorted({
+                round(i * (len(blocks) - 1) / 11) for i in range(12)
+            })
+            blocks = [blocks[i] for i in picks]
+        return "\n\n".join(blocks)[:max_chars]
+
+    def _compute_assignment_signal(
+        assignment_title: str,
+        assignment_description: str,
+        assignment_rubric: str,
+        entries: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        assignment_text = " ".join([
+            _normalize_space(assignment_title),
+            _normalize_space(assignment_description),
+            _normalize_space(assignment_rubric),
+        ])
+        assignment_tokens = _relevance_token_set(assignment_text)
+        if not assignment_tokens:
+            return {
+                "assignment_tokens": 0,
+                "token_overlap": 0,
+                "signal_ratio": 0.0,
+                "files_with_overlap": 0,
+                "files_scanned": len(entries),
+                "matched_terms": [],
+                "has_relevant_sections": False,
+            }
+
+        overlap_all: set[str] = set()
+        files_with_overlap = 0
+        for _filename, text in entries:
+            file_tokens = _relevance_token_set(text[:12000])
+            overlap = assignment_tokens & file_tokens
+            if overlap:
+                files_with_overlap += 1
+                overlap_all.update(overlap)
+
+        overlap_count = len(overlap_all)
+        signal_ratio = float(overlap_count) / float(max(1, len(assignment_tokens)))
+        has_relevant_sections = (overlap_count >= 5) or (overlap_count >= 3 and signal_ratio >= 0.10)
+
+        return {
+            "assignment_tokens": len(assignment_tokens),
+            "token_overlap": overlap_count,
+            "signal_ratio": round(signal_ratio, 4),
+            "files_with_overlap": files_with_overlap,
+            "files_scanned": len(entries),
+            "matched_terms": sorted(list(overlap_all))[:20],
+            "has_relevant_sections": has_relevant_sections,
+        }
+
+    file_entries = _extract_file_entries(student_files)
+    total_text = "\n".join(text for _, text in file_entries)
+    has_any_images = any(
+        (
+            hasattr(c, "images") and bool(getattr(c, "images", None))
+        ) or (
+            isinstance(c, dict) and bool(c.get("images"))
+        )
+        for c in (student_files or [])
+    )
+
+    assignment_signal = _compute_assignment_signal(title, description, rubric, file_entries)
+
+    if len(total_text.strip()) < 50 and not has_any_images:
         return {
             "is_relevant": False,
             "confidence": "high",
             "flags": ["empty_submission"],
-            "reasoning": "Submission contains minimal or no content"
+            "reasoning": "Submission contains minimal or no content",
+            "has_relevant_sections": False,
+            "assignment_signal": assignment_signal,
         }
+
+    sampled_submission = _build_relevance_text_sample(file_entries)
     
     system_prompt = """You are checking if a student submission is relevant to the given assignment.
 
@@ -953,7 +1078,10 @@ Respond in this exact JSON format:
   "is_relevant": true/false,
   "confidence": "high/medium/low",
   "flags": ["list", "of", "issues"],
-  "reasoning": "Explanation of why it's relevant or not"
+  "reasoning": "Explanation of why it's relevant or not",
+  "has_relevant_sections": true/false,
+  "relevant_evidence": ["short evidence snippets"],
+  "irrelevant_evidence": ["short evidence snippets"]
 }
 
 Possible flags:
@@ -962,14 +1090,25 @@ Possible flags:
 - "incomplete": Major sections missing
 - "template_only": Only contains template/boilerplate code
 - "placeholder_content": Contains "TODO", "FIXME", or placeholder text
-- "off_topic": Content doesn't match assignment requirements"""
+- "off_topic": Content doesn't match assignment requirements
+- "mixed_content": Contains both relevant and irrelevant sections
+
+Important policy:
+- If ANY meaningful section answers assignment requirements, set has_relevant_sections=true.
+- For mixed submissions, include flag "mixed_content" and avoid marking the full submission as completely irrelevant."""
 
     user_prompt = f"""Assignment: {title}
 Description: {description}
 Rubric: {rubric}
 
-Student Submission Content (first 3000 chars):
-{total_text[:3000]}
+Submission Content Sample (coverage across files/head-middle-tail):
+{sampled_submission[:9000]}
+
+Deterministic assignment-signal summary:
+- token_overlap: {assignment_signal.get("token_overlap", 0)}
+- signal_ratio: {assignment_signal.get("signal_ratio", 0.0)}
+- files_with_overlap: {assignment_signal.get("files_with_overlap", 0)}/{assignment_signal.get("files_scanned", 0)}
+- matched_terms: {", ".join(assignment_signal.get("matched_terms", [])[:12])}
 
 Is this submission relevant to the assignment?"""
 
@@ -987,12 +1126,43 @@ Is this submission relevant to the assignment?"""
         
         raw_text = response.choices[0].message.content or ""
         result = _extract_json(raw_text)
-        
+
+        flags = result.get("flags", [])
+        flags_norm = []
+        if isinstance(flags, list):
+            for raw in flags:
+                flag = str(raw or "").strip().lower()
+                if flag:
+                    flags_norm.append(flag)
+        flags_norm = sorted(set(flags_norm))
+
+        has_relevant_sections = bool(result.get("has_relevant_sections", False)) or bool(
+            assignment_signal.get("has_relevant_sections", False)
+        )
+        if has_relevant_sections and ("off_topic" in flags_norm or "wrong_assignment" in flags_norm):
+            if "mixed_content" not in flags_norm:
+                flags_norm.append("mixed_content")
+                flags_norm = sorted(set(flags_norm))
+
+        is_relevant = bool(result.get("is_relevant", True))
+        if has_relevant_sections:
+            is_relevant = True
+
+        reasoning = str(result.get("reasoning", "") or "")
+        if has_relevant_sections and not bool(result.get("has_relevant_sections", False)):
+            reasoning = (
+                reasoning + " Deterministic signal detected assignment-relevant sections in the submission."
+            ).strip()
+
         return {
-            "is_relevant": result.get("is_relevant", True),
+            "is_relevant": is_relevant,
             "confidence": result.get("confidence", "medium"),
-            "flags": result.get("flags", []),
-            "reasoning": result.get("reasoning", "")
+            "flags": flags_norm,
+            "reasoning": reasoning,
+            "has_relevant_sections": has_relevant_sections,
+            "assignment_signal": assignment_signal,
+            "relevant_evidence": result.get("relevant_evidence", []) if isinstance(result.get("relevant_evidence"), list) else [],
+            "irrelevant_evidence": result.get("irrelevant_evidence", []) if isinstance(result.get("irrelevant_evidence"), list) else [],
         }
         
     except ProviderFailoverError as e:
@@ -1002,6 +1172,8 @@ Is this submission relevant to the assignment?"""
             "confidence": "low",
             "flags": ["validation_provider_error"],
             "reasoning": str(e),
+            "has_relevant_sections": bool(assignment_signal.get("has_relevant_sections", False)),
+            "assignment_signal": assignment_signal,
         }
     except Exception as e:
         logger.exception("Relevance validation failed")
@@ -1009,8 +1181,139 @@ Is this submission relevant to the assignment?"""
             "is_relevant": True,
             "confidence": "low",
             "flags": ["validation_error"],
-            "reasoning": f"Validation failed: {str(e)}. Defaulting to relevant."
+            "reasoning": f"Validation failed: {str(e)}. Defaulting to relevant.",
+            "has_relevant_sections": bool(assignment_signal.get("has_relevant_sections", False)),
+            "assignment_signal": assignment_signal,
         }
+
+
+_RELEVANCE_BLOCK_FLAGS = {"empty_submission", "wrong_assignment", "off_topic"}
+
+
+def evaluate_relevance_gate(relevance: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Decide whether grading should be blocked due to strong irrelevance signals."""
+    rel = relevance if isinstance(relevance, dict) else {}
+    raw_flags = rel.get("flags", [])
+    flags: list[str] = []
+    if isinstance(raw_flags, list):
+        for raw in raw_flags:
+            flag = str(raw or "").strip().lower()
+            if flag:
+                flags.append(flag)
+    flags = sorted(set(flags))
+
+    confidence = str(rel.get("confidence", "low") or "low").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    is_relevant = bool(rel.get("is_relevant", True))
+    critical_flags = sorted(flag for flag in flags if flag in _RELEVANCE_BLOCK_FLAGS)
+    signal_info = rel.get("assignment_signal") if isinstance(rel.get("assignment_signal"), dict) else {}
+    signal_overlap = int(signal_info.get("token_overlap", 0) or 0)
+    signal_ratio = float(signal_info.get("signal_ratio", 0.0) or 0.0)
+    has_relevant_sections = bool(rel.get("has_relevant_sections", False)) or bool(
+        signal_info.get("has_relevant_sections", False)
+    )
+    mixed_content = bool(rel.get("mixed_content", False)) or ("mixed_content" in flags)
+    if not mixed_content and critical_flags and has_relevant_sections:
+        mixed_content = True
+
+    block_grading = False
+    reason = ""
+    if "empty_submission" in critical_flags:
+        block_grading = True
+        reason = "Submission appears empty or unreadable."
+    elif mixed_content:
+        block_grading = False
+        reason = "Submission has mixed relevant and irrelevant content; grading should proceed with review."
+    elif (not is_relevant) and critical_flags and confidence == "high" and not has_relevant_sections:
+        block_grading = True
+        reason = "Submission appears unrelated to the assignment."
+    elif (
+        (not is_relevant)
+        and {"wrong_assignment", "off_topic"}.issubset(set(critical_flags))
+        and confidence in {"high", "medium"}
+        and not has_relevant_sections
+        and signal_overlap <= 1
+        and signal_ratio < 0.04
+    ):
+        block_grading = True
+        reason = "Submission was classified as wrong assignment and off-topic."
+
+    review_required = (not block_grading) and ((not is_relevant) or bool(critical_flags))
+    return {
+        "block_grading": block_grading,
+        "review_required": review_required,
+        "reason": reason,
+        "is_relevant": is_relevant,
+        "confidence": confidence,
+        "flags": flags,
+        "critical_flags": critical_flags,
+        "has_relevant_sections": has_relevant_sections,
+        "mixed_content": mixed_content,
+        "assignment_signal": {
+            "token_overlap": signal_overlap,
+            "signal_ratio": round(signal_ratio, 4),
+            "files_with_overlap": int(signal_info.get("files_with_overlap", 0) or 0),
+            "files_scanned": int(signal_info.get("files_scanned", 0) or 0),
+            "matched_terms": signal_info.get("matched_terms", [])[:12] if isinstance(signal_info.get("matched_terms"), list) else [],
+        },
+        "policy_version": "relevance_gate_v2_2026_03_06",
+    }
+
+
+def build_relevance_block_result(
+    rubric: str,
+    max_score: int,
+    relevance: Optional[dict[str, Any]],
+    gate: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return a deterministic zero-score result for clearly irrelevant submissions."""
+    gate_info = gate if isinstance(gate, dict) else evaluate_relevance_gate(relevance)
+    reasoning = str((relevance or {}).get("reasoning", "")).strip()
+    gate_reason = str(gate_info.get("reason", "")).strip()
+    merged_reason = gate_reason or reasoning or "Submission failed relevance validation."
+
+    rubric_criteria = parse_rubric(rubric)
+    breakdown = []
+    for rc in rubric_criteria:
+        criterion = str(rc.get("criterion", "")).strip()
+        max_points = float(rc.get("max", 0) or 0)
+        if not criterion:
+            continue
+        breakdown.append({
+            "criterion": criterion,
+            "score": 0.0,
+            "max": max_points,
+            "justification": f"Not graded because the submission appears irrelevant. Evidence: relevance_gate ({', '.join(gate_info.get('critical_flags', []) or gate_info.get('flags', []) or ['none'])}).",
+            "citations": [{"source": "relevance_validation"}],
+        })
+
+    conf = str(gate_info.get("confidence", "medium")).lower()
+    if conf not in {"high", "medium", "low"}:
+        conf = "medium"
+
+    return {
+        "total_score": 0.0,
+        "max_score": max_score,
+        "percentage": 0.0,
+        "letter_grade": "F",
+        "rubric_breakdown": breakdown,
+        "overall_feedback": (
+            "Submission was not graded against rubric content because relevance checks "
+            f"indicated it is likely unrelated to this assignment. {merged_reason}"
+        )[:2000],
+        "strengths": [],
+        "weaknesses": [
+            "Submission appears out-of-scope for the assigned task.",
+        ],
+        "suggestions_for_improvement": (
+            "Resubmit work that directly answers the assignment questions and aligns with the rubric criteria."
+        ),
+        "confidence": conf if conf in {"high", "medium"} else "medium",
+        "confidence_reasoning": f"Relevance gate blocked rubric scoring. Flags: {', '.join(gate_info.get('flags', []) or ['none'])}.",
+        "relevance": relevance if isinstance(relevance, dict) else {},
+        "relevance_gate": gate_info,
+    }
 
 
 SYSTEM_PROMPT = """You are an expert Computer Science instructor grading student submissions.
@@ -1039,7 +1342,16 @@ GRADING RULES:
 RESPONSE FORMAT - return ONLY valid JSON:
 {
   "rubric_breakdown": [
-    {"criterion": "<EXACT name from rubric>", "score": <number>, "max": <exact max from rubric>, "justification": "<specific evidence>"}
+    {
+      "criterion": "<EXACT name from rubric>",
+      "score": <number>,
+      "max": <exact max from rubric>,
+      "justification": "<specific evidence>",
+      "citations": [
+        {"type": "image", "image_id": "img_0001"},
+        {"type": "text", "snippet_id": "txt_0001"}
+      ]
+    }
   ],
   "total_score": <sum of rubric scores>,
   "overall_feedback": "<comprehensive feedback>",
@@ -1054,7 +1366,8 @@ IMPORTANT:
 - Do NOT add extra rubric criteria.
 - Do NOT skip any rubric criteria.
 - If handwritten work is visible, include that evidence in feedback and scoring.
-- If automated vision notes are provided, treat them as additional evidence to verify against images."""
+- If automated vision notes are provided, treat them as additional evidence to verify against images.
+- If a criterion-evidence candidate list is provided, prefer citations from that list."""
 
 
 def _build_user_prompt(
@@ -1064,6 +1377,7 @@ def _build_user_prompt(
     max_score: int,
     student_files: list,
     questions: Optional[list[dict]] = None,
+    criterion_evidence_context: Optional[str] = None,
 ) -> str:
     
     rubric_criteria = parse_rubric(rubric)
@@ -1116,6 +1430,16 @@ def _build_user_prompt(
     parts.append("- Apply rubric deductions consistently across students.")
     parts.append("- If evidence is ambiguous, choose the lower adjacent score.")
     parts.append("")
+    parts.append("CITATION REQUIREMENT:")
+    parts.append("- For EACH rubric item, include citations in rubric_breakdown[].citations.")
+    parts.append("- Use image_id citations when image evidence is relevant.")
+    parts.append("- If only text supports a point, use {\"type\":\"text\",\"snippet_id\":\"txt_xxxx\"} or {\"source\":\"text_content\"}.")
+    parts.append("- Do not cite image IDs that are not listed in the criterion evidence candidates.")
+    parts.append("")
+    if criterion_evidence_context:
+        parts.append("CRITERION EVIDENCE CANDIDATES (PREFER THESE FOR CITATIONS):")
+        parts.append(criterion_evidence_context)
+        parts.append("")
     parts.append("IMPORTANT: Carefully analyze all images provided. They may contain handwritten solutions, graphs, and diagrams.")
     
     return "\n".join(parts)
@@ -1874,6 +2198,183 @@ def _tokenize_for_citation(text: str) -> set[str]:
     return {tok for tok in re.findall(r"[a-zA-Z][a-zA-Z0-9_+\-*]{2,}", str(text or "").lower())}
 
 
+_CITATION_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "are", "was", "were", "have", "has",
+    "into", "onto", "using", "use", "used", "task", "question", "problem", "part", "section",
+    "criterion", "criteria", "points", "score", "max", "implementation", "analysis", "design",
+    "system", "algorithm", "approach", "student", "solution", "code", "report", "work",
+}
+
+
+def _criterion_token_set(text: str) -> set[str]:
+    return {tok for tok in _tokenize_for_citation(text) if tok not in _CITATION_STOPWORDS}
+
+
+def _extract_text_snippets_for_evidence(
+    text_content: str,
+    max_snippets: int = 90,
+    snippet_chars: int = 280,
+) -> list[dict[str, Any]]:
+    snippets: list[dict[str, Any]] = []
+    if not isinstance(text_content, str) or not text_content.strip():
+        return snippets
+
+    current_file = "unknown"
+    block_lines: list[str] = []
+
+    def _push_block(file_label: str, lines: list[str]) -> None:
+        nonlocal snippets
+        if not lines or len(snippets) >= max_snippets:
+            return
+        raw = "\n".join(lines).strip()
+        if not raw:
+            return
+        segments = re.split(r"\n{2,}", raw)
+        for seg in segments:
+            if len(snippets) >= max_snippets:
+                break
+            clean = _normalize_space(seg)
+            if not clean:
+                continue
+            start = 0
+            while start < len(clean) and len(snippets) < max_snippets:
+                chunk = clean[start:start + snippet_chars]
+                if len(chunk) >= snippet_chars:
+                    cut = max(chunk.rfind(". "), chunk.rfind("; "), chunk.rfind(", "))
+                    if cut >= 140:
+                        chunk = chunk[:cut + 1]
+                snippet_id = f"txt_{len(snippets) + 1:04d}"
+                tokens = _criterion_token_set(chunk + " " + file_label)
+                snippets.append({
+                    "snippet_id": snippet_id,
+                    "filename": file_label,
+                    "text": chunk.strip(),
+                    "tokens": tokens,
+                })
+                start += max(1, len(chunk))
+
+    for line in text_content.splitlines():
+        header = re.match(r"^\s*===\s*(.+?)\s*===\s*$", line)
+        if header:
+            _push_block(current_file, block_lines)
+            block_lines = []
+            header_label = _normalize_space(header.group(1))
+            current_file = header_label.split(" (")[0].strip() if " (" in header_label else header_label
+            current_file = current_file or "unknown"
+            continue
+        block_lines.append(line)
+    _push_block(current_file, block_lines)
+    return snippets
+
+
+def _score_image_evidence_for_criterion(ev: dict[str, Any], criterion_tokens: set[str]) -> tuple[float, int]:
+    evidence_text = " ".join([
+        str(ev.get("filename", "")),
+        str(ev.get("description", "")),
+        str(ev.get("summary", "")),
+        str(ev.get("transcription", "")),
+    ])
+    ev_tokens = _criterion_token_set(evidence_text)
+    overlap = len(criterion_tokens & ev_tokens)
+
+    conf_bonus = {"high": 6.0, "medium": 3.0, "low": 1.0}.get(str(ev.get("confidence", "")).lower(), 0.0)
+    score = (overlap * 120.0) + float(ev.get("content_score", 0.0) or 0.0) + conf_bonus
+    if ev.get("substantive"):
+        score += 10.0
+    if overlap == 0:
+        # Keep weak candidates but demote heavily when no lexical match exists.
+        score -= 25.0
+    return score, overlap
+
+
+def _score_text_snippet_for_criterion(snippet: dict[str, Any], criterion_tokens: set[str]) -> tuple[float, int]:
+    overlap = len(criterion_tokens & set(snippet.get("tokens", set())))
+    length_bonus = min(6.0, len(str(snippet.get("text", ""))) / 80.0)
+    score = (overlap * 95.0) + length_bonus
+    if overlap == 0:
+        score -= 20.0
+    return score, overlap
+
+
+def _build_criterion_evidence_plan(
+    rubric_criteria: list[dict[str, Any]],
+    text_content: str,
+    evidence_map: list[dict[str, Any]],
+) -> dict[str, Any]:
+    snippets = _extract_text_snippets_for_evidence(text_content)
+    prompt_lines: list[str] = []
+    candidate_map: dict[str, dict[str, Any]] = {}
+
+    for rc in rubric_criteria:
+        criterion = str(rc.get("criterion", "")).strip()
+        if not criterion:
+            continue
+        key = criterion.lower()
+        c_tokens = _criterion_token_set(criterion)
+
+        image_ranked: list[tuple[float, int, dict[str, Any]]] = []
+        for ev in evidence_map:
+            score, overlap = _score_image_evidence_for_criterion(ev, c_tokens)
+            image_ranked.append((score, overlap, ev))
+        image_ranked.sort(
+            key=lambda t: (
+                t[0],
+                t[1],
+                bool(t[2].get("substantive")),
+                float(t[2].get("content_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        picked_images = [ev for score, overlap, ev in image_ranked if score > 0 and overlap > 0][:4]
+
+        text_ranked: list[tuple[float, int, dict[str, Any]]] = []
+        for snip in snippets:
+            score, overlap = _score_text_snippet_for_criterion(snip, c_tokens)
+            text_ranked.append((score, overlap, snip))
+        text_ranked.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        picked_text = [snip for score, overlap, snip in text_ranked if score > 0 and overlap > 0][:2]
+
+        candidate_map[key] = {
+            "criterion": criterion,
+            "image_ids": [str(ev.get("image_id")) for ev in picked_images if ev.get("image_id")],
+            "text_snippet_ids": [str(s.get("snippet_id")) for s in picked_text if s.get("snippet_id")],
+            "images": picked_images,
+            "text_snippets": picked_text,
+        }
+
+        prompt_lines.append(f"[Criterion] {criterion}")
+        if picked_images:
+            img_parts = []
+            for ev in picked_images[:4]:
+                img_parts.append(
+                    f"{ev.get('image_id')} ({ev.get('filename')} p{ev.get('page')}: {str(ev.get('summary', '') or ev.get('description', ''))[:90]})"
+                )
+            prompt_lines.append("- Candidate image IDs: " + "; ".join(img_parts))
+        else:
+            prompt_lines.append("- Candidate image IDs: none")
+
+        if picked_text:
+            txt_parts = []
+            for snip in picked_text[:2]:
+                txt_parts.append(
+                    f"{snip.get('snippet_id')} ({snip.get('filename')}: {str(snip.get('text', ''))[:90]})"
+                )
+            prompt_lines.append("- Candidate text snippets: " + "; ".join(txt_parts))
+        else:
+            prompt_lines.append("- Candidate text snippets: none")
+        prompt_lines.append("")
+
+    prompt_block = "\n".join(prompt_lines).strip()
+    if len(prompt_block) > 11000:
+        prompt_block = prompt_block[:11000] + "\n...[TRUNCATED CANDIDATE LIST]"
+
+    return {
+        "prompt_block": prompt_block,
+        "candidate_map": candidate_map,
+        "text_snippets_indexed": len(snippets),
+    }
+
+
 def _build_evidence_map(selected_images: list[dict], vision_trace: dict[str, Any]) -> list[dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     for img in selected_images:
@@ -1912,57 +2413,445 @@ def _build_evidence_map(selected_images: list[dict], vision_trace: dict[str, Any
     return sorted(by_id.values(), key=lambda x: x["image_id"])
 
 
-def _attach_rubric_citations(result: dict[str, Any], evidence_map: list[dict[str, Any]]) -> None:
+def _normalize_citation_objects(raw_citations: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    if not isinstance(raw_citations, list):
+        return normalized
+    for raw in raw_citations[:8]:
+        if isinstance(raw, str):
+            image_id = raw.strip()
+            if image_id.startswith("img_"):
+                normalized.append({"type": "image", "image_id": image_id})
+            continue
+        if not isinstance(raw, dict):
+            continue
+        image_id = str(raw.get("image_id", "")).strip()
+        snippet_id = str(raw.get("snippet_id", "")).strip()
+        source = str(raw.get("source", "")).strip()
+        item: dict[str, Any] = {}
+        if image_id:
+            item["type"] = "image"
+            item["image_id"] = image_id
+            if raw.get("filename"):
+                item["filename"] = str(raw.get("filename", ""))
+            if raw.get("page") is not None:
+                try:
+                    item["page"] = int(raw.get("page"))
+                except Exception:
+                    pass
+        elif snippet_id:
+            item["type"] = "text"
+            item["snippet_id"] = snippet_id
+            item["source"] = source or "text_content"
+        elif source:
+            item["source"] = source
+        if item:
+            normalized.append(item)
+    return normalized
+
+
+def _append_evidence_to_justification(base_text: str, citations: list[dict[str, Any]]) -> str:
+    base = str(base_text or "").strip()
+    if not base:
+        base = "Evidence assessed."
+    base = re.sub(r"\s*Evidence:\s*.*$", "", base, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    tags: list[str] = []
+    for c in citations:
+        image_id = str(c.get("image_id", "")).strip()
+        if image_id:
+            filename = str(c.get("filename", "")).strip()
+            page = c.get("page")
+            if filename and page is not None:
+                tags.append(f"{image_id} ({filename} p{page})")
+            elif filename:
+                tags.append(f"{image_id} ({filename})")
+            else:
+                tags.append(image_id)
+            continue
+        snippet_id = str(c.get("snippet_id", "")).strip()
+        if snippet_id:
+            tags.append(f"{snippet_id} (text)")
+            continue
+        source = str(c.get("source", "")).strip()
+        if source:
+            tags.append(source)
+
+    if not tags:
+        tags = ["text_content"]
+    return f"{base} Evidence: {', '.join(tags)}".strip()
+
+
+def _attach_rubric_citations(
+    result: dict[str, Any],
+    evidence_map: list[dict[str, Any]],
+    candidate_map: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, Any]:
     breakdown = result.get("rubric_breakdown")
     if not isinstance(breakdown, list):
-        return
+        return {"total_items": 0, "criteria_with_image_citation": 0, "fallback_applied": 0}
 
     evidence_pool = list(evidence_map or [])
+    evidence_by_id = {
+        str(ev.get("image_id", "")): ev
+        for ev in evidence_pool
+        if str(ev.get("image_id", "")).strip()
+    }
+
+    stats = {
+        "total_items": len(breakdown),
+        "criteria_with_image_citation": 0,
+        "fallback_applied": 0,
+        "model_citations_used": 0,
+        "text_only_items": 0,
+    }
+
     for item in breakdown:
         if not isinstance(item, dict):
             continue
         criterion = str(item.get("criterion", "")).strip()
-        c_tokens = _tokenize_for_citation(criterion)
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for ev in evidence_pool:
-            evidence_text = " ".join([
-                str(ev.get("description", "")),
-                str(ev.get("summary", "")),
-                str(ev.get("transcription", "")),
-            ])
-            overlap = len(c_tokens & _tokenize_for_citation(evidence_text))
-            score = float(overlap * 100) + float(ev.get("content_score", 0.0) or 0.0)
-            if ev.get("substantive"):
-                score += 8.0
-            scored.append((score, ev))
+        key = criterion.lower()
+        c_tokens = _criterion_token_set(criterion)
 
-        scored.sort(key=lambda t: t[0], reverse=True)
-        chosen = [ev for _, ev in scored[:2] if ev]
-        citations = []
-        if chosen:
-            for ev in chosen:
+        criterion_candidates = (candidate_map or {}).get(key, {})
+        candidate_ids = [
+            cid for cid in criterion_candidates.get("image_ids", [])
+            if cid in evidence_by_id
+        ]
+        allowed_ids = set(candidate_ids) if candidate_ids else set(evidence_by_id.keys())
+
+        normalized_existing = _normalize_citation_objects(item.get("citations", []))
+        scored_existing: list[tuple[float, int, dict[str, Any]]] = []
+        for c in normalized_existing:
+            image_id = str(c.get("image_id", "")).strip()
+            if not image_id or image_id not in evidence_by_id:
+                continue
+            if image_id not in allowed_ids:
+                continue
+            ev = evidence_by_id[image_id]
+            score, overlap = _score_image_evidence_for_criterion(ev, c_tokens)
+            scored_existing.append((score, overlap, ev))
+
+        scored_existing.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        chosen_images: list[dict[str, Any]] = []
+        if scored_existing and scored_existing[0][1] > 0:
+            chosen_images = [ev for _, _, ev in scored_existing[:2]]
+            stats["model_citations_used"] += 1
+
+        if not chosen_images:
+            scored_candidates: list[tuple[float, int, dict[str, Any]]] = []
+            pool = candidate_ids if candidate_ids else list(allowed_ids)
+            for image_id in pool:
+                ev = evidence_by_id.get(image_id)
+                if not ev:
+                    continue
+                score, overlap = _score_image_evidence_for_criterion(ev, c_tokens)
+                scored_candidates.append((score, overlap, ev))
+            scored_candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            chosen_images = [ev for score, overlap, ev in scored_candidates[:2] if score > 0 and overlap > 0]
+            if chosen_images:
+                stats["fallback_applied"] += 1
+
+        citations: list[dict[str, Any]] = []
+        if chosen_images:
+            for ev in chosen_images[:2]:
                 citations.append({
+                    "type": "image",
                     "image_id": ev.get("image_id"),
                     "filename": ev.get("filename"),
                     "page": ev.get("page"),
                     "batch_id": ev.get("batch_id"),
                 })
-            tags = ", ".join(
-                f"{c.get('image_id')} ({c.get('filename')} p{c.get('page')})"
-                for c in citations
-                if c.get("image_id")
-            )
-            if tags:
-                base = str(item.get("justification", "") or "").strip()
-                if "Evidence:" not in base:
-                    item["justification"] = f"{base} Evidence: {tags}".strip()
+            stats["criteria_with_image_citation"] += 1
         else:
-            citations = [{"source": "text_content"}]
-            base = str(item.get("justification", "") or "").strip()
-            if "Evidence:" not in base:
-                item["justification"] = f"{base} Evidence: text_content".strip()
+            text_ids = criterion_candidates.get("text_snippet_ids", [])
+            if text_ids:
+                citations.append({"type": "text", "snippet_id": text_ids[0], "source": "text_content"})
+            else:
+                citations.append({"source": "text_content"})
+            stats["text_only_items"] += 1
 
+        item["justification"] = _append_evidence_to_justification(item.get("justification", ""), citations)
         item["citations"] = citations
+    return stats
+
+
+async def _verify_citations_with_llm(
+    rubric_breakdown: list[dict[str, Any]],
+    evidence_map: list[dict[str, Any]],
+    candidate_map: dict[str, dict[str, Any]],
+    preferred_provider: str,
+) -> dict[str, Any]:
+    trace: dict[str, Any] = {
+        "checked": 0,
+        "invalid": 0,
+        "weak": 0,
+        "provider": "",
+        "model": "",
+        "error": "",
+        "verdict_map": {},
+    }
+    if not rubric_breakdown or not evidence_map or not candidate_map:
+        return trace
+
+    evidence_by_id = {
+        str(ev.get("image_id", "")): ev
+        for ev in evidence_map
+        if str(ev.get("image_id", "")).strip()
+    }
+
+    checks_payload: list[dict[str, Any]] = []
+    for item in rubric_breakdown:
+        criterion = str(item.get("criterion", "")).strip()
+        if not criterion:
+            continue
+        key = criterion.lower()
+        candidate_ids = [
+            cid for cid in candidate_map.get(key, {}).get("image_ids", [])
+            if cid in evidence_by_id
+        ][:5]
+        if not candidate_ids:
+            continue
+
+        cited_ids = [
+            str(c.get("image_id", "")).strip()
+            for c in _normalize_citation_objects(item.get("citations", []))
+            if str(c.get("image_id", "")).strip()
+        ][:3]
+        candidate_evidence = []
+        for cid in candidate_ids:
+            ev = evidence_by_id[cid]
+            candidate_evidence.append({
+                "image_id": cid,
+                "filename": str(ev.get("filename", "")),
+                "page": int(ev.get("page", 0) or 0),
+                "summary": str(ev.get("summary", ""))[:140],
+                "transcription": str(ev.get("transcription", ""))[:140],
+                "description": str(ev.get("description", ""))[:100],
+            })
+        checks_payload.append({
+            "criterion": criterion,
+            "justification": str(item.get("justification", ""))[:260],
+            "cited_image_ids": cited_ids,
+            "candidate_image_ids": candidate_ids,
+            "candidate_evidence": candidate_evidence,
+        })
+
+    if not checks_payload:
+        return trace
+
+    verifier_prompt = (
+        "Validate rubric-item evidence citations.\n"
+        "For each item, approve only image IDs that concretely support the criterion.\n"
+        "Use candidate evidence only. Do not invent IDs.\n"
+        "Output strict JSON:\n"
+        "{\n"
+        '  "checks": [\n'
+        '    {"criterion":"...", "status":"valid|weak|invalid", "approved_image_ids":["img_0001"], "reason":"..."}\n'
+        "  ]\n"
+        "}\n\n"
+        f"Items:\n{json.dumps(checks_payload, ensure_ascii=False)}"
+    )
+
+    try:
+        await _rate_limiter.acquire()
+        response, meta = _chat_completion_with_failover(
+            purpose="citation_verification",
+            needs_vision=False,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict citation auditor for academic grading evidence. "
+                        "Only approve citations supported by provided evidence."
+                    ),
+                },
+                {"role": "user", "content": verifier_prompt},
+            ],
+            temperature=0.0,
+            top_p=0.1,
+            max_tokens=1200,
+            seed=42,
+            preferred_provider=preferred_provider,
+            allow_fallback=bool(SCORING_ALLOW_FALLBACK),
+        )
+        trace["provider"] = str(meta.get("provider", ""))
+        trace["model"] = str(meta.get("model", ""))
+        raw = (response.choices[0].message.content or "").strip()
+        parsed = _extract_json(raw)
+        checks = parsed.get("checks", []) if isinstance(parsed, dict) else []
+        verdict_map: dict[str, dict[str, Any]] = {}
+        for chk in checks:
+            if not isinstance(chk, dict):
+                continue
+            criterion = str(chk.get("criterion", "")).strip().lower()
+            if not criterion:
+                continue
+            status = str(chk.get("status", "weak")).strip().lower()
+            approved = [
+                cid for cid in chk.get("approved_image_ids", [])
+                if isinstance(cid, str) and cid in evidence_by_id
+            ][:2]
+            verdict_map[criterion] = {
+                "status": status if status in {"valid", "weak", "invalid"} else "weak",
+                "approved_image_ids": approved,
+                "reason": str(chk.get("reason", ""))[:220],
+            }
+        trace["verdict_map"] = verdict_map
+        trace["checked"] = len(verdict_map)
+        trace["invalid"] = sum(1 for v in verdict_map.values() if v.get("status") == "invalid")
+        trace["weak"] = sum(1 for v in verdict_map.values() if v.get("status") == "weak")
+        return trace
+    except Exception as exc:
+        trace["error"] = str(exc)
+        return trace
+
+
+def _apply_llm_citation_verdict(
+    rubric_breakdown: list[dict[str, Any]],
+    evidence_map: list[dict[str, Any]],
+    candidate_map: dict[str, dict[str, Any]],
+    verifier_trace: dict[str, Any],
+) -> dict[str, int]:
+    applied = 0
+    evidence_by_id = {
+        str(ev.get("image_id", "")): ev
+        for ev in evidence_map
+        if str(ev.get("image_id", "")).strip()
+    }
+    verdict_map = verifier_trace.get("verdict_map", {}) if isinstance(verifier_trace, dict) else {}
+    if not verdict_map:
+        return {"applied": 0}
+
+    for item in rubric_breakdown:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("criterion", "")).strip().lower()
+        verdict = verdict_map.get(key)
+        if not verdict:
+            continue
+        approved_ids = verdict.get("approved_image_ids", [])
+        allowed = set(candidate_map.get(key, {}).get("image_ids", []))
+        filtered = []
+        for image_id in approved_ids:
+            if image_id not in evidence_by_id:
+                continue
+            if allowed and image_id not in allowed:
+                continue
+            filtered.append(image_id)
+        if not filtered:
+            continue
+        citations = []
+        for image_id in filtered[:2]:
+            ev = evidence_by_id[image_id]
+            citations.append({
+                "type": "image",
+                "image_id": image_id,
+                "filename": ev.get("filename"),
+                "page": ev.get("page"),
+                "batch_id": ev.get("batch_id"),
+            })
+        item["citations"] = citations
+        item["justification"] = _append_evidence_to_justification(item.get("justification", ""), citations)
+        applied += 1
+    return {"applied": applied}
+
+
+def _calibrate_confidence_with_citations(
+    base_confidence: str,
+    citation_stats: dict[str, Any],
+    verifier_trace: dict[str, Any],
+    image_evidence_available: bool,
+) -> tuple[str, str]:
+    total_items = max(1, int(citation_stats.get("total_items", 0) or 0))
+    image_covered = int(citation_stats.get("criteria_with_image_citation", 0) or 0)
+    image_coverage = image_covered / total_items
+
+    checked = int(verifier_trace.get("checked", 0) or 0)
+    invalid = int(verifier_trace.get("invalid", 0) or 0)
+    weak = int(verifier_trace.get("weak", 0) or 0)
+    invalid_ratio = (invalid / checked) if checked > 0 else 0.0
+    weak_ratio = (weak / checked) if checked > 0 else 0.0
+
+    rank = {"low": 0, "medium": 1, "high": 2}.get(str(base_confidence).lower(), 1)
+    if image_evidence_available:
+        if image_coverage < 0.40:
+            rank = min(rank, 0)
+        elif image_coverage < 0.70:
+            rank = min(rank, 1)
+
+    if invalid_ratio >= 0.30:
+        rank = 0
+    elif invalid_ratio >= 0.10 or weak_ratio >= 0.40:
+        rank = min(rank, 1)
+
+    calibrated = {0: "low", 1: "medium", 2: "high"}[rank]
+    if image_evidence_available:
+        reason = (
+            f"Citation audit: {image_covered}/{total_items} rubric criteria have image-backed evidence."
+        )
+    else:
+        reason = "Citation audit: no image evidence was available; confidence calibrated from textual evidence consistency."
+    if checked > 0:
+        reason += f" Verifier: {invalid}/{checked} invalid, {weak}/{checked} weak."
+    return calibrated, reason
+
+
+async def _repair_grading_json(
+    raw_text: str,
+    rubric_criteria: list[dict[str, Any]],
+    max_score: int,
+    preferred_provider: str,
+) -> Optional[dict[str, Any]]:
+    source = str(raw_text or "").strip()
+    if not source:
+        return None
+
+    rubric_lines = [f"- {c.get('criterion')}: {c.get('max')}" for c in rubric_criteria if c.get("criterion")]
+    prompt = (
+        "Convert the following grading response into strict JSON.\n"
+        "Return only JSON with this schema:\n"
+        "{\n"
+        '  "rubric_breakdown":[{"criterion":"...","score":0,"max":0,"justification":"...","citations":[{"type":"image","image_id":"img_0001"}]}],\n'
+        '  "total_score":0,\n'
+        '  "overall_feedback":"...",\n'
+        '  "strengths":["..."],\n'
+        '  "weaknesses":["..."],\n'
+        '  "suggestions_for_improvement":"...",\n'
+        '  "confidence":"high|medium|low",\n'
+        '  "confidence_reasoning":"..."\n'
+        "}\n"
+        "Rules:\n"
+        "1) Keep criterion names exactly from this rubric list.\n"
+        "2) Keep max values exactly from rubric.\n"
+        "3) Ensure total_score is the sum of rubric scores and <= max_score.\n"
+        "4) If citation evidence is missing, set citations to [{\"source\":\"text_content\"}].\n\n"
+        f"RUBRIC:\n{chr(10).join(rubric_lines)}\n"
+        f"MAX SCORE: {max_score}\n\n"
+        f"RAW RESPONSE:\n{source[:12000]}"
+    )
+
+    try:
+        await _rate_limiter.acquire()
+        response, _meta = _chat_completion_with_failover(
+            purpose="grade_json_repair",
+            needs_vision=False,
+            messages=[
+                {"role": "system", "content": "You are a strict JSON formatter for grading outputs."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            top_p=0.1,
+            max_tokens=1800,
+            seed=42,
+            preferred_provider=preferred_provider,
+            allow_fallback=bool(SCORING_ALLOW_FALLBACK),
+        )
+        repaired_raw = (response.choices[0].message.content or "").strip()
+        repaired = _extract_json(repaired_raw)
+        return _validate_result(repaired, rubric_criteria, max_score)
+    except Exception:
+        return None
 
 
 def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) -> dict:
@@ -2002,13 +2891,18 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
             except (ValueError, TypeError):
                 score = 0
             score = max(0, min(score, matched_data['max']))
-            
-            fixed_breakdown.append({
+
+            fixed_item = {
                 "criterion": matched_data['criterion'],
                 "score": round(score, 1),
                 "max": matched_data['max'],
                 "justification": str(item.get("justification", item.get("feedback", "")))[:500]
-            })
+            }
+            normalized_citations = _normalize_citation_objects(item.get("citations", []))
+            if normalized_citations:
+                fixed_item["citations"] = normalized_citations
+
+            fixed_breakdown.append(fixed_item)
             used_keys.add(matched_key)
     
     for rubric_key, rubric_data in rubric_map.items():
@@ -2176,6 +3070,126 @@ def compute_grading_hash(student_files: list, rubric: str, max_score: int) -> st
     return hasher.hexdigest()[:16]
 
 
+
+# ============================================================================
+# AI-POWERED IMAGE RELEVANCE RANKING
+# ============================================================================
+
+IMAGE_RELEVANCE_PROMPT = """You are an expert at analyzing student submissions.
+Analyze the provided images and rank them by RELEVANCE for grading purposes.
+
+Classification categories:
+- "SUBSTANTIVE_CODE": Contains actual code solutions, algorithms, implementations
+- "SUBSTANTIVE_WRITTEN": Contains written solutions, explanations, analysis
+- "SUBSTANTIVE_DIAGRAM": Contains important diagrams, flowcharts, graphs
+- "MINOR": Front matter, headers, decorative, or irrelevant content
+
+Return ONLY valid JSON:
+{
+  "ranked_images": [
+    {"image_id": "id1", "rank": 1, "classification": "SUBSTANTIVE_CODE", "relevance_score": 10, "reason": "Contains main solution code"},
+    {"image_id": "id2", "rank": 2, "classification": "SUBSTANTIVE_WRITTEN", "reason": "Contains explanation"}
+  ],
+  "summary": "Overall assessment"
+}"""
+
+
+async def _rank_images_by_relevance(
+    client,
+    images: list[dict],
+    max_images: int = 8,
+) -> tuple[list[dict], dict]:
+    """
+    Use AI to rank images by relevance for grading.
+    This helps prioritize which images are most important.
+    """
+    if not images:
+        return [], {"method": "none", "ranked_count": 0}
+    
+    # Only rank if we have more images than we can send
+    if len(images) <= max_images:
+        return images, {"method": "all_within_limit", "ranked_count": len(images)}
+    
+    # Build content with images for ranking
+    content = [{"type": "text", "text": IMAGE_RELEVANCE_PROMPT}]
+    
+    # Take a sample for ranking (not all - would be too many)
+    sample_size = min(20, len(images))
+    sample = images[:sample_size]
+    
+    for img in sample:
+        desc = f"[Image {img.get('image_id', 'unknown')}] {img.get('filename', '')}"
+        if img.get('page'):
+            desc += f" (Page {img['page']})"
+        content.append({"type": "text", "text": desc})
+        
+        if img.get('base64'):
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img['base64']}", "detail": "low"}
+            })
+    
+    messages = [
+        {"role": "system", "content": "You are an expert at analyzing student submissions for grading."},
+        {"role": "user", "content": content}
+    ]
+    
+    try:
+        await _rate_limiter.acquire()
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=1000,
+            seed=42,
+        )
+        
+        raw = response.choices[0].message.content or ""
+        
+        # Parse response
+        import json
+        json_start = raw.find('{')
+        json_end = raw.rfind('}') + 1
+        if json_start >= 0 and json_end > json_start:
+            rankings = json.loads(raw[json_start:json_end])
+            
+            # Map rankings back to images
+            ranked_ids = {}
+            for item in rankings.get("ranked_images", []):
+                ranked_ids[item.get("image_id")] = {
+                    "rank": item.get("rank", 999),
+                    "classification": item.get("classification", "MINOR"),
+                    "score": item.get("relevance_score", 0),
+                    "reason": item.get("reason", "")
+                }
+            
+            # Sort images by their ranking
+            def get_rank(img):
+                rid = img.get("image_id", "")
+                return ranked_ids.get(rid, {}).get("rank", 999)
+            
+            sorted_images = sorted(images, key=get_rank)
+            selected = sorted_images[:max_images]
+            
+            return selected, {
+                "method": "ai_ranked",
+                "ranked_count": len(ranked_ids),
+                "selected_count": len(selected),
+                "total_available": len(images),
+                "classifications": {
+                    img.get("image_id", ""): ranked_ids.get(img.get("image_id", ""), {}).get("classification", "UNKNOWN")
+                    for img in selected
+                }
+            }
+        
+    except Exception as e:
+        logger.warning(f"Image relevance ranking failed: {e}")
+    
+    # Fallback: just take first N images
+    return images[:max_images], {"method": "fallback_first_n", "ranked_count": 0}
+
+
+
 async def grade_student(
     title: str,
     description: str,
@@ -2209,10 +3223,10 @@ async def grade_student(
     
     grading_hash = compute_grading_hash(student_files, rubric, max_score)
 
+    # Use the existing robust grading pipeline with vision pre-analysis
     await _rate_limiter.acquire()
 
-    user_text = _build_user_prompt(title, description, rubric, max_score, student_files, questions)
-    text_content = _extract_text_content(student_files)
+    raw_text_content = _extract_text_content(student_files)
     selection_pool_limit = max(200, int(MAX_IMAGES_SELECTION_POOL))
     total_available_images = sum(
         len(getattr(f, "images", []) or [])
@@ -2225,6 +3239,18 @@ async def grade_student(
     # Vision pre-analysis processes image batches deterministically, so no image is silently dropped.
     vision_notes, vision_trace = await _run_vision_preanalysis(selected_images)
     evidence_map = _build_evidence_map(selected_images, vision_trace)
+    criterion_evidence = _build_criterion_evidence_plan(rubric_criteria, raw_text_content, evidence_map)
+    user_text = _build_user_prompt(
+        title,
+        description,
+        rubric,
+        max_score,
+        student_files,
+        questions,
+        criterion_evidence_context=criterion_evidence.get("prompt_block", ""),
+    )
+
+    text_content = raw_text_content
     notes_attached_to_grading = bool((vision_notes or "").strip())
     if notes_attached_to_grading:
         text_content = (
@@ -2235,17 +3261,61 @@ async def grade_student(
             + vision_notes
         )
 
-    # Final grade call is text-first; raw images are handled by deterministic vision batching above.
+    # Final grade call includes a selected multimodal subset for direct evidence grounding.
     vision_candidates = _enabled_provider_candidates(needs_vision=True)
     provider_image_cap = _effective_vision_image_cap(vision_candidates)
+    selected_by_id = {
+        str(img.get("image_id", "")): img
+        for img in selected_images
+        if str(img.get("image_id", "")).strip()
+    }
+    ordered_candidate_ids: list[str] = []
+    for rc in rubric_criteria:
+        key = str(rc.get("criterion", "")).strip().lower()
+        for image_id in criterion_evidence.get("candidate_map", {}).get(key, {}).get("image_ids", []):
+            if image_id not in ordered_candidate_ids:
+                ordered_candidate_ids.append(image_id)
+
     final_images: list[dict[str, Any]] = []
+    for image_id in ordered_candidate_ids:
+        if image_id in selected_by_id:
+            final_images.append(selected_by_id[image_id])
+        if len(final_images) >= provider_image_cap:
+            break
+
+    if len(final_images) < provider_image_cap:
+        for img in _pick_diverse_images_for_grading(selected_images, max_images=provider_image_cap):
+            image_id = str(img.get("image_id", "")).strip()
+            if not image_id:
+                continue
+            if any(str(x.get("image_id", "")).strip() == image_id for x in final_images):
+                continue
+            final_images.append(img)
+            if len(final_images) >= provider_image_cap:
+                break
+
+    final_images = _enforce_image_byte_budget(final_images[:provider_image_cap], int(MAX_FINAL_IMAGE_BYTES))
     user_content, img_count, images_info = _build_multimodal_content(user_text, text_content, final_images)
     scoring_primary = str(SCORING_PRIMARY_PROVIDER or "").strip().lower()
     scoring_allow_fallback = bool(SCORING_ALLOW_FALLBACK)
+    fallback_user_text = _build_user_prompt(
+        title,
+        description,
+        rubric,
+        max_score,
+        student_files,
+        questions,
+        criterion_evidence_context=None,
+    )
+    fallback_user_content, _, _ = _build_multimodal_content(fallback_user_text, text_content, final_images)
     
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content}
+    ]
+    fallback_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": fallback_user_content}
     ]
     
     logger.info(
@@ -2282,6 +3352,12 @@ async def grade_student(
             for ev in evidence_map
         ],
         "evidence_map": evidence_map,
+        "criterion_evidence": {
+            "criteria": len(rubric_criteria),
+            "candidate_map_size": len(criterion_evidence.get("candidate_map", {})),
+            "text_snippets_indexed": int(criterion_evidence.get("text_snippets_indexed", 0)),
+            "prompt_chars": len(str(criterion_evidence.get("prompt_block", ""))),
+        },
         "prompt_preview": user_text[:500] + "..." if len(user_text) > 500 else user_text,
         "llm_call": {
             "provider": "auto",
@@ -2314,10 +3390,11 @@ async def grade_student(
     raw_text = ""
     for attempt in range(3):
         try:
+            active_messages = messages if attempt == 0 else fallback_messages
             response, call_meta = _chat_completion_with_failover(
                 purpose="grade_student",
-                needs_vision=False,
-                messages=messages,
+                needs_vision=img_count > 0,
+                messages=active_messages,
                 temperature=0.0,
                 top_p=0.1,
                 max_tokens=3000,
@@ -2339,17 +3416,73 @@ async def grade_student(
                 )
             raw_text = response.choices[0].message.content or ""
             usage = getattr(response, "usage", None)
+            transparency["llm_call"]["response_preview"] = raw_text[:400]
 
-            result = _extract_json(raw_text)
-            validated = _validate_result(result, rubric_criteria, max_score)
-            _attach_rubric_citations(validated, evidence_map)
+            try:
+                result = _extract_json(raw_text)
+                validated = _validate_result(result, rubric_criteria, max_score)
+            except json.JSONDecodeError:
+                repaired = await _repair_grading_json(raw_text, rubric_criteria, max_score, scoring_primary)
+                if repaired is None:
+                    raise
+                validated = repaired
+                transparency["llm_call"]["json_repaired"] = True
+                transparency["llm_call"]["json_repair_attempt"] = attempt + 1
+
+            citation_stats = _attach_rubric_citations(
+                validated,
+                evidence_map,
+                criterion_evidence.get("candidate_map", {}),
+            )
+            verifier_trace = await _verify_citations_with_llm(
+                validated.get("rubric_breakdown", []),
+                evidence_map,
+                criterion_evidence.get("candidate_map", {}),
+                scoring_primary,
+            )
+            verifier_apply = _apply_llm_citation_verdict(
+                validated.get("rubric_breakdown", []),
+                evidence_map,
+                criterion_evidence.get("candidate_map", {}),
+                verifier_trace,
+            )
+            image_cited_count = 0
+            for rb_item in validated.get("rubric_breakdown", []):
+                citations = _normalize_citation_objects(rb_item.get("citations", []))
+                if any(str(c.get("image_id", "")).strip() for c in citations):
+                    image_cited_count += 1
+            citation_stats["criteria_with_image_citation"] = image_cited_count
+            citation_stats["verifier_overrides_applied"] = int(verifier_apply.get("applied", 0))
+            calibrated_conf, calibrated_reason = _calibrate_confidence_with_citations(
+                str(validated.get("confidence", "medium")),
+                citation_stats,
+                verifier_trace,
+                image_evidence_available=bool(evidence_map),
+            )
+            validated["confidence"] = calibrated_conf
+            existing_conf_reason = str(validated.get("confidence_reasoning", "")).strip()
+            merged_conf_reason = (
+                (existing_conf_reason + " " + calibrated_reason).strip()
+                if existing_conf_reason else calibrated_reason
+            )
+            validated["confidence_reasoning"] = merged_conf_reason[:500]
             if usage:
                 transparency["llm_call"]["usage"] = {
                     "prompt_tokens": getattr(usage, "prompt_tokens", 0),
                     "completion_tokens": getattr(usage, "completion_tokens", 0),
                     "total_tokens": getattr(usage, "total_tokens", 0),
                 }
-            transparency["llm_call"]["response_preview"] = raw_text[:400]
+            transparency["citation_audit"] = {
+                "deterministic_assignment": citation_stats,
+                "llm_verifier": {
+                    "checked": int(verifier_trace.get("checked", 0) or 0),
+                    "invalid": int(verifier_trace.get("invalid", 0) or 0),
+                    "weak": int(verifier_trace.get("weak", 0) or 0),
+                    "provider": str(verifier_trace.get("provider", "")),
+                    "model": str(verifier_trace.get("model", "")),
+                    "error": str(verifier_trace.get("error", "")),
+                },
+            }
 
             validated["grading_hash"] = grading_hash
             validated["images_processed"] = selected_count

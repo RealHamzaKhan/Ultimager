@@ -13,8 +13,8 @@ load_dotenv(BASE_DIR / ".env")
 # Primary and only provider for this grading system
 NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
-# Qwen model for grading - powerful 397B parameter model
-NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
+# Llama 4 Maverick (17B MoE) - faster and more efficient than Qwen
+NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "meta/llama-4-maverick-17b-128e-instruct")
 
 # Vision capabilities for the model
 NVIDIA_MAX_IMAGES_PER_REQUEST: int = int(os.getenv("NVIDIA_MAX_IMAGES_PER_REQUEST", "8"))
@@ -38,13 +38,20 @@ MAX_FINAL_IMAGE_BYTES: int = int(os.getenv("MAX_FINAL_IMAGE_BYTES", "8000000"))
 RATE_LIMIT_RPM: int = 40  # requests per minute — hard limit
 
 # ── ACMAG (Anchor-Calibrated Multi-Agent Grading) ────────────────
-ACMAG_ENABLED: bool = os.getenv("ACMAG_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+# ACMAG can be enabled explicitly via env when needed. Keep default off for
+# stable baseline grading throughput.
+ACMAG_ENABLED: bool = os.getenv("ACMAG_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 ACMAG_CALIBRATION_RATIO: float = float(os.getenv("ACMAG_CALIBRATION_RATIO", "0.10"))
 ACMAG_MIN_CALIBRATION: int = int(os.getenv("ACMAG_MIN_CALIBRATION", "3"))
 ACMAG_MAX_CALIBRATION: int = int(os.getenv("ACMAG_MAX_CALIBRATION", "12"))
 ACMAG_BLIND_REVIEW_RATIO: float = float(os.getenv("ACMAG_BLIND_REVIEW_RATIO", "0.30"))
 ACMAG_KAPPA_THRESHOLD: float = float(os.getenv("ACMAG_KAPPA_THRESHOLD", "0.60"))
 ACMAG_MODERATION_SCORE_DELTA: float = float(os.getenv("ACMAG_MODERATION_SCORE_DELTA", "1.0"))
+
+# ── Parallel Grading Configuration ──────────────────────────────────────
+PARALLEL_GRADING_ENABLED: bool = os.getenv("PARALLEL_GRADING_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+PARALLEL_GRADING_WORKERS: int = int(os.getenv("PARALLEL_GRADING_WORKERS", "8"))  # Concurrent students
+
 ACMAG_MAX_ANCHORS: int = int(os.getenv("ACMAG_MAX_ANCHORS", "8"))
 
 # ── Paths ─────────────────────────────────────────────────────────

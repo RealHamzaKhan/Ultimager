@@ -9,8 +9,11 @@ import base64
 import json
 import logging
 import mimetypes
+import re
+import zipfile
 from pathlib import Path
 from typing import Optional
+import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,20 @@ ARCHIVE_EXTENSIONS: set[str] = {
     ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2"
 }
 
+TRANSIENT_FILE_PREFIXES: tuple[str, ...] = ("~$", "._")
+TRANSIENT_FILE_NAMES: set[str] = {".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def _is_transient_or_system_file(file_path: Path) -> bool:
+    """Return True for Office lock files and OS metadata files."""
+    name = file_path.name
+    lower_name = name.lower()
+
+    if name.startswith(TRANSIENT_FILE_PREFIXES):
+        return True
+
+    return lower_name in TRANSIENT_FILE_NAMES
+
 
 def parse_file(file_path: Path) -> dict:
     """Return a dict describing the file content for the AI.
@@ -53,6 +70,14 @@ def parse_file(file_path: Path) -> dict:
         "extension": ext,
         "size": file_path.stat().st_size if file_path.exists() else 0,
     }
+
+    if _is_transient_or_system_file(file_path):
+        result.update({
+            "type": "skipped",
+            "content": None,
+            "note": "Transient/system file skipped"
+        })
+        return result
 
     try:
         if ext in CODE_EXTENSIONS:
@@ -210,21 +235,70 @@ def _parse_doc(file_path: Path) -> dict:
 
 
 def _parse_excel(file_path: Path) -> dict:
-    """Parse Excel files."""
-    try:
-        import pandas as pd
-        df = pd.read_excel(file_path, sheet_name=None)
-        parts = []
-        for sheet_name, sheet_df in df.items():
-            parts.append(f"=== Sheet: {sheet_name} ===")
-            parts.append(sheet_df.to_string())
-        return {"type": "excel", "content": "\n".join(parts), "note": "Excel spreadsheet"}
-    except Exception as e:
-        return {"type": "excel", "content": None, "error": str(e)}
+    """Parse Excel files using openpyxl/xlrd fallback."""
+    ext = file_path.suffix.lower()
+    errors: list[str] = []
+
+    if ext == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(filename=str(file_path), data_only=True, read_only=True)
+            parts: list[str] = []
+            sheet_names: list[str] = []
+
+            for sheet in workbook.worksheets:
+                sheet_names.append(sheet.title)
+                parts.append(f"=== Sheet: {sheet.title} ===")
+                for row in sheet.iter_rows(values_only=True):
+                    values = ["" if value is None else str(value) for value in row]
+                    if any(value.strip() for value in values):
+                        parts.append(" | ".join(values))
+
+            workbook.close()
+            return {
+                "type": "excel",
+                "content": "\n".join(parts),
+                "note": "Excel spreadsheet",
+                "sheets": sheet_names,
+                "extraction_method": "openpyxl",
+            }
+        except Exception as exc:
+            errors.append(f"openpyxl: {exc}")
+
+    if ext == ".xls":
+        try:
+            import xlrd
+
+            workbook = xlrd.open_workbook(str(file_path))
+            parts: list[str] = []
+            sheet_names: list[str] = []
+
+            for sheet in workbook.sheets():
+                sheet_names.append(sheet.name)
+                parts.append(f"=== Sheet: {sheet.name} ===")
+                for row_idx in range(sheet.nrows):
+                    values = [str(sheet.cell_value(row_idx, col_idx)) for col_idx in range(sheet.ncols)]
+                    if any(value.strip() for value in values):
+                        parts.append(" | ".join(values))
+
+            return {
+                "type": "excel",
+                "content": "\n".join(parts),
+                "note": "Excel spreadsheet",
+                "sheets": sheet_names,
+                "extraction_method": "xlrd",
+            }
+        except Exception as exc:
+            errors.append(f"xlrd: {exc}")
+
+    return {"type": "excel", "content": None, "error": "; ".join(errors) if errors else "Unsupported or corrupted Excel file"}
 
 
 def _parse_powerpoint(file_path: Path) -> dict:
-    """Parse PowerPoint files."""
+    """Parse PowerPoint files using python-pptx and XML fallback."""
+    pptx_error: Optional[Exception] = None
+
     try:
         from pptx import Presentation
         prs = Presentation(str(file_path))
@@ -234,9 +308,61 @@ def _parse_powerpoint(file_path: Path) -> dict:
             for shape in slide.shapes:
                 if hasattr(shape, "text") and shape.text.strip():
                     parts.append(shape.text)
-        return {"type": "powerpoint", "content": "\n".join(parts), "note": "PowerPoint presentation"}
-    except Exception as e:
-        return {"type": "powerpoint", "content": None, "error": str(e)}
+        return {
+            "type": "powerpoint",
+            "content": "\n".join(parts),
+            "note": "PowerPoint presentation",
+            "extraction_method": "python-pptx",
+        }
+    except Exception as exc:
+        pptx_error = exc
+
+    xml_error: Optional[Exception] = None
+    if file_path.suffix.lower() == ".pptx":
+        try:
+            with zipfile.ZipFile(file_path, "r") as archive:
+                slide_paths = sorted(
+                    [
+                        name for name in archive.namelist()
+                        if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+                    ],
+                    key=lambda name: int(re.search(r"slide(\d+)\.xml$", name).group(1))
+                    if re.search(r"slide(\d+)\.xml$", name) else 10**9,
+                )
+
+                parts: list[str] = []
+                for idx, slide_path in enumerate(slide_paths, 1):
+                    root = ET.fromstring(archive.read(slide_path))
+                    texts = [
+                        node.text.strip()
+                        for node in root.iter()
+                        if node.tag.endswith("}t") and node.text and node.text.strip()
+                    ]
+                    parts.append(f"=== Slide {idx} ===")
+                    if texts:
+                        parts.append("\n".join(texts))
+
+                if slide_paths:
+                    return {
+                        "type": "powerpoint",
+                        "content": "\n".join(parts),
+                        "note": "PowerPoint presentation",
+                        "extraction_method": "pptx_xml_fallback",
+                    }
+        except Exception as exc:
+            xml_error = exc
+
+    errors: list[str] = []
+    if pptx_error:
+        errors.append(f"python-pptx: {pptx_error}")
+    if xml_error:
+        errors.append(f"xml_fallback: {xml_error}")
+
+    return {
+        "type": "powerpoint",
+        "content": None,
+        "error": "; ".join(errors) if errors else "Unsupported or corrupted PowerPoint file",
+    }
 
 
 def _parse_image(file_path: Path) -> dict:

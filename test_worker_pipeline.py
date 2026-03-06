@@ -237,3 +237,89 @@ def test_consistency_across_regrade_runs(monkeypatch):
     assert first["rubric_breakdown"] == second["rubric_breakdown"]
     assert all(item.get("citations") for item in first.get("rubric_breakdown", []))
     assert first.get("transparency", {}).get("images_processed_in_batches", 0) >= 1
+
+
+def test_relevance_gate_blocks_strong_off_topic_cases():
+    relevance = {
+        "is_relevant": False,
+        "confidence": "high",
+        "flags": ["off_topic", "wrong_assignment"],
+        "reasoning": "Submission content is about an unrelated subject.",
+    }
+
+    gate = grader.evaluate_relevance_gate(relevance)
+    assert gate["block_grading"] is True
+    assert "off_topic" in gate["critical_flags"]
+    assert "wrong_assignment" in gate["critical_flags"]
+
+    result = grader.build_relevance_block_result(
+        rubric="Algorithm Correctness: 8 points\nAnalysis Quality: 2 points\nTotal: 10",
+        max_score=10,
+        relevance=relevance,
+        gate=gate,
+    )
+    assert result["total_score"] == 0.0
+    assert result["letter_grade"] == "F"
+    assert result.get("relevance_gate", {}).get("block_grading") is True
+    assert len(result.get("rubric_breakdown", [])) == 2
+
+
+def test_relevance_gate_allows_mixed_content_with_relevant_sections():
+    relevance = {
+        "is_relevant": False,
+        "confidence": "high",
+        "flags": ["off_topic", "wrong_assignment", "mixed_content"],
+        "reasoning": "Some parts look unrelated, but assignment-specific work is present.",
+        "has_relevant_sections": True,
+        "assignment_signal": {
+            "token_overlap": 7,
+            "signal_ratio": 0.21,
+            "files_with_overlap": 2,
+            "files_scanned": 3,
+            "matched_terms": ["bfs", "ucs", "manhattan"],
+            "has_relevant_sections": True,
+        },
+    }
+
+    gate = grader.evaluate_relevance_gate(relevance)
+    assert gate["block_grading"] is False
+    assert gate["review_required"] is True
+    assert gate["mixed_content"] is True
+    assert gate["has_relevant_sections"] is True
+
+
+def test_citation_assignment_does_not_force_unrelated_image():
+    evidence_map = [{
+        "image_id": "img_0001",
+        "filename": "24P-0547-Question#01.pdf",
+        "page": 1,
+        "description": "Campus navigation graph",
+        "summary": "Graph nodes and BFS/UCS traversal notes",
+        "transcription": "BFS queue updates and shortest path",
+        "content_score": 42.0,
+        "substantive": True,
+        "confidence": "high",
+    }]
+    rubric_criteria = [{"criterion": "8-Puzzle Solver Implementation", "max": 2}]
+    plan = grader._build_criterion_evidence_plan(rubric_criteria, text_content="", evidence_map=evidence_map)
+    candidate_map = plan.get("candidate_map", {})
+
+    key = "8-puzzle solver implementation"
+    assert key in candidate_map
+    assert candidate_map[key].get("image_ids", []) == []
+
+    result = {
+        "rubric_breakdown": [{
+            "criterion": "8-Puzzle Solver Implementation",
+            "score": 0,
+            "max": 2,
+            "justification": "No visible evidence.",
+            "citations": [{"type": "image", "image_id": "img_0001"}],
+        }]
+    }
+    stats = grader._attach_rubric_citations(result, evidence_map, candidate_map)
+    citations = result["rubric_breakdown"][0].get("citations", [])
+
+    assert stats["criteria_with_image_citation"] == 0
+    assert all(not c.get("image_id") for c in citations)
+    assert any(c.get("source") == "text_content" for c in citations)

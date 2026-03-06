@@ -22,20 +22,26 @@
 
     {% if sessions %}
     <!-- Stats Overview -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+    <div class="grid grid-cols-2 sm:grid-cols-5 gap-4">
         <div class="glass rounded-xl p-4 text-center">
             <div class="text-2xl font-bold gradient-text">{{ sessions|length }}</div>
             <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">Total Sessions</div>
         </div>
         <div class="glass rounded-xl p-4 text-center">
-            <div class="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{{ sessions|selectattr('status',
-                'equalto', 'completed')|list|length }}</div>
+            <div class="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{{ (sessions|selectattr('status',
+                'equalto', 'completed')|list|length) + (sessions|selectattr('status',
+                'equalto', 'completed_with_errors')|list|length) }}</div>
             <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">Completed</div>
         </div>
         <div class="glass rounded-xl p-4 text-center">
             <div class="text-2xl font-bold text-amber-600 dark:text-amber-400">{{ sessions|selectattr('status',
                 'equalto', 'grading')|list|length }}</div>
             <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">In Progress</div>
+        </div>
+        <div class="glass rounded-xl p-4 text-center">
+            <div class="text-2xl font-bold text-orange-600 dark:text-orange-400">{{ sessions|selectattr('status',
+                'equalto', 'paused')|list|length }}</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-1">Paused</div>
         </div>
         <div class="glass rounded-xl p-4 text-center">
             <div class="text-2xl font-bold text-gray-600 dark:text-gray-400">{{ sessions|selectattr('status', 'equalto',

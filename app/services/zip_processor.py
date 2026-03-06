@@ -33,31 +33,29 @@ def _should_ignore(name: str) -> bool:
     """Return True if the file/folder should be skipped."""
     basename = name.strip().rstrip("/")
     lower_name = basename.lower()
-    
+    stem = Path(basename).stem.lower()
+
+    ignored_names_lower = {n.lower() for n in IGNORED_NAMES}
+
     # Exact name match against ignored names set
-    if basename in IGNORED_NAMES or lower_name in {n.lower() for n in IGNORED_NAMES}:
+    if basename in IGNORED_NAMES or lower_name in ignored_names_lower or stem in ignored_names_lower:
         return True
-    
-    # Hidden files and system folders
-    if basename.startswith(".") or basename.startswith("__"):
+
+    # Hidden files and explicit system folders/files
+    if basename.startswith(".") or lower_name.startswith("__macosx"):
         return True
-    
-    # Test-related patterns
-    test_patterns = ['test', 'testing', 'dataset_', 'sample_', 'example_']
-    for pattern in test_patterns:
-        if pattern in lower_name:
-            return True
-    
-    # Common test data names (single names that look like test data)
-    common_test_names = [
-        'carol', 'eve', 'nick', 'jake', 'grace', 'bob', 'frank', 'dan',
-        'karen', 'leo', 'iris', 'olivia', 'mia', 'alice', 'henry',
-        'test', 'demo', 'sample', 'example'
-    ]
-    # Only ignore if it's a simple name (not like "Test_Submission_2024")
-    if lower_name in common_test_names or lower_name.rstrip('_0123456789') in common_test_names:
+    if basename.startswith(("~$", "._")):
         return True
-    
+
+    if lower_name in {"thumbs.db", "desktop.ini"}:
+        return True
+
+    # Only ignore explicit synthetic/test naming conventions, not incidental substrings.
+    if stem in {"test", "tests", "testing", "sample", "samples", "example", "examples", "demo"}:
+        return True
+    if stem.startswith(("dataset_", "sample_", "example_", "test_dataset_")):
+        return True
+
     return False
 
 

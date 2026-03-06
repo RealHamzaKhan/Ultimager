@@ -18,9 +18,19 @@ from typing import Any, Optional, Dict, List, Tuple
 
 from openai import OpenAI
 
-from app.config import NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL, RATE_LIMIT_RPM
+from app.config import (
+    NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL, RATE_LIMIT_RPM,
+    MAX_IMAGES_FOR_FINAL_GRADE, MAX_IMAGES_SELECTION_POOL,
+    MAX_IMAGES_FOR_PREANALYSIS, VISION_PREANALYSIS_CHUNK_SIZE,
+    ENABLE_VISION_PREANALYSIS
+)
 
 logger = logging.getLogger(__name__)
+
+# SOTA Configuration
+MAX_TEXT_CHARS = 50000  # Max text before chunking
+MAX_IMAGES_PER_REQUEST = MAX_IMAGES_FOR_FINAL_GRADE  # 8 by default
+TEXT_CHUNK_SIZE = 40000  # Smart chunk boundary
 
 
 class RateLimiter:
@@ -335,6 +345,547 @@ RESPONSE FORMAT - Return ONLY valid JSON:
 }
 
 IMPORTANT: Do NOT add extra rubric criteria. Use ONLY the criteria provided in the rubric."""
+
+
+# ============================================================================
+# SOTA FEATURES: Smart Chunking, Multi-turn Grading, Batch Processing
+# ============================================================================
+
+def _get_file_language(filename: str, file_type: str) -> str:
+    """Detect programming language from filename and type."""
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    lang_map = {
+        'py': 'python', 'java': 'java', 'cpp': 'cpp', 'c': 'c', 'h': 'c',
+        'js': 'javascript', 'ts': 'typescript', 'jsx': 'jsx', 'tsx': 'tsx',
+        'cs': 'csharp', 'go': 'go', 'rb': 'ruby', 'php': 'php',
+        'swift': 'swift', 'kt': 'kotlin', 'scala': 'scala', 'rs': 'rust',
+        'sh': 'bash', 'sql': 'sql', 'html': 'html', 'css': 'css',
+    }
+    if ext in lang_map:
+        return lang_map[ext]
+    if file_type == 'code':
+        return 'unknown'
+    return ''
+
+
+def _smart_extract_text_with_chunking(student_files: list, max_chars: int = 50000) -> Tuple[str, dict]:
+    """SOTA: Extract text with intelligent chunking that respects code boundaries."""
+    from app.services.file_parser_enhanced import _smart_chunk_code
+
+    text_parts = []
+    total_chars = 0
+    chunk_info = []
+
+    for f in student_files:
+        if hasattr(f, 'text_content'):
+            file_type = f.file_type
+            filename = f.filename
+            content = f.text_content
+        else:
+            file_type = f.get("type", "")
+            filename = f.get("filename", "unknown")
+            content = f.get("content")
+
+        if file_type in ("image", "pdf_images", "error", "missing", "binary", "archive"):
+            continue
+        if content is None or not isinstance(content, str):
+            continue
+        if not content.strip():
+            continue
+
+        if len(content) > TEXT_CHUNK_SIZE:
+            lang = _get_file_language(filename, file_type)
+            chunked_content, chunk_meta = _smart_chunk_code(content, lang, TEXT_CHUNK_SIZE)
+
+            header = f"\n=== {filename} ({file_type}) [CHUNKED: {chunk_meta['total_chunks']} parts] ===\n"
+            text_parts.append(header)
+            text_parts.append(chunked_content)
+            chunk_info.append({
+                'filename': filename,
+                'chunks': chunk_meta['total_chunks'],
+                'truncated': chunk_meta['truncated'],
+                'missing_code_units': chunk_meta.get('missing_code_units', [])
+            })
+            total_chars += len(header) + len(chunked_content)
+        else:
+            header = f"\n=== {filename} ({file_type}) ===\n"
+            remaining = max_chars - total_chars - len(header)
+            if remaining <= 0:
+                text_parts.append(f"\n[... MORE FILES TRUNCATED ...]")
+                break
+
+            file_content = content[:remaining]
+            text_parts.append(header)
+            text_parts.append(file_content)
+            total_chars += len(header) + len(file_content)
+
+    if total_chars > max_chars:
+        text_parts.append(f"\n[TOTAL CONTENT TRUNCATED from {total_chars} to {max_chars} chars]")
+
+    result_text = "\n".join(text_parts)
+
+    return result_text, {
+        'total_chars': total_chars,
+        'was_truncated': total_chars > max_chars,
+        'chunk_info': chunk_info
+    }
+
+
+def _rank_and_select_images(student_files: list, max_images: int = 8) -> Tuple[List[dict], dict]:
+    """SOTA: Rank and select most relevant images using relevance scoring."""
+    all_images = []
+
+    for f in student_files:
+        filename = getattr(f, 'filename', None) or f.get('filename', 'unknown')
+
+        if hasattr(f, 'images') and f.images:
+            for idx, img in enumerate(f.images):
+                page_num = img.get('page')
+                desc = (img.get('description') or '').lower()
+
+                score = 0
+                if page_num is not None:
+                    score += 10
+                    score += max(0, 10 - page_num)
+                if 'code' in desc or 'solution' in desc:
+                    score += 5
+                if 'diagram' in desc or 'flow' in desc or 'chart' in desc:
+                    score += 3
+
+                all_images.append({
+                    'source_file': filename,
+                    'base64': img.get('base64'),
+                    'media_type': img.get('media_type', 'image/png'),
+                    'page': page_num,
+                    'description': img.get('description'),
+                    'score': score,
+                    'index': idx
+                })
+
+    all_images.sort(key=lambda x: x['score'], reverse=True)
+    selected = all_images[:max_images]
+    total_available = len(all_images)
+
+    return selected, {
+        'total_available': total_available,
+        'selected_count': len(selected),
+        'was_truncated': total_available > max_images,
+        'selection_method': 'relevance_ranked',
+        'top_scores': [img['score'] for img in selected[:3]]
+    }
+
+
+# ============================================================================
+# MULTI-TURN GRADING WITH PRE-ANALYSIS
+# ============================================================================
+
+IMAGE_PREANALYSIS_PROMPT = """You are an expert at analyzing student submissions.
+Your task is to analyze ALL the images provided and identify which contain IMPORTANT GRADING INFORMATION.
+
+For each image, classify it as:
+- "IMPORTANT_CODE": Contains code, algorithms, or solutions
+- "IMPORTANT_DIAGRAM": Contains flowcharts, architecture, diagrams, graphs
+- "IMPORTANT_WRITTEN": Contains written explanations, answers, analysis
+- "MINOR": Front page, cover, title, decorative elements, or irrelevant content
+
+Provide your response as a JSON object:
+{
+  "analyzed_images": [
+    {
+      "index": 0,
+      "source_file": "filename",
+      "classification": "IMPORTANT_CODE|IMPORTANT_DIAGRAM|IMPORTANT_WRITTEN|MINOR",
+      "relevance_score": 1-10,
+      "summary": "Brief description of what's in this image"
+    }
+  ],
+  "total_important": <number>,
+  "recommendation": "Which images should definitely be included in grading?"
+}
+
+Be thorough - analyze EVERY image carefully."""
+
+
+TEXT_PREANALYSIS_PROMPT = """You are an expert at analyzing code submissions.
+Analyze the following code and provide a STRUCTURED SUMMARY that captures:
+1. Overall file structure and purpose
+2. Key functions/methods and what they do
+3. Classes and their responsibilities
+4. Any algorithms or data structures used
+5. Potential issues or bugs
+
+Provide response as JSON:
+{
+  "file_summary": {
+    "filename": "main.py",
+    "purpose": "What this file does",
+    "key_functions": ["function1: does X", "function2: does Y"],
+    "classes": ["Class1: brief description"],
+    "algorithms": ["BFS", "A* search", etc],
+    "potential_issues": ["issue1", "issue2"]
+  },
+  "overall_structure": "Brief summary of how files work together",
+  "completed_requirements": ["req1", "req2"],
+  "missing_requirements": ["req3"]
+}
+
+This summary will be used for grading, so be thorough and accurate."""
+
+
+async def _preanalyze_images(
+    client,
+    student_files: list,
+    max_images_for_preanalysis: int = 20,
+) -> dict:
+    """
+    MULTI-TURN SOTA: Pre-analyze ALL images to identify which are most relevant.
+    This uses actual AI analysis, not just page numbers.
+    """
+    # First, collect all available images (up to limit)
+    all_images = []
+    for f in student_files:
+        filename = getattr(f, 'filename', None) or f.get('filename', 'unknown')
+        if hasattr(f, 'images') and f.images:
+            for idx, img in enumerate(f.images[:max_images_for_preanalysis]):
+                all_images.append({
+                    'source_file': filename,
+                    'base64': img.get('base64'),
+                    'media_type': img.get('media_type', 'image/png'),
+                    'page': img.get('page'),
+                    'index': len(all_images)
+                })
+
+    if not all_images:
+        return {'selected': [], 'summary': 'No images to analyze'}
+
+    # Build content with all images
+    content = [{"type": "text", "text": IMAGE_PREANALYSIS_PROMPT}]
+    for img in all_images:
+        if img['base64']:
+            desc = f"Image {img['index']}"
+            if img['page']:
+                desc += f" (Page {img['page']})"
+            desc += f" from {img['source_file']}"
+            content.append({"type": "text", "text": f"\n[{desc}]"})
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{img['media_type']};base64,{img['base64']}",
+                    "detail": "low"  # Use low detail for pre-analysis (faster)
+                }
+            })
+
+    messages = [
+        {"role": "system", "content": "You are an expert at analyzing student submissions for grading."},
+        {"role": "user", "content": content}
+    ]
+
+    try:
+        await _rate_limiter.acquire()
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=2000,
+            seed=42,
+        )
+
+        raw_response = response.choices[0].message.content or ""
+
+        # Try to parse JSON from response
+        try:
+            import json
+            # Find JSON in response
+            json_start = raw_response.find('{')
+            json_end = raw_response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                analysis = json.loads(raw_response[json_start:json_end])
+            else:
+                analysis = {'error': 'Could not parse analysis'}
+
+            # Extract important images based on AI analysis
+            selected_images = []
+            if 'analyzed_images' in analysis:
+                # Sort by relevance score
+                sorted_images = sorted(
+                    analysis['analyzed_images'],
+                    key=lambda x: x.get('relevance_score', 0),
+                    reverse=True
+                )
+                # Select top scored as IMPORTANT
+                for img_analysis in sorted_images[:8]:  # Take top 8
+                    if img_analysis.get('classification', 'MINOR') != 'MINOR':
+                        idx = img_analysis.get('index', 0)
+                        if idx < len(all_images):
+                            selected_images.append({
+                                **all_images[idx],
+                                'classification': img_analysis.get('classification'),
+                                'ai_summary': img_analysis.get('summary', ''),
+                                'relevance_score': img_analysis.get('relevance_score', 0)
+                            })
+
+            # If AI analysis failed, fall back to page-based selection
+            if not selected_images:
+                selected_images = all_images[:8]
+
+            return {
+                'selected': selected_images[:8],
+                'analysis': analysis,
+                'total_analyzed': len(all_images),
+                'method': 'ai_preanalysis'
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to parse image analysis: {e}")
+            # Fallback to simple selection
+            return {
+                'selected': all_images[:8],
+                'analysis': {'error': str(e)},
+                'total_analyzed': len(all_images),
+                'method': 'fallback_page_based'
+            }
+
+    except Exception as e:
+        logger.error(f"Image pre-analysis failed: {e}")
+        return {
+            'selected': all_images[:8] if all_images else [],
+            'error': str(e),
+            'method': 'error_fallback'
+        }
+
+
+async def _preanalyze_text(
+    client,
+    student_files: list,
+    max_chars: int = 30000,
+) -> dict:
+    """
+    MULTI-TURN SOTA: Pre-analyze large text content to extract structure.
+    """
+    # Collect text content (only code files)
+    text_parts = []
+    file_summaries = []
+
+    for f in student_files:
+        if hasattr(f, 'text_content'):
+            file_type = f.file_type
+            filename = f.filename
+            content = f.text_content
+        else:
+            file_type = f.get("type", "")
+            filename = f.get("filename", "unknown")
+            content = f.get("content")
+
+        if file_type in ("image", "pdf_images", "error", "missing", "binary", "archive"):
+            continue
+        if content is None or not isinstance(content, str):
+            continue
+
+        text_parts.append(f"=== FILE: {filename} ===\n{content[:8000]}")  # Limit per file
+
+    if not text_parts:
+        return {'summary': 'No text to analyze', 'structure': {}}
+
+    full_text = TEXT_PREANALYSIS_PROMPT + "\n\n" + "\n\n".join(text_parts[:10])  # Max 10 files
+
+    messages = [
+        {"role": "system", "content": "You are an expert code analyst."},
+        {"role": "user", "content": full_text}
+    ]
+
+    try:
+        await _rate_limiter.acquire()
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=2500,
+            seed=42,
+        )
+
+        raw_response = response.choices[0].message.content or ""
+
+        # Parse JSON
+        try:
+            import json
+            json_start = raw_response.find('{')
+            json_end = raw_response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                structure = json.loads(raw_response[json_start:json_end])
+            else:
+                structure = {'raw_summary': raw_response[:500]}
+
+            return {
+                'structure': structure,
+                'method': 'ai_preanalysis'
+            }
+        except Exception as e:
+            return {
+                'structure': {'raw_text_preview': full_text[:1000]},
+                'error': str(e),
+                'method': 'fallback'
+            }
+
+    except Exception as e:
+        logger.error(f"Text pre-analysis failed: {e}")
+        return {'error': str(e), 'method': 'error_fallback'}
+
+
+async def _grade_with_multiturn_context(
+    client=None,
+    title: str = "",
+    description: str = "",
+    rubric: str = "",
+    max_score: int = 100,
+    student_files: list = None,
+    questions: Optional[list[dict]] = None,
+) -> dict:
+    """
+    MULTI-TURN SOTA: True multi-pass grading with pre-analysis.
+
+    Pass 1: Pre-analyze images to find the most relevant ones
+    Pass 2: (Optional) Pre-analyze text structure for large submissions
+    Pass 3: Final grading with full context from pre-analysis
+
+    Can be called with just client (for ai_grader_fixed) or with all params (standalone).
+    """
+    if student_files is None:
+        student_files = []
+
+    # Use passed client, or get our own using local function
+    grading_client = client  # Client must be passed from caller
+    rubric_criteria = parse_rubric(rubric)
+
+    # === PASS 1: Pre-analyze images ===
+    image_analysis = await _preanalyze_images(grading_client, student_files)
+    selected_images = image_analysis.get('selected', [])
+
+    # === PASS 2: Pre-analyze text (only for large submissions) ===
+    text_analysis = None
+    total_text_chars = sum(
+        len(getattr(f, 'text_content', '') or f.get('content', '') or '')
+        for f in student_files
+        if hasattr(f, 'text_content') or f.get('type') not in ('image', 'pdf_images')
+    )
+
+    if total_text_chars > 30000:  # Only for large submissions
+        text_analysis = await _preanalyze_text(grading_client, student_files)
+
+    # === PASS 3: Final grading with context ===
+    # Build user prompt
+    user_text = _build_user_prompt(title, description, rubric, max_score, student_files, questions)
+
+    # Extract text content
+    text_content, text_meta = _smart_extract_text_with_chunking(student_files, MAX_TEXT_CHARS)
+
+    # Add pre-analysis context to the prompt
+    context_note = "\n\n=== PRE-ANALYSIS CONTEXT ===\n"
+    if image_analysis.get('method') == 'ai_preanalysis':
+        context_note += f"Image Analysis: Analyzed {image_analysis.get('total_analyzed', 0)} images\n"
+        if image_analysis.get('analysis', {}).get('recommendation'):
+            context_note += f"Recommendation: {image_analysis['analysis']['recommendation']}\n"
+
+    if text_analysis and text_analysis.get('method') == 'ai_preanalysis':
+        structure = text_analysis.get('structure', {})
+        if 'overall_structure' in structure:
+            context_note += f"\nCode Structure Summary: {structure['overall_structure'][:500]}\n"
+
+    full_text = user_text + context_note + "\n\nFILE CONTENTS:\n" + text_content
+
+    # Build content with selected images
+    content: list[dict] = [{"type": "text", "text": full_text}]
+
+    for img in selected_images:
+        if img.get('base64'):
+            desc = f"{img.get('source_file', 'Image')}"
+            if img.get('classification'):
+                desc += f" [{img['classification']}]"
+            if img.get('ai_summary'):
+                desc += f": {img['ai_summary']}"
+
+            content.append({"type": "text", "text": f"\n[{desc}]"})
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{img.get('media_type', 'image/png')};base64,{img['base64']}",
+                    "detail": "auto"
+                }
+            })
+
+    # Add note if we didn't analyze all images
+    if image_analysis.get('total_analyzed', 0) > len(selected_images):
+        content[0]["text"] += f"\n\n[NOTE: {image_analysis['total_analyzed'] - len(selected_images)} additional images were available but not shown]"
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": content}
+    ]
+
+    try:
+        await _rate_limiter.acquire()
+        response = grading_client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=4000,
+            seed=42,
+        )
+
+        raw_text = response.choices[0].message.content or ""
+        result = _extract_json(raw_text)
+        validated = _validate_result(result, rubric_criteria, max_score)
+
+        # Add comprehensive SOTA metadata
+        validated["sota_metadata"] = {
+            "grading_strategy": "multi_turn_with_preanalysis",
+            "passes": {
+                "image_preanalysis": image_analysis.get('method', 'none'),
+                "text_preanalysis": text_analysis.get('method', 'none') if text_analysis else 'skipped',
+                "final_grading": "completed"
+            },
+            "image_analysis": {
+                "method": image_analysis.get('method'),
+                "total_analyzed": image_analysis.get('total_analyzed', 0),
+                "selected_count": len(selected_images),
+                "selected_images": [
+                    {
+                        "source": img.get('source_file'),
+                        "classification": img.get('classification'),
+                        "relevance_score": img.get('relevance_score')
+                    }
+                    for img in selected_images[:4]  # Include top 4 details
+                ]
+            },
+            "text_analysis": text_analysis,
+            "text_processing": text_meta,
+            "context_preserved": True,
+            "multi_turn": True,
+        }
+
+        validated["images_processed"] = len(selected_images)
+        validated["text_chars_processed"] = text_meta['total_chars']
+
+        return validated
+
+    except Exception as e:
+        logger.error(f"Multi-turn grading failed: {e}")
+        raise
+
+
+async def _grade_with_sota_context(
+    client,
+    title: str,
+    description: str,
+    rubric: str,
+    max_score: int,
+    student_files: list,
+    questions: Optional[list[dict]] = None,
+) -> dict:
+    """SOTA: Multi-turn grading with AI-powered pre-analysis."""
+    # Use the multi-turn approach with pre-analysis
+    return await _grade_with_multiturn_context(
+        client, title, description, rubric, max_score, student_files, questions
+    )
 
 
 def _build_user_prompt(
@@ -698,10 +1249,19 @@ async def grade_student(
     # Compute grading hash for consistency verification
     grading_hash = compute_grading_hash(student_files, rubric, max_score)
     
-    await _rate_limiter.acquire()
-    
-    client = _get_client()
-    
+    # Use SOTA approach: smart text chunking + image ranking
+    try:
+        client = _get_client()
+        result = await _grade_with_sota_context(
+            client, title, description, rubric, max_score, student_files, questions
+        )
+        result["grading_hash"] = grading_hash
+        logger.info(f"Graded (SOTA): {result['total_score']}/{max_score} ({result['letter_grade']})")
+        return result
+    except Exception as e:
+        logger.warning(f"SOTA approach failed: {e}, using standard approach")
+
+    # Standard approach (fallback)
     user_text = _build_user_prompt(title, description, rubric, max_score, student_files, questions)
     text_content = _extract_text_content(student_files)
     user_content, img_count = _build_multimodal_content(user_text, text_content, student_files)
@@ -716,7 +1276,7 @@ async def grade_student(
     raw_text = ""
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(
+            response = grading_client.chat.completions.create(
                 model=NVIDIA_MODEL,
                 messages=messages,
                 temperature=0.0,  # Deterministic

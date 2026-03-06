@@ -67,6 +67,7 @@ uploads/
 # Backup files
 *_backup.py
 *_fixed.py
+!app/services/file_parser_fixed.py
 
 # Temporary files
 tmp/

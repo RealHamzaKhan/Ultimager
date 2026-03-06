@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -265,6 +266,9 @@ class ACMAGRuntime:
     halt_reason: str = ""
     secondary_quota: int = 0
     secondary_used: int = 0
+    
+    # Thread safety lock for parallel grading
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
         self.calibration_ratio = _clamp_float(self.calibration_ratio, 0.0, 1.0)
@@ -290,8 +294,9 @@ class ACMAGRuntime:
 
     @property
     def calibration_complete(self) -> bool:
-        calibrated = {a.student_id for a in self.anchors if a.student_id in self.calibration_ids}
-        return len(calibrated) >= len(self.calibration_ids)
+        with self._lock:
+            calibrated = {a.student_id for a in self.anchors if a.student_id in self.calibration_ids}
+            return len(calibrated) >= len(self.calibration_ids)
 
     def is_calibration_submission(self, submission_id: int) -> bool:
         return submission_id in self.calibration_ids
@@ -299,45 +304,48 @@ class ACMAGRuntime:
     def should_run_secondary(self, submission_id: int, student_identifier: str) -> bool:
         if not self.enabled:
             return False
-        if self.is_calibration_submission(submission_id):
-            return True
-        if self.secondary_used >= self.secondary_quota:
-            return False
-        # deterministic sampling for blind second marking
-        score = (_stable_int(f"{self.session_id}:{student_identifier}:{submission_id}:blind") % 10000) / 10000.0
-        return score < self.blind_review_ratio
+        with self._lock:
+            if self.is_calibration_submission(submission_id):
+                return True
+            if self.secondary_used >= self.secondary_quota:
+                return False
+            # deterministic sampling for blind second marking
+            score = (_stable_int(f"{self.session_id}:{student_identifier}:{submission_id}:blind") % 10000) / 10000.0
+            return score < self.blind_review_ratio
 
     def register_anchor(self, submission_id: int, student_identifier: str, result: dict[str, Any]) -> None:
         if not self.enabled:
             return
-        if not self.is_calibration_submission(submission_id):
-            return
-        if any(a.student_id == submission_id for a in self.anchors):
-            return
-        score = float(result.get("total_score", 0) or 0)
-        max_score = int(result.get("max_score", self.max_score) or self.max_score)
-        band = _score_band(score, max_score)
-        ex = AnchorExample(
-            student_id=submission_id,
-            student_identifier=student_identifier,
-            score=score,
-            max_score=max_score,
-            band=band,
-            confidence=str(result.get("confidence", "medium")),
-            overall_feedback=str(result.get("overall_feedback", ""))[:420],
-            rubric_breakdown=_top_rubric_items(result, limit=5),
-        )
-        self.anchors.append(ex)
+        with self._lock:
+            if not self.is_calibration_submission(submission_id):
+                return
+            if any(a.student_id == submission_id for a in self.anchors):
+                return
+            score = float(result.get("total_score", 0) or 0)
+            max_score = int(result.get("max_score", self.max_score) or self.max_score)
+            band = _score_band(score, max_score)
+            ex = AnchorExample(
+                student_id=submission_id,
+                student_identifier=student_identifier,
+                score=score,
+                max_score=max_score,
+                band=band,
+                confidence=str(result.get("confidence", "medium")),
+                overall_feedback=str(result.get("overall_feedback", ""))[:420],
+                rubric_breakdown=_top_rubric_items(result, limit=5),
+            )
+            self.anchors.append(ex)
 
     def record_secondary_pair(self, primary: dict[str, Any], secondary: dict[str, Any], from_calibration: bool = False) -> None:
         if not self.enabled:
             return
-        p = float(primary.get("total_score", 0) or 0)
-        s = float(secondary.get("total_score", 0) or 0)
-        self.blind_pairs.append((p, s))
-        if not from_calibration:
-            self.secondary_used += 1
-        self._refresh_kappa()
+        with self._lock:
+            p = float(primary.get("total_score", 0) or 0)
+            s = float(secondary.get("total_score", 0) or 0)
+            self.blind_pairs.append((p, s))
+            if not from_calibration:
+                self.secondary_used += 1
+            self._refresh_kappa()
 
     def _refresh_kappa(self) -> None:
         if len(self.blind_pairs) < 2:
@@ -353,55 +361,57 @@ class ACMAGRuntime:
             )
 
     def anchor_context_text(self) -> str:
-        if not self.anchors:
-            return ""
+        with self._lock:
+            if not self.anchors:
+                return ""
 
-        by_band: dict[str, list[AnchorExample]] = {}
-        for a in self.anchors:
-            by_band.setdefault(a.band, []).append(a)
+            by_band: dict[str, list[AnchorExample]] = {}
+            for a in self.anchors:
+                by_band.setdefault(a.band, []).append(a)
 
-        selected: list[AnchorExample] = []
-        for band in ["A", "B", "C", "D", "F"]:
-            if band in by_band and by_band[band]:
-                selected.append(sorted(by_band[band], key=lambda x: abs(x.score - (0.9 if band == "A" else 0.8) * x.max_score))[0])
-        if len(selected) < self.max_anchors:
-            remaining = [a for a in self.anchors if a not in selected]
-            remaining.sort(key=lambda x: x.score, reverse=True)
-            selected.extend(remaining[: max(0, self.max_anchors - len(selected))])
-        selected = selected[: self.max_anchors]
+            selected: list[AnchorExample] = []
+            for band in ["A", "B", "C", "D", "F"]:
+                if band in by_band and by_band[band]:
+                    selected.append(sorted(by_band[band], key=lambda x: abs(x.score - (0.9 if band == "A" else 0.8) * x.max_score))[0])
+            if len(selected) < self.max_anchors:
+                remaining = [a for a in self.anchors if a not in selected]
+                remaining.sort(key=lambda x: x.score, reverse=True)
+                selected.extend(remaining[: max(0, self.max_anchors - len(selected))])
+            selected = selected[: self.max_anchors]
 
-        parts = [
-            "ACMAG Anchor Context (calibrated examples from this batch):",
-            "Use these anchors for consistency, not for copying exact wording.",
-        ]
-        for idx, a in enumerate(selected, 1):
-            parts.append(
-                f"[Anchor {idx}] {a.student_identifier} | band={a.band} | score={a.score:.1f}/{a.max_score} | confidence={a.confidence}"
-            )
-            if a.rubric_breakdown:
-                mini = "; ".join(
-                    f"{it.get('criterion','')}: {it.get('score',0)}/{it.get('max',0)}"
-                    for it in a.rubric_breakdown[:4]
+            parts = [
+                "ACMAG Anchor Context (calibrated examples from this batch):",
+                "Use these anchors for consistency, not for copying exact wording.",
+            ]
+            for idx, a in enumerate(selected, 1):
+                parts.append(
+                    f"[Anchor {idx}] {a.student_identifier} | band={a.band} | score={a.score:.1f}/{a.max_score} | confidence={a.confidence}"
                 )
-                parts.append(f"Rubric pattern: {mini}")
-            if a.overall_feedback:
-                parts.append(f"Anchor rationale: {a.overall_feedback[:260]}")
-        return "\n".join(parts)
+                if a.rubric_breakdown:
+                    mini = "; ".join(
+                        f"{it.get('criterion','')}: {it.get('score',0)}/{it.get('max',0)}"
+                        for it in a.rubric_breakdown[:4]
+                    )
+                    parts.append(f"Rubric pattern: {mini}")
+                if a.overall_feedback:
+                    parts.append(f"Anchor rationale: {a.overall_feedback[:260]}")
+            return "\n".join(parts)
 
     def reliability_snapshot(self) -> dict[str, Any]:
-        return {
-            "enabled": bool(self.enabled),
-            "calibration_target": len(self.calibration_ids),
-            "calibration_complete": bool(self.calibration_complete),
-            "anchors_built": len(self.anchors),
-            "secondary_quota": int(self.secondary_quota),
-            "secondary_used": int(self.secondary_used),
-            "blind_pairs": len(self.blind_pairs),
-            "weighted_kappa": round(float(self.kappa), 4),
-            "kappa_threshold": float(self.kappa_threshold),
-            "halted": bool(self.halted),
-            "halt_reason": str(self.halt_reason),
-        }
+        with self._lock:
+            return {
+                "enabled": bool(self.enabled),
+                "calibration_target": len(self.calibration_ids),
+                "calibration_complete": bool(self.calibration_complete),
+                "anchors_built": len(self.anchors),
+                "secondary_quota": int(self.secondary_quota),
+                "secondary_used": int(self.secondary_used),
+                "blind_pairs": len(self.blind_pairs),
+                "weighted_kappa": round(float(self.kappa), 4),
+                "kappa_threshold": float(self.kappa_threshold),
+                "halted": bool(self.halted),
+                "halt_reason": str(self.halt_reason),
+            }
 
 
 def _augment_description_for_examiner(

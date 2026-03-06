@@ -109,14 +109,17 @@
                     :class="activeTable === 'marks' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">Marks</button>
                 <button @click="activeTable = 'rubric'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
                     :class="activeTable === 'rubric' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">Rubric</button>
-                <button @click="activeTable = 'ingestion'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
+                <button @click="activeTable = 'ingestion'"
+                    class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
                     :class="activeTable === 'ingestion' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">Ingestion</button>
                 <button @click="activeTable = 'llm'" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition"
-                    :class="activeTable === 'llm' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">LLM Calls</button>
+                    :class="activeTable === 'llm' ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300' : 'text-gray-500'">LLM
+                    Calls</button>
             </div>
         </div>
 
-        <div x-show="tableLoading" x-cloak class="rounded-xl border border-dashed border-primary-300/70 dark:border-primary-700/60 p-8 text-center">
+        <div x-show="tableLoading" x-cloak
+            class="rounded-xl border border-dashed border-primary-300/70 dark:border-primary-700/60 p-8 text-center">
             <div class="inline-flex items-center gap-3 text-primary-600 dark:text-primary-300">
                 <svg class="w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none">
                     <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="4"></circle>
@@ -143,7 +146,8 @@
                 </thead>
                 <tbody>
                     {% for row in marks_rows %}
-                    <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                    <tr
+                        class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
                         <td class="py-2 pr-4 font-medium">{{ row.student_identifier }}</td>
                         <td class="py-2 pr-4">
                             <span class="px-2 py-0.5 rounded-md text-xs font-semibold
@@ -155,15 +159,18 @@
                             </span>
                         </td>
                         <td class="py-2 pr-4 text-right">{{ row.ai_score if row.ai_score is not none else '-' }}</td>
-                        <td class="py-2 pr-4 text-right font-semibold">{{ row.final_score if row.final_score is not none else '-' }} / {{ session.max_score }}</td>
+                        <td class="py-2 pr-4 text-right font-semibold">{{ row.final_score if row.final_score is not none
+                            else '-' }} / {{ session.max_score }}</td>
                         <td class="py-2 pr-4 text-right">
                             {% if row.delta is not none %}
-                            <span class="{% if row.delta > 0 %}text-emerald-600{% elif row.delta < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
+                            <span
+                                class="{% if row.delta > 0 %}text-emerald-600{% elif row.delta < 0 %}text-red-600{% else %}text-gray-500{% endif %}">
                                 {{ '%+0.2f'|format(row.delta) }}
                             </span>
                             {% else %}-{% endif %}
                         </td>
-                        <td class="py-2 pr-4 text-right">{{ row.percentage if row.percentage is not none else '-' }}</td>
+                        <td class="py-2 pr-4 text-right">{{ row.percentage if row.percentage is not none else '-' }}
+                        </td>
                         <td class="py-2 pr-4">{{ row.letter_grade or '-' }}</td>
                         <td class="py-2">{{ row.confidence or '-' }}</td>
                     </tr>
@@ -188,7 +195,8 @@
                 </thead>
                 <tbody>
                     {% for row in rubric_rows %}
-                    <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                    <tr
+                        class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
                         <td class="py-2 pr-4 font-medium">{{ row.criterion }}</td>
                         <td class="py-2 pr-4 text-right">{{ row.students_graded }}</td>
                         <td class="py-2 pr-4 text-right">{{ row.avg_score }}</td>
@@ -208,14 +216,38 @@
         <!-- Ingestion Table -->
         <div x-show="!tableLoading && activeTable === 'ingestion'" x-cloak class="space-y-4">
             <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
-                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Reports</p><p class="font-semibold">{{ ingestion_overview.students_with_report }}</p></div>
-                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Received</p><p class="font-semibold">{{ ingestion_overview.files_received }}</p></div>
-                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Parsed</p><p class="font-semibold">{{ ingestion_overview.files_parsed }}</p></div>
-                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Failed</p><p class="font-semibold">{{ ingestion_overview.files_failed }}</p></div>
-                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Text Chars</p><p class="font-semibold">{{ ingestion_overview.total_text_chars }}</p></div>
-                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3"><p class="text-[11px] text-blue-700/70">Images</p><p class="font-semibold">{{ ingestion_overview.total_images }}</p></div>
-                <div class="bg-amber-50 dark:bg-amber-900/20 rounded-xl p-3"><p class="text-[11px] text-amber-700/70">Warnings</p><p class="font-semibold">{{ ingestion_overview.warnings }}</p></div>
-                <div class="bg-red-50 dark:bg-red-900/20 rounded-xl p-3"><p class="text-[11px] text-red-700/70">Errors</p><p class="font-semibold">{{ ingestion_overview.errors }}</p></div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-blue-700/70">Reports</p>
+                    <p class="font-semibold">{{ ingestion_overview.students_with_report }}</p>
+                </div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-blue-700/70">Received</p>
+                    <p class="font-semibold">{{ ingestion_overview.files_received }}</p>
+                </div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-blue-700/70">Parsed</p>
+                    <p class="font-semibold">{{ ingestion_overview.files_parsed }}</p>
+                </div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-blue-700/70">Failed</p>
+                    <p class="font-semibold">{{ ingestion_overview.files_failed }}</p>
+                </div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-blue-700/70">Text Chars</p>
+                    <p class="font-semibold">{{ ingestion_overview.total_text_chars }}</p>
+                </div>
+                <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-blue-700/70">Images</p>
+                    <p class="font-semibold">{{ ingestion_overview.total_images }}</p>
+                </div>
+                <div class="bg-amber-50 dark:bg-amber-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-amber-700/70">Warnings</p>
+                    <p class="font-semibold">{{ ingestion_overview.warnings }}</p>
+                </div>
+                <div class="bg-red-50 dark:bg-red-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-red-700/70">Errors</p>
+                    <p class="font-semibold">{{ ingestion_overview.errors }}</p>
+                </div>
             </div>
             <div class="overflow-x-auto">
                 <table class="min-w-full text-sm">
@@ -234,7 +266,8 @@
                     </thead>
                     <tbody>
                         {% for row in ingestion_rows %}
-                        <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                        <tr
+                            class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
                             <td class="py-2 pr-4 font-medium">{{ row.student_identifier }}</td>
                             <td class="py-2 pr-4 text-right">{{ row.received }}</td>
                             <td class="py-2 pr-4 text-right">{{ row.parsed }}</td>
@@ -257,12 +290,30 @@
         <!-- LLM Table -->
         <div x-show="!tableLoading && activeTable === 'llm'" x-cloak class="space-y-4">
             <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Calls</p><p class="font-semibold">{{ llm_overview.calls }}</p></div>
-                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Prompt Tokens</p><p class="font-semibold">{{ llm_overview.prompt_tokens }}</p></div>
-                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Completion Tokens</p><p class="font-semibold">{{ llm_overview.completion_tokens }}</p></div>
-                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Total Tokens</p><p class="font-semibold">{{ llm_overview.total_tokens }}</p></div>
-                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Text Chars Sent</p><p class="font-semibold">{{ llm_overview.text_chars_sent }}</p></div>
-                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3"><p class="text-[11px] text-purple-700/70">Images Sent</p><p class="font-semibold">{{ llm_overview.images_sent }}</p></div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-purple-700/70">Calls</p>
+                    <p class="font-semibold">{{ llm_overview.calls }}</p>
+                </div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-purple-700/70">Prompt Tokens</p>
+                    <p class="font-semibold">{{ llm_overview.prompt_tokens }}</p>
+                </div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-purple-700/70">Completion Tokens</p>
+                    <p class="font-semibold">{{ llm_overview.completion_tokens }}</p>
+                </div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-purple-700/70">Total Tokens</p>
+                    <p class="font-semibold">{{ llm_overview.total_tokens }}</p>
+                </div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-purple-700/70">Text Chars Sent</p>
+                    <p class="font-semibold">{{ llm_overview.text_chars_sent }}</p>
+                </div>
+                <div class="bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3">
+                    <p class="text-[11px] text-purple-700/70">Images Sent</p>
+                    <p class="font-semibold">{{ llm_overview.images_sent }}</p>
+                </div>
             </div>
             <div class="overflow-x-auto">
                 <table class="min-w-full text-sm">
@@ -281,7 +332,8 @@
                     </thead>
                     <tbody>
                         {% for row in llm_rows %}
-                        <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
+                        <tr
+                            class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50/80 dark:hover:bg-gray-800/40 transition-colors">
                             <td class="py-2 pr-4 font-medium">{{ row.student_identifier }}</td>
                             <td class="py-2 pr-4">{{ row.provider or '-' }}</td>
                             <td class="py-2 pr-4 break-all">{{ row.model or '-' }}</td>
@@ -380,8 +432,10 @@
 
                     <!-- LLM Call Overview -->
                     {% if ai.transparency and ai.transparency.llm_call %}
-                    <div class="bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-xl p-3">
-                        <h4 class="text-sm font-semibold text-purple-700 dark:text-purple-300 mb-2">LLM Call Overview</h4>
+                    <div
+                        class="bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-xl p-3">
+                        <h4 class="text-sm font-semibold text-purple-700 dark:text-purple-300 mb-2">LLM Call Overview
+                        </h4>
                         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
                             <div>
                                 <p class="text-purple-600/80">Model</p>
@@ -397,13 +451,16 @@
                             </div>
                             <div>
                                 <p class="text-purple-600/80">Tokens</p>
-                                <p class="font-semibold">{{ ai.transparency.llm_call.usage.total_tokens if ai.transparency.llm_call.usage else 'N/A' }}</p>
+                                <p class="font-semibold">{{ ai.transparency.llm_call.usage.total_tokens if
+                                    ai.transparency.llm_call.usage else 'N/A' }}</p>
                             </div>
                         </div>
                         {% if ai.transparency.prompt_preview %}
                         <details class="mt-2">
-                            <summary class="cursor-pointer text-xs font-medium text-purple-700 dark:text-purple-300">Prompt Preview</summary>
-                            <pre class="mt-2 text-[11px] bg-gray-900 text-gray-100 rounded-lg p-2 whitespace-pre-wrap">{{ ai.transparency.prompt_preview }}</pre>
+                            <summary class="cursor-pointer text-xs font-medium text-purple-700 dark:text-purple-300">
+                                Prompt Preview</summary>
+                            <pre
+                                class="mt-2 text-[11px] bg-gray-900 text-gray-100 rounded-lg p-2 whitespace-pre-wrap">{{ ai.transparency.prompt_preview }}</pre>
                         </details>
                         {% endif %}
                     </div>
@@ -411,18 +468,32 @@
 
                     <!-- Ingestion Report -->
                     {% if ingestion %}
-                    <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-3">
+                    <div
+                        class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-3">
                         <h4 class="text-sm font-semibold text-blue-700 dark:text-blue-300 mb-2">Ingestion Report</h4>
                         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
-                            <div><p class="text-blue-600/80">Received</p><p class="font-semibold">{{ ingestion.summary.received|default(0) }}</p></div>
-                            <div><p class="text-blue-600/80">Parsed</p><p class="font-semibold">{{ ingestion.summary.parsed|default(0) }}</p></div>
-                            <div><p class="text-blue-600/80">Text Chars</p><p class="font-semibold">{{ ingestion.total_text_chars|default(0) }}</p></div>
-                            <div><p class="text-blue-600/80">Images</p><p class="font-semibold">{{ ingestion.total_images|default(0) }}</p></div>
+                            <div>
+                                <p class="text-blue-600/80">Received</p>
+                                <p class="font-semibold">{{ ingestion.summary.received|default(0) }}</p>
+                            </div>
+                            <div>
+                                <p class="text-blue-600/80">Parsed</p>
+                                <p class="font-semibold">{{ ingestion.summary.parsed|default(0) }}</p>
+                            </div>
+                            <div>
+                                <p class="text-blue-600/80">Text Chars</p>
+                                <p class="font-semibold">{{ ingestion.total_text_chars|default(0) }}</p>
+                            </div>
+                            <div>
+                                <p class="text-blue-600/80">Images</p>
+                                <p class="font-semibold">{{ ingestion.total_images|default(0) }}</p>
+                            </div>
                         </div>
                         {% if ingestion.files_parsed %}
                         <div class="space-y-2">
                             {% for file in ingestion.files_parsed %}
-                            <div class="bg-white dark:bg-gray-800 rounded-lg p-2 border border-blue-100 dark:border-blue-900/40">
+                            <div
+                                class="bg-white dark:bg-gray-800 rounded-lg p-2 border border-blue-100 dark:border-blue-900/40">
                                 <div class="flex items-center justify-between">
                                     <p class="text-xs font-semibold">{{ file.filename }}</p>
                                     <p class="text-[11px] text-gray-500">{{ file.extraction_method|default('n/a') }}</p>
@@ -431,8 +502,10 @@
                                 <div class="mt-2 grid grid-cols-2 md:grid-cols-3 gap-2">
                                     {% for preview in file.image_previews %}
                                     <div class="rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
-                                        <img src="{{ preview.data_url }}" alt="Extracted preview" class="w-full h-24 object-contain bg-gray-50 dark:bg-gray-900" />
-                                        <p class="px-1.5 py-1 text-[10px] text-gray-500">{{ preview.description or ('Page ' ~ preview.page) }}</p>
+                                        <img src="{{ preview.data_url }}" alt="Extracted preview"
+                                            class="w-full h-24 object-contain bg-gray-50 dark:bg-gray-900" />
+                                        <p class="px-1.5 py-1 text-[10px] text-gray-500">{{ preview.description or
+                                            ('Page ' ~ preview.page) }}</p>
                                     </div>
                                     {% endfor %}
                                 </div>
@@ -527,18 +600,21 @@
                             <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
                                 <div class="flex items-center justify-between mb-1">
                                     <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                                        Q{{ q.question_number }}: {{ q.question_text[:50] }}{% if q.question_text|length > 50 %}...{% endif %}
+                                        Q{{ q.question_number }}: {{ q.question_text[:50] }}{% if q.question_text|length
+                                        > 50 %}...{% endif %}
                                     </span>
                                     <div class="flex items-center gap-2">
                                         {% set correctness = q.correctness|default('')|lower %}
-                                        <span class="text-xs px-2 py-0.5 rounded-full font-medium
+                                        <span
+                                            class="text-xs px-2 py-0.5 rounded-full font-medium
                                             {% if correctness == 'correct' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300
                                             {% elif correctness == 'partially_correct' %}bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300
                                             {% elif correctness == 'incorrect' %}bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300
                                             {% else %}bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300{% endif %}">
                                             {{ q.correctness|default('Not assessed') }}
                                         </span>
-                                        <span class="text-sm font-bold">{{ q.score|default(0) }}/{{ q.max_points|default(0) }}</span>
+                                        <span class="text-sm font-bold">{{ q.score|default(0) }}/{{
+                                            q.max_points|default(0) }}</span>
                                     </div>
                                 </div>
                                 {% if q.files_addressing and q.files_addressing|length > 0 %}
@@ -550,7 +626,9 @@
                                 <p class="text-xs text-gray-500 dark:text-gray-400">{{ q.feedback }}</p>
                                 {% endif %}
                                 {% if q.response_summary %}
-                                <p class="text-xs text-gray-400 dark:text-gray-500 mt-1 italic">{{ q.response_summary[:100] }}{% if q.response_summary|length > 100 %}...{% endif %}</p>
+                                <p class="text-xs text-gray-400 dark:text-gray-500 mt-1 italic">{{
+                                    q.response_summary[:100] }}{% if q.response_summary|length > 100 %}...{% endif %}
+                                </p>
                                 {% endif %}
                             </div>
                             {% endfor %}
@@ -573,10 +651,13 @@
                             <div class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
                                 <div class="flex items-center justify-between mb-1">
                                     <span class="text-sm font-medium">{{ fa.filename }}</span>
-                                    <span class="text-xs px-2 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300">{{ fa.file_type }}</span>
+                                    <span
+                                        class="text-xs px-2 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300">{{
+                                        fa.file_type }}</span>
                                 </div>
                                 {% if fa.assessment %}
-                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ fa.assessment[:200] }}{% if fa.assessment|length > 200 %}...{% endif %}</p>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ fa.assessment[:200] }}{% if
+                                    fa.assessment|length > 200 %}...{% endif %}</p>
                                 {% endif %}
                                 {% if fa.issues_found and fa.issues_found|length > 0 %}
                                 <div class="mt-2">
@@ -660,8 +741,10 @@
                                 <span x-show="!filesLoading">Load Files</span>
                                 <span x-show="filesLoading" x-cloak class="inline-flex items-center gap-1.5">
                                     <svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
-                                        <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
-                                        <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor" stroke-width="3"></path>
+                                        <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor"
+                                            stroke-width="3"></circle>
+                                        <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor"
+                                            stroke-width="3"></path>
                                     </svg>
                                     Loading...
                                 </span>
@@ -669,7 +752,9 @@
                         </div>
                         <div x-show="filesLoading" x-cloak class="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
                             <template x-for="n in 4" :key="n">
-                                <div class="h-12 rounded-xl bg-gradient-to-r from-gray-100 via-gray-200 to-gray-100 dark:from-gray-800 dark:via-gray-700 dark:to-gray-800 animate-pulse"></div>
+                                <div
+                                    class="h-12 rounded-xl bg-gradient-to-r from-gray-100 via-gray-200 to-gray-100 dark:from-gray-800 dark:via-gray-700 dark:to-gray-800 animate-pulse">
+                                </div>
                             </template>
                         </div>
                         <div x-show="filesLoaded" class="space-y-2">
@@ -693,10 +778,14 @@
                                     </div>
                                     <div x-show="file.open" x-collapse>
                                         <div class="p-3 border-t border-gray-200 dark:border-gray-700">
-                                            <div x-show="file.loading" class="text-center py-3 text-xs text-gray-400 inline-flex items-center gap-2">
-                                                <svg class="w-3.5 h-3.5 animate-spin text-primary-500" viewBox="0 0 24 24" fill="none">
-                                                    <circle cx="12" cy="12" r="10" class="opacity-25" stroke="currentColor" stroke-width="3"></circle>
-                                                    <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90" stroke="currentColor" stroke-width="3"></path>
+                                            <div x-show="file.loading"
+                                                class="text-center py-3 text-xs text-gray-400 inline-flex items-center gap-2">
+                                                <svg class="w-3.5 h-3.5 animate-spin text-primary-500"
+                                                    viewBox="0 0 24 24" fill="none">
+                                                    <circle cx="12" cy="12" r="10" class="opacity-25"
+                                                        stroke="currentColor" stroke-width="3"></circle>
+                                                    <path d="M22 12a10 10 0 0 1-10 10" class="opacity-90"
+                                                        stroke="currentColor" stroke-width="3"></path>
                                                 </svg>
                                                 Loading preview...
                                             </div>
@@ -813,15 +902,21 @@
 
             async saveOverride(studentId, score, comments, isReviewed, btn) {
                 try {
+                    const scoreVal = parseFloat(score);
+                    if (isNaN(scoreVal) || scoreVal < 0) {
+                        showToast('Score cannot be negative', 'error');
+                        return;
+                    }
                     const resp = await fetch(`/session/{{ session.id }}/student/${studentId}/override`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ score: parseFloat(score), comments, is_reviewed: isReviewed })
+                        body: JSON.stringify({ score: scoreVal, comments, is_reviewed: isReviewed })
                     });
                     if (resp.ok) {
                         showToast('Override saved!', 'success');
                     } else {
-                        showToast('Failed to save', 'error');
+                        const body = await resp.json().catch(() => ({}));
+                        showToast(body.detail || 'Failed to save', 'error');
                     }
                 } catch (e) {
                     showToast('Network error', 'error');

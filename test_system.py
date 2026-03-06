@@ -110,7 +110,7 @@ def test_file_parsing():
         txt_file = tmp_dir / "test.txt"
         txt_file.write_text("Hello World")
         result = parse_file(txt_file)
-        assert result['type'] == 'code', f"Expected 'code', got {result['type']}"
+        assert result['type'] == 'text', f"Expected 'text', got {result['type']}"
         print("✓ Text file parsing works")
         
         return True
