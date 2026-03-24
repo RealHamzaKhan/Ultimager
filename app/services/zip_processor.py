@@ -78,20 +78,41 @@ def extract_archive(archive_path: Path, extract_dir: Path) -> Tuple[bool, str]:
     try:
         if suffix == '.zip':
             with zipfile.ZipFile(archive_path, 'r') as zf:
-                zf.extractall(extract_dir)
+                # D6 FIX: Zip slip prevention — reject entries that escape extract_dir
+                resolved_dir = extract_dir.resolve()
+                for info in zf.infolist():
+                    target = (resolved_dir / info.filename).resolve()
+                    if not str(target).startswith(str(resolved_dir)):
+                        logger.warning(f"Zip slip attempt blocked: {info.filename}")
+                        continue
+                    zf.extract(info, extract_dir)
             return True, f"Extracted ZIP: {archive_path.name}"
-        
+
         elif suffix in ['.tar', '.gz', '.tgz'] or '.tar.' in name_lower:
             mode = 'r:gz' if suffix in ['.gz', '.tgz'] or '.tar.gz' in name_lower else 'r'
             with tarfile.open(archive_path, mode) as tf:
-                tf.extractall(extract_dir)
+                # D6 FIX: Tar slip prevention
+                resolved_dir = extract_dir.resolve()
+                for member in tf.getmembers():
+                    target = (resolved_dir / member.name).resolve()
+                    if not str(target).startswith(str(resolved_dir)):
+                        logger.warning(f"Tar slip attempt blocked: {member.name}")
+                        continue
+                    tf.extract(member, extract_dir)
             return True, f"Extracted TAR: {archive_path.name}"
-        
+
         elif suffix == '.rar':
             try:
                 import rarfile
                 with rarfile.RarFile(archive_path) as rf:
-                    rf.extractall(extract_dir)
+                    # D6 FIX: RAR slip prevention
+                    resolved_dir = extract_dir.resolve()
+                    for info in rf.infolist():
+                        target = (resolved_dir / info.filename).resolve()
+                        if not str(target).startswith(str(resolved_dir)):
+                            logger.warning(f"RAR slip attempt blocked: {info.filename}")
+                            continue
+                        rf.extract(info, extract_dir)
                 return True, f"Extracted RAR: {archive_path.name}"
             except ImportError:
                 return False, "rarfile module not installed. Run: pip install rarfile"

@@ -37,6 +37,15 @@ MAX_IMAGES_FOR_FINAL_GRADE: int = int(os.getenv("MAX_IMAGES_FOR_FINAL_GRADE", "8
 MAX_FINAL_IMAGE_BYTES: int = int(os.getenv("MAX_FINAL_IMAGE_BYTES", "8000000"))
 RATE_LIMIT_RPM: int = 40  # requests per minute — hard limit
 
+# ── Vision Transcript Injection ──────────────────────────────────
+# Full per-image transcriptions replace the old lossy consolidation summary.
+VISION_TRANSCRIPT_MAX_CHARS: int = int(os.getenv("VISION_TRANSCRIPT_MAX_CHARS", "80000"))
+VISION_ENTRY_TRANSCRIPTION_LIMIT: int = int(os.getenv("VISION_ENTRY_TRANSCRIPTION_LIMIT", "1200"))
+VISION_ENTRY_SUMMARY_LIMIT: int = int(os.getenv("VISION_ENTRY_SUMMARY_LIMIT", "800"))
+
+# ── Score Verification ───────────────────────────────────────────
+SCORE_VERIFICATION_ENABLED: bool = os.getenv("SCORE_VERIFICATION_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+
 # ── ACMAG (Anchor-Calibrated Multi-Agent Grading) ────────────────
 # ACMAG can be enabled explicitly via env when needed. Keep default off for
 # stable baseline grading throughput.
@@ -58,6 +67,14 @@ ACMAG_MAX_ANCHORS: int = int(os.getenv("ACMAG_MAX_ANCHORS", "8"))
 UPLOAD_DIR: Path = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'grading.db'}"
+
+# ── Multi-Pass Grading ────────────────────────────────────────────
+# When a student's content exceeds a single context window, the grader
+# splits into multiple passes and aggregates with MAX-score-per-criterion.
+MULTI_PASS_TEXT_THRESHOLD: int = int(os.getenv("MULTI_PASS_TEXT_THRESHOLD", "28000"))
+MULTI_PASS_WINDOW_SIZE: int = int(os.getenv("MULTI_PASS_WINDOW_SIZE", "24000"))
+MULTI_PASS_OVERLAP: int = int(os.getenv("MULTI_PASS_OVERLAP", "2000"))  # overlap chars between windows
+FINAL_IMAGE_CAP: int = int(os.getenv("FINAL_IMAGE_CAP", "6"))  # images per LLM request
 
 # ── Code execution limits ─────────────────────────────────────────
 EXEC_TIMEOUT_SECONDS: int = 10

@@ -112,115 +112,515 @@ def parse_rubric(rubric_text: str) -> list[dict]:
     return criteria
 
 
-async def generate_rubric_from_description(
+async def _extract_question_structure(
     assignment_description: str,
     max_score: int = 100,
-    strictness: str = "balanced"  # "lenient", "balanced", "strict"
 ) -> dict:
-    """
-    Generate a rubric from assignment description using AI.
-    
-    Args:
-        assignment_description: The assignment description text
-        max_score: Maximum total score
-        strictness: How strict the rubric should be ("lenient", "balanced", "strict")
-    
+    """Phase 1: Extract question structure and mark allocations from the description.
+
+    Uses a focused LLM call with low temperature to reliably parse questions,
+    sub-parts, and their explicit or implied mark allocations.
+
     Returns:
-        dict with generated rubric and metadata
+        dict with 'questions' list and metadata about mark allocations.
     """
-    await _rate_limiter.acquire()
-    
-    strictness_prompts = {
-        "lenient": """
-Create a LENIENT rubric that:
-- Focuses on effort and completion over perfection
-- Gives partial credit generously
-- Emphasizes learning and improvement
-- Penalizes minor issues lightly
-- Rewards creativity and attempts""",
-        "balanced": """
-Create a BALANCED rubric that:
-- Rewards correct implementation appropriately
-- Considers both correctness and code quality
-- Gives fair partial credit
-- Balances strictness with encouragement""",
-        "strict": """
-Create a STRICT rubric that:
-- Requires full correctness for full points
-- Penalizes errors and missing requirements
-- Emphasizes best practices and edge cases
-- Has high standards for code quality
-- Little tolerance for incomplete solutions"""
-    }
-    
-    system_prompt = f"""You are an expert Computer Science instructor creating grading rubrics.
-
-{strictness_prompts.get(strictness, strictness_prompts["balanced"])}
-
-Generate a rubric that sums to exactly {max_score} points.
-
-Respond in this exact JSON format:
-{{
-  "rubric_text": "Criterion 1: XX points\\nCriterion 2: XX points\\n...\\nTotal: {max_score}",
-  "criteria": [
-    {{"criterion": "Name", "max": XX, "description": "What this criterion assesses"}}
-  ],
-  "strictness_level": "{strictness}",
-  "max_score": {max_score},
-  "reasoning": "Brief explanation of why these criteria were chosen"
-}}"""
-
-    user_prompt = f"""Assignment Description:
-{assignment_description}
-
-Generate a complete grading rubric for this assignment."""
-
     client = _get_client()
-    
+
+    system_prompt = (
+        "You are a precise question-structure parser. Your ONLY job is to extract "
+        "every question, sub-question, and part from an assignment description, along "
+        "with their mark/point allocations.\n\n"
+        "RULES:\n"
+        "1. Extract EVERY question and sub-part. Do NOT skip any.\n"
+        "2. If marks/points are explicitly written (e.g., '10 marks', '5 pts', '[10]', '(10)'), "
+        "set marks_explicit=true and use the exact value.\n"
+        "3. If a question has sub-parts with marks, the parent question's marks should be "
+        "the sum of its parts' marks.\n"
+        "4. If NO marks are specified for a question, set marks_explicit=false and marks=null.\n"
+        "5. Identify questions by their labels: Q1, Q2, Question 1, Problem 1, Part A, (a), (i), etc.\n"
+        "6. If the description has no clear question structure (just a general task description), "
+        "return an empty questions array.\n"
+        "7. Preserve the original question numbering/labeling exactly.\n\n"
+        "Respond in this EXACT JSON format (no extra text, no markdown):\n"
+        "{\n"
+        '  "questions": [\n'
+        '    {\n'
+        '      "id": "Q1",\n'
+        '      "label": "Q1",\n'
+        '      "description": "Brief description of what the question asks",\n'
+        '      "marks": 10,\n'
+        '      "marks_explicit": true,\n'
+        '      "parts": [\n'
+        '        {"id": "Q1a", "label": "a", "description": "Sub-part description", "marks": 4, "marks_explicit": true, "parts": []}\n'
+        "      ]\n"
+        "    }\n"
+        "  ],\n"
+        '  "has_explicit_marks": true,\n'
+        '  "total_explicit_marks": 25\n'
+        "}\n\n"
+        "Output ONLY the JSON object. No markdown fences. No extra text."
+    )
+
+    user_prompt = (
+        f"Assignment Description:\n{assignment_description}\n\n"
+        f"Total marks for this assignment: {max_score}\n\n"
+        "Extract the complete question structure with mark allocations."
+    )
+
     try:
         response = client.chat.completions.create(
             model=NVIDIA_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0.3,  # Slight creativity allowed for rubric generation
+            temperature=0.1,
             max_tokens=1500,
         )
-        
+
+        raw_text = response.choices[0].message.content or ""
+        logger.info("Phase 1 raw response (first 500 chars): %s", raw_text[:500])
+        result = _extract_json(raw_text)
+        logger.info("Phase 1 parsed result keys: %s, questions count: %d",
+                     list(result.keys()), len(result.get("questions", [])))
+
+        questions = result.get("questions", [])
+        has_explicit = result.get("has_explicit_marks", False)
+        total_explicit = result.get("total_explicit_marks", 0)
+
+        # ── Distribute marks for questions without explicit allocations ──
+        if questions:
+            _distribute_marks(questions, max_score, has_explicit, total_explicit)
+
+        return {
+            "questions": questions,
+            "has_explicit_marks": has_explicit,
+            "total_explicit_marks": total_explicit,
+        }
+
+    except Exception as e:
+        logger.warning("Phase 1 question extraction failed: %s — falling back to single-phase", e)
+        return {"questions": [], "has_explicit_marks": False, "total_explicit_marks": 0}
+
+
+def _distribute_marks(
+    questions: list[dict],
+    max_score: int,
+    has_explicit: bool,
+    total_explicit: int,
+) -> None:
+    """Distribute marks to questions/parts that don't have explicit allocations.
+
+    Mutates the questions list in-place.
+    """
+    def _get_leaf_items(qs: list[dict]) -> list[dict]:
+        """Get all leaf-level items (questions with no parts, or the parts themselves)."""
+        leaves = []
+        for q in qs:
+            parts = q.get("parts", [])
+            if parts:
+                leaves.extend(_get_leaf_items(parts))
+            else:
+                leaves.append(q)
+        return leaves
+
+    leaves = _get_leaf_items(questions)
+    if not leaves:
+        return
+
+    # If all marks are explicit, scale to match max_score
+    if has_explicit and total_explicit > 0:
+        actual_total = sum(leaf.get("marks") or 0 for leaf in leaves)
+        if actual_total != max_score and actual_total > 0:
+            factor = max_score / actual_total
+            for leaf in leaves:
+                if leaf.get("marks"):
+                    leaf["marks"] = round(leaf["marks"] * factor, 1)
+            # Fix rounding on last
+            current = sum(leaf["marks"] for leaf in leaves)
+            if current != max_score:
+                leaves[-1]["marks"] = round(leaves[-1]["marks"] + (max_score - current), 1)
+        return
+
+    # Some or all marks missing — distribute remaining equally
+    allocated = sum(leaf.get("marks") or 0 for leaf in leaves if leaf.get("marks_explicit"))
+    unallocated_leaves = [leaf for leaf in leaves if not leaf.get("marks_explicit")]
+    remaining = max_score - allocated
+
+    if unallocated_leaves and remaining > 0:
+        per_item = remaining / len(unallocated_leaves)
+        for leaf in unallocated_leaves:
+            leaf["marks"] = round(per_item, 1)
+        # Fix rounding
+        current = sum(leaf.get("marks") or 0 for leaf in leaves)
+        if current != max_score and leaves:
+            leaves[-1]["marks"] = round(leaves[-1]["marks"] + (max_score - current), 1)
+
+    # Propagate marks up to parent questions
+    def _sum_parts(qs: list[dict]):
+        for q in qs:
+            parts = q.get("parts", [])
+            if parts:
+                _sum_parts(parts)
+                q["marks"] = sum(p.get("marks") or 0 for p in parts)
+
+    _sum_parts(questions)
+
+
+async def generate_rubric_from_description(
+    assignment_description: str,
+    max_score: int = 100,
+    strictness: str = "balanced",  # "lenient", "balanced", "strict"
+    detail_level: str = "balanced",  # "simple", "balanced", "detailed"
+) -> dict:
+    """Generate a rubric from assignment description using AI.
+
+    Uses a two-phase approach:
+    - Phase 1: Extract question structure and mark allocations
+    - Phase 2: Generate rubric criteria constrained to the extracted structure
+
+    Args:
+        assignment_description: The assignment description text
+        max_score: Maximum total score
+        strictness: Grading stringency ("lenient", "balanced", "strict")
+        detail_level: How many criteria and how much detail ("simple", "balanced", "detailed")
+
+    Returns:
+        dict with generated rubric, criteria, extracted questions, and metadata
+    """
+    await _rate_limiter.acquire()
+
+    # ── Phase 1: Extract question structure ──────────────────────────
+    extraction = await _extract_question_structure(assignment_description, max_score)
+    questions = extraction.get("questions", [])
+
+    # If no questions found, use single-phase fallback
+    if not questions:
+        return await _single_phase_rubric(
+            assignment_description, max_score, strictness, detail_level
+        )
+
+    # ── Phase 2: Generate criteria constrained to question structure ─
+    await _rate_limiter.acquire()
+
+    # Build the question constraint block for the prompt
+    question_constraint = _build_question_constraint(questions)
+
+    # ── Strictness guidance (controls description richness) ──────────
+    strictness_desc = {
+        "lenient": (
+            "SCORING PHILOSOPHY: LENIENT\n"
+            "- Descriptions should emphasize effort, completion, and learning.\n"
+            "- Include generous partial credit tiers (e.g., 'Attempted = 60% credit').\n"
+            "- Focus on what students got RIGHT, not what they missed."
+        ),
+        "balanced": (
+            "SCORING PHILOSOPHY: BALANCED\n"
+            "- Descriptions should include clear full/partial/zero credit tiers.\n"
+            "- Be fair: common minor mistakes lose 10-20%, major bugs lose 40-60%.\n"
+            "- Include both what earns full credit and what loses credit."
+        ),
+        "strict": (
+            "SCORING PHILOSOPHY: STRICT\n"
+            "- Descriptions must have precise pass/fail conditions.\n"
+            "- Full credit requires FULL correctness — no generous partial credit.\n"
+            "- Include criteria for edge cases, error handling, efficiency.\n"
+            "- Partial credit only for partially-correct work, NOT for 'attempted'."
+        ),
+    }
+
+    detail_desc = {
+        "simple": "Keep descriptions to 1 sentence each. Focus on the main deliverable only.",
+        "balanced": "Descriptions should be 1-3 sentences explaining what earns full, partial, and zero credit.",
+        "detailed": (
+            "Descriptions should be comprehensive: list specific checkpoints, edge cases, "
+            "and exactly what earns full, partial (with percentage), or zero credit."
+        ),
+    }
+
+    strictness_text = strictness_desc.get(strictness, strictness_desc["balanced"])
+    detail_text = detail_desc.get(detail_level, detail_desc["balanced"])
+
+    system_prompt = (
+        "You are an expert instructor creating a grading rubric. You MUST follow the "
+        "question structure and mark allocations provided below EXACTLY.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Create EXACTLY ONE criterion for each leaf question/part listed below.\n"
+        "2. The criterion's 'max' value MUST EXACTLY match the marks allocated to that question/part.\n"
+        "3. DO NOT add extra criteria, merge questions, or skip any question/part.\n"
+        "4. DO NOT redistribute or change the mark allocations.\n"
+        "5. Criterion names should include the question label (e.g., 'Q1 - BST Insert').\n\n"
+        f"{strictness_text}\n\n"
+        f"DESCRIPTION DETAIL: {detail_text}\n\n"
+        "QUESTION STRUCTURE (generate exactly one criterion per leaf item):\n"
+        f"{question_constraint}\n\n"
+        "Respond in this EXACT JSON format (no extra text, no markdown):\n"
+        "{\n"
+        '  "criteria": [\n'
+        '    {"criterion": "Q1 - Short name", "max": <exact marks>, "description": "Grading description", "question_id": "Q1"}\n'
+        "  ],\n"
+        '  "reasoning": "Brief explanation of rubric design choices"\n'
+        "}\n\n"
+        "Output ONLY the JSON object. No markdown fences. No extra text."
+    )
+
+    user_prompt = (
+        f"Assignment Description:\n{assignment_description}\n\n"
+        f"Generate the rubric criteria following the question structure above. "
+        f"Total must be exactly {max_score} points."
+    )
+
+    client = _get_client()
+
+    try:
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=3000,
+        )
+
         raw_text = response.choices[0].message.content or ""
         result = _extract_json(raw_text)
-        
-        # Validate the rubric sums correctly
+
         criteria = result.get("criteria", [])
+        if not criteria:
+            raise ValueError("LLM returned no criteria in Phase 2")
+
+        # ── Validate coverage: every leaf question must have a criterion ─
+        expected_ids = _get_leaf_ids(questions)
+        covered_ids = {c.get("question_id", "") for c in criteria}
+
+        for qid, qdesc, qmarks in expected_ids:
+            if qid not in covered_ids:
+                logger.warning("Phase 2 missed question %s — adding stub criterion", qid)
+                criteria.append({
+                    "criterion": f"{qid} - {qdesc[:40]}",
+                    "max": qmarks or 0,
+                    "description": f"Criterion for {qdesc}. Assess correctness and completeness.",
+                    "question_id": qid,
+                })
+
+        # ── Force marks to match question allocations exactly ────────
+        leaf_map = {qid: qmarks for qid, _, qmarks in expected_ids}
+        for c in criteria:
+            qid = c.get("question_id", "")
+            if qid in leaf_map and leaf_map[qid]:
+                c["max"] = leaf_map[qid]
+
+        # ── Final sum validation ─────────────────────────────────────
         total = sum(c.get("max", 0) for c in criteria)
-        
-        if total != max_score:
-            # Adjust proportionally
-            factor = max_score / total if total > 0 else 1
+        if total != max_score and total > 0:
+            factor = max_score / total
             for c in criteria:
-                c["max"] = round(c["max"] * factor)
-            # Fix rounding errors on last item
+                c["max"] = round(c["max"] * factor, 1)
             current_total = sum(c["max"] for c in criteria)
             if current_total != max_score and criteria:
-                criteria[-1]["max"] += max_score - current_total
-        
+                criteria[-1]["max"] = round(
+                    criteria[-1]["max"] + (max_score - current_total), 1
+                )
+
+        # Build clean rubric_text (backward-compatible with parse_rubric)
+        rubric_lines = [f"{c['criterion']}: {c['max']}" for c in criteria]
+        rubric_text = "\n".join(rubric_lines)
+
         return {
             "success": True,
-            "rubric_text": result.get("rubric_text", ""),
+            "rubric_text": rubric_text,
             "criteria": criteria,
+            "questions": questions,
             "strictness": strictness,
+            "detail_level": detail_level,
             "max_score": max_score,
-            "reasoning": result.get("reasoning", "")
+            "reasoning": result.get("reasoning", ""),
+            "quality_warnings": [],
         }
-        
+
+    except Exception as e:
+        logger.exception("Phase 2 rubric generation failed — falling back to single-phase")
+        return await _single_phase_rubric(
+            assignment_description, max_score, strictness, detail_level
+        )
+
+
+def _build_question_constraint(questions: list[dict], indent: int = 0) -> str:
+    """Build a human-readable question structure string for the LLM prompt."""
+    lines = []
+    prefix = "  " * indent
+    for q in questions:
+        parts = q.get("parts", [])
+        marks = q.get("marks", "?")
+        label = q.get("label", q.get("id", "?"))
+        desc = q.get("description", "")
+        if parts:
+            lines.append(f"{prefix}{label} ({marks} marks): {desc}")
+            lines.append(_build_question_constraint(parts, indent + 1))
+        else:
+            lines.append(f"{prefix}[LEAF] {label} ({marks} marks): {desc}  → Generate one criterion")
+    return "\n".join(lines)
+
+
+def _get_leaf_ids(questions: list[dict]) -> list[tuple]:
+    """Get (id, description, marks) tuples for all leaf-level questions."""
+    leaves = []
+    for q in questions:
+        parts = q.get("parts", [])
+        if parts:
+            leaves.extend(_get_leaf_ids(parts))
+        else:
+            leaves.append((q.get("id", ""), q.get("description", ""), q.get("marks", 0)))
+    return leaves
+
+
+async def _single_phase_rubric(
+    assignment_description: str,
+    max_score: int = 100,
+    strictness: str = "balanced",
+    detail_level: str = "balanced",
+) -> dict:
+    """Fallback: single-phase rubric generation for descriptions without clear question structure."""
+
+    strictness_blocks = {
+        "lenient": (
+            "STRICTNESS: LENIENT\n"
+            "- Create FEWER criteria (broad categories) so partial credit is easy to award.\n"
+            "- Criteria descriptions should emphasize effort, completion, and learning.\n"
+            "- Include generous partial credit tiers (e.g., 'Attempted = 60% credit').\n"
+            "- Weight heavily toward completion and basic correctness, NOT edge cases.\n"
+            "- If max_score is small (≤20), use 2-4 criteria with broad names.\n"
+            "- Example scoring philosophy: any reasonable attempt → 50%+, minor bugs → 70%+."
+        ),
+        "balanced": (
+            "STRICTNESS: BALANCED\n"
+            "- Mix high-level correctness criteria with quality/detail criteria.\n"
+            "- Provide clear partial credit breakdowns (full / partial / none).\n"
+            "- Weight correctness at ~60-70%, code quality/style at ~20-30%, extras at ~10%.\n"
+            "- Be fair: common minor mistakes lose 10-20%, major bugs lose 40-60%.\n"
+            "- Criteria should cover all assignment requirements proportionally."
+        ),
+        "strict": (
+            "STRICTNESS: STRICT\n"
+            "- Create MORE fine-grained criteria so each requirement is individually assessed.\n"
+            "- Each criterion must have clear pass/fail or threshold conditions.\n"
+            "- Require FULL correctness for full credit — no generous partial credit.\n"
+            "- Include criteria for: edge cases, error handling, efficiency, style/docs.\n"
+            "- Partial credit only for partially-correct work, NOT for 'attempted'.\n"
+            "- Example scoring philosophy: minor bug → -30%, missing feature → 0 for that criterion."
+        ),
+    }
+
+    detail_blocks = {
+        "simple": (
+            "DETAIL LEVEL: SIMPLE\n"
+            "- Create 2-4 broad criteria with short, clear names.\n"
+            "- Descriptions should be 1 sentence each.\n"
+            "- Focus on the MAIN deliverables only."
+        ),
+        "balanced": (
+            "DETAIL LEVEL: BALANCED\n"
+            "- Create 3-6 criteria that cover all major requirements.\n"
+            "- Each criterion description should be 1-2 sentences explaining what earns full credit.\n"
+            "- Include the most important sub-requirements in descriptions."
+        ),
+        "detailed": (
+            "DETAIL LEVEL: DETAILED\n"
+            "- Create 5-10 criteria covering every aspect of the assignment.\n"
+            "- Each criterion description should list specific checkpoints or sub-items.\n"
+            "- Break complex requirements into separate criteria.\n"
+            "- Include criteria for edge cases, documentation, style, efficiency if applicable.\n"
+            "- Descriptions should specify exactly what earns full, partial, or zero credit."
+        ),
+    }
+
+    strictness_text = strictness_blocks.get(strictness, strictness_blocks["balanced"])
+    detail_text = detail_blocks.get(detail_level, detail_blocks["balanced"])
+
+    system_prompt = (
+        "You are an expert instructor creating grading rubrics.\n\n"
+        f"{strictness_text}\n\n"
+        f"{detail_text}\n\n"
+        f"Generate a rubric whose criteria max values sum to EXACTLY {max_score} points.\n"
+        "Distribute points proportionally to the importance and complexity of each requirement.\n\n"
+        "Respond in this EXACT JSON format (no extra text, no markdown):\n"
+        "{\n"
+        '  "criteria": [\n'
+        '    {"criterion": "Short clear name", "max": XX, "description": "What earns full credit"}\n'
+        "  ],\n"
+        f'  "max_score": {max_score},\n'
+        '  "reasoning": "Brief explanation of rubric design choices"\n'
+        "}\n\n"
+        "RULES:\n"
+        "- Criterion names must be short (3-8 words) and descriptive.\n"
+        "- Every criterion MUST have a non-zero max.\n"
+        "- Sum of all criteria max values MUST equal exactly " + str(max_score) + ".\n"
+        "- Output ONLY the JSON object. No markdown fences. No extra text."
+    )
+
+    user_prompt = (
+        f"Assignment Description:\n{assignment_description}\n\n"
+        f"Generate a complete {strictness} grading rubric "
+        f"with {detail_level} detail level, summing to {max_score} points."
+    )
+
+    client = _get_client()
+
+    try:
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.4,
+            max_tokens=2000,
+        )
+
+        raw_text = response.choices[0].message.content or ""
+        result = _extract_json(raw_text)
+
+        criteria = result.get("criteria", [])
+        if not criteria:
+            raise ValueError("LLM returned no criteria")
+
+        total = sum(c.get("max", 0) for c in criteria)
+
+        if total != max_score and total > 0:
+            factor = max_score / total
+            for c in criteria:
+                c["max"] = round(c["max"] * factor, 1)
+            current_total = sum(c["max"] for c in criteria)
+            if current_total != max_score and criteria:
+                criteria[-1]["max"] = round(
+                    criteria[-1]["max"] + (max_score - current_total), 1
+                )
+
+        rubric_lines = [f"{c['criterion']}: {c['max']}" for c in criteria]
+        rubric_text = "\n".join(rubric_lines)
+
+        return {
+            "success": True,
+            "rubric_text": rubric_text,
+            "criteria": criteria,
+            "questions": [],
+            "strictness": strictness,
+            "detail_level": detail_level,
+            "max_score": max_score,
+            "reasoning": result.get("reasoning", ""),
+            "quality_warnings": [],
+        }
+
     except Exception as e:
         logger.exception("Failed to generate rubric")
         return {
             "success": False,
             "error": str(e),
             "rubric_text": "",
-            "criteria": []
+            "criteria": [],
+            "questions": [],
+            "quality_warnings": [],
         }
 
 

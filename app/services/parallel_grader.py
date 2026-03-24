@@ -149,7 +149,13 @@ class GradingWorker:
             worker_submission.is_relevant = relevance.get("is_relevant", True)
             worker_submission.relevance_flags = json.dumps(relevance.get("flags", []))
             db.commit()
-            relevance_gate = evaluate_relevance_gate(relevance)
+            # Count images so the gate knows about handwritten/visual submissions
+            _img_count = sum(
+                len(getattr(f, "images", []) or [])
+                for f in extracted_contents
+                if hasattr(f, "images")
+            )
+            relevance_gate = evaluate_relevance_gate(relevance, image_count=_img_count)
             if relevance_gate.get("block_grading"):
                 logger.warning(
                     "[RELEVANCE] Blocking grading for %s due to %s (confidence=%s, flags=%s)",
@@ -161,14 +167,36 @@ class GradingWorker:
                 grading_hash = compute_grading_hash(extracted_contents, rubric_text, max_score)
                 result = build_relevance_block_result(rubric_text, max_score, relevance, relevance_gate)
                 result["grading_hash"] = grading_hash
-                result["images_processed"] = int(sum(
+                _blocked_img_total = int(sum(
                     len(getattr(f, "images", []) or [])
                     for f in extracted_contents
                     if hasattr(f, "images")
                 ))
-                result["text_chars_processed"] = len("".join([
+                _blocked_text_total = len("".join([
                     str(getattr(f, "text_content", "") or "") for f in extracted_contents
                 ]))
+                result["images_processed"] = _blocked_img_total
+                result["text_chars_processed"] = _blocked_text_total
+                # Add transparency so Mapping tab can show what was found
+                result["transparency"] = {
+                    "text_chars_sent": 0,
+                    "images_sent": 0,
+                    "images_available_total": _blocked_img_total,
+                    "images_selected_total": 0,
+                    "files_processed": [
+                        {
+                            "filename": getattr(f, "filename", "unknown"),
+                            "type": getattr(f, "file_type", "unknown"),
+                            "text_length": len(getattr(f, "text_content", "") or ""),
+                            "image_count": len(getattr(f, "images", []) or []),
+                        }
+                        for f in extracted_contents
+                        if hasattr(f, "filename")
+                    ],
+                    "images_info": [],
+                    "blocked_by_relevance_gate": True,
+                    "llm_call": {},
+                }
 
                 worker_submission.ai_result = json.dumps(result)
                 worker_submission.ai_score = result.get("total_score", 0)
@@ -290,6 +318,10 @@ class GradingWorker:
                         max_score=max_score,
                         student_files=extracted_contents,
                         questions=questions,
+                        reference_solution=getattr(session, "reference_solution", None) or None,
+                        test_cases=getattr(session, "test_cases", None) or None,
+                        run_command=getattr(session, "run_command", None) or None,
+                        student_dir=str(student_dir) if student_dir else None,
                     )
             else:
                 result = await grade_student(
@@ -299,6 +331,10 @@ class GradingWorker:
                     max_score=max_score,
                     student_files=extracted_contents,
                     questions=questions,
+                    reference_solution=getattr(session, "reference_solution", None) or None,
+                    test_cases=getattr(session, "test_cases", None) or None,
+                    run_command=getattr(session, "run_command", None) or None,
+                    student_dir=str(student_dir) if student_dir else None,
                 )
             
             # Save result
@@ -308,6 +344,12 @@ class GradingWorker:
             worker_submission.ai_confidence = result.get("confidence", "medium")
             worker_submission.status = "graded"
             worker_submission.graded_at = datetime.utcnow()
+            # Store code test results if available
+            _tr = result.get("transparency", {}).get("test_results") or result.get("_test_results")
+            if _tr and isinstance(_tr, dict):
+                worker_submission.test_results = json.dumps(_tr)
+                worker_submission.tests_passed = int(_tr.get("passed", 0))
+                worker_submission.tests_total = int(_tr.get("total", 0))
             if relevance_gate.get("review_required"):
                 worker_submission.is_flagged = True
                 if worker_submission.flagged_by != "user":
@@ -397,24 +439,27 @@ class ParallelGrader:
         max_workers: int = PARALLEL_GRADING_WORKERS,
         rpm: int = RATE_LIMIT_RPM,
         sse_callback: Optional[Callable] = None,  # For SSE broadcast
+        stop_check: Optional[Callable] = None,  # Callable returning True when stop requested
     ):
         self.session_id = session_id
         self.db = db
         self.max_workers = max_workers
         self.rpm = rpm
         self.sse_callback = sse_callback
-        
+        self.stop_check = stop_check
+
         # Shared rate limiter state
         self._rate_lock = threading.Lock()
         self._request_timestamps: list[float] = []
-        
+
         # Set up worker class
         GradingWorker.set_rate_limiter(self._rate_lock, self._request_timestamps)
-        
+
         # Stats
         self.processed = 0
         self.failed = 0
         self.rate_limited = 0
+        self.stopped = False
     
     async def grade_batch_parallel(
         self,
@@ -463,10 +508,19 @@ class ParallelGrader:
         
         while pending and iteration < max_iterations:
             iteration += 1
-            
+
+            # Check stop flag before starting new work
+            if self.stop_check and self.stop_check():
+                logger.info(f"[PARALLEL_GRADER] Stop requested for session {self.session_id}, cancelling {len(in_progress)} in-progress tasks")
+                # Cancel any in-progress tasks
+                for sub_id, (sub, task, worker) in in_progress.items():
+                    task.cancel()
+                self.stopped = True
+                break
+
             # DEBUG: Log iteration status
             logger.info(f"[PARALLEL_GRADER] Iteration {iteration}: {len(pending)} pending, {len(in_progress)} in progress, max_iter={max_iterations}")
-            
+
             # Start as many workers as we have capacity for
             while len(in_progress) < self.max_workers and pending:
                 sub = pending.pop(0)
@@ -512,12 +566,21 @@ class ParallelGrader:
                     task.cancel()
                 break
             
-            # Rebuild in_progress from still_pending
+            # Check stop flag after wait returns
+            if self.stop_check and self.stop_check():
+                logger.info(f"[PARALLEL_GRADER] Stop requested after wait for session {self.session_id}")
+                for task in still_pending:
+                    task.cancel()
+                # Still process completed tasks below so their results are recorded
+                self.stopped = True
+
+            # Rebuild in_progress from still_pending (empty if stopped)
             in_progress = {}
-            for task in still_pending:
-                sub_id, sub, worker = task_to_sub[task]
-                in_progress[sub_id] = (sub, task, worker)
-            
+            if not self.stopped:
+                for task in still_pending:
+                    sub_id, sub, worker = task_to_sub[task]
+                    in_progress[sub_id] = (sub, task, worker)
+
             # Process completed tasks
             for task in done:
                 completed_sub_id, completed_sub, completed_worker = task_to_sub[task]
@@ -560,13 +623,18 @@ class ParallelGrader:
                         retry_queue[completed_sub_id] = retry_count + 1
                     else:
                         self.failed += 1
-        
+
+            # If stopped, break out of the retry/pending loop
+            if self.stopped:
+                break
+
         return {
             "total": len(submissions),
             "processed": self.processed,
             "failed": self.failed,
             "rate_limited": self.rate_limited,
             "results": results,
+            "stopped": self.stopped,
         }
 
 
