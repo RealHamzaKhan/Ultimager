@@ -127,25 +127,35 @@ class _ResponseShim:
 
 
 class RateLimiter:
-    """Sliding-window rate limiter."""
+    """Async-safe sliding-window rate limiter.
+
+    Uses an asyncio.Lock so it never blocks the event loop — multiple
+    coroutines can wait concurrently without serialising all workers.
+    """
 
     def __init__(self, max_requests: int = RATE_LIMIT_RPM, per_seconds: int = 60):
         self.max_requests = max_requests
         self.per_seconds = per_seconds
         self.timestamps: list[float] = []
-        self.lock = threading.Lock()
+        self._lock: Optional[asyncio.Lock] = None  # created lazily in the running loop
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def acquire(self):
-        with self.lock:
-            now = time.time()
-            self.timestamps = [t for t in self.timestamps if now - t < self.per_seconds]
-            if len(self.timestamps) >= self.max_requests:
-                sleep_time = self.per_seconds - (now - self.timestamps[0]) + 0.5
-                self.lock.release()
-                await asyncio.sleep(sleep_time)
-                self.lock.acquire()
-                self.timestamps = [t for t in self.timestamps if time.time() - t < self.per_seconds]
-            self.timestamps.append(time.time())
+        while True:
+            async with self._get_lock():
+                now = time.time()
+                self.timestamps = [t for t in self.timestamps if now - t < self.per_seconds]
+                if len(self.timestamps) < self.max_requests:
+                    self.timestamps.append(now)
+                    return  # Got a slot
+                # Calculate wait time
+                sleep_time = self.per_seconds - (now - self.timestamps[0]) + 0.1
+            # Sleep OUTSIDE the lock so other coroutines can proceed
+            await asyncio.sleep(min(sleep_time, 1.0))
 
 
 _rate_limiter = RateLimiter()
@@ -306,6 +316,7 @@ def _chat_completion(
     max_tokens: int,
     top_p: Optional[float] = None,
     seed: Optional[int] = None,
+    response_format: Optional[dict[str, str]] = None,
 ):
     kwargs: dict[str, Any] = {
         "model": model,
@@ -317,6 +328,8 @@ def _chat_completion(
         kwargs["top_p"] = top_p
     if seed is not None:
         kwargs["seed"] = seed
+    if response_format is not None:
+        kwargs["response_format"] = response_format
 
     chat_template_kwargs = _chat_template_kwargs_for_model(provider_name, model)
     if chat_template_kwargs is not None:
@@ -372,6 +385,7 @@ def _chat_completion_with_failover(
     seed: Optional[int] = None,
     preferred_provider: Optional[str] = None,
     allow_fallback: bool = True,
+    response_format: Optional[dict[str, str]] = None,
 ) -> tuple[Any, dict[str, Any]]:
     candidates = _enabled_provider_candidates(needs_vision=needs_vision)
     attempts: list[dict[str, Any]] = []
@@ -410,45 +424,81 @@ def _chat_completion_with_failover(
                 }],
             )
 
+    # Retryable error types — transient failures that may resolve on their own
+    _RETRYABLE = {"connection_error", "timeout", "rate_limited", "provider_overloaded", "provider_server_error"}
+    MAX_RETRIES = 4          # up to 4 retries per provider (5 total attempts)
+    BASE_BACKOFF = 2.0       # seconds — doubles each retry: 2, 4, 8, 16
+
     for spec, model in candidates:
         provider_key = "nvidia" if spec.name == "nvidia_nim" else spec.name
         client = _get_client(spec)
-        try:
-            response = _chat_completion(
-                client,
-                _spec=spec,
-                purpose=purpose,
-                provider_name=provider_key,
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                top_p=top_p,
-                seed=seed,
-            )
-            return response, {
-                "provider": provider_key,
-                "provider_key": provider_key,
-                "model": model,
-                "attempts_before_success": attempts,
-                "preferred_provider": preferred_key,
-                "fallback_used": bool(preferred_key and provider_key != preferred_key),
-            }
-        except Exception as exc:
-            error_type = _classify_provider_error(exc)
-            _apply_provider_cooldown(provider_key, error_type)
-            status_code = getattr(exc, "status_code", None)
-            attempts.append({
-                "provider": provider_key,
-                "provider_key": provider_key,
-                "model": model,
-                "error_type": error_type,
-                "status_code": status_code,
-                "error": str(exc)[:500],
-            })
-            logger.warning(
-                f"{purpose}: provider {spec.name}/{model} failed with {error_type}: {exc}"
-            )
+
+        for retry_idx in range(MAX_RETRIES + 1):
+            try:
+                response = _chat_completion(
+                    client,
+                    _spec=spec,
+                    purpose=purpose,
+                    provider_name=provider_key,
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    seed=seed,
+                    response_format=response_format,
+                )
+                return response, {
+                    "provider": provider_key,
+                    "provider_key": provider_key,
+                    "model": model,
+                    "attempts_before_success": attempts,
+                    "preferred_provider": preferred_key,
+                    "fallback_used": bool(preferred_key and provider_key != preferred_key),
+                    "retries": retry_idx,
+                }
+            except Exception as exc:
+                error_type = _classify_provider_error(exc)
+                status_code = getattr(exc, "status_code", None)
+                attempts.append({
+                    "provider": provider_key,
+                    "provider_key": provider_key,
+                    "model": model,
+                    "error_type": error_type,
+                    "status_code": status_code,
+                    "error": str(exc)[:500],
+                    "retry": retry_idx,
+                })
+
+                # If retryable and we have retries left, wait and retry same provider
+                if error_type in _RETRYABLE and retry_idx < MAX_RETRIES:
+                    wait = BASE_BACKOFF * (2 ** retry_idx)  # 2, 4, 8, 16s
+                    logger.warning(
+                        f"{purpose}: provider {spec.name}/{model} failed with "
+                        f"{error_type} (attempt {retry_idx + 1}/{MAX_RETRIES + 1}), "
+                        f"retrying in {wait:.0f}s: {exc}"
+                    )
+                    time.sleep(wait)
+                    # Recreate client in case of stale connection
+                    if error_type == "connection_error":
+                        with _provider_state_lock:
+                            # Clear cached client to force fresh connection
+                            keys_to_remove = [
+                                k for k in _provider_clients
+                                if k.startswith(f"{spec.name}|")
+                            ]
+                            for k in keys_to_remove:
+                                _provider_clients.pop(k, None)
+                        client = _get_client(spec)
+                    continue
+
+                # Non-retryable or retries exhausted — apply cooldown and try next provider
+                _apply_provider_cooldown(provider_key, error_type)
+                logger.warning(
+                    f"{purpose}: provider {spec.name}/{model} failed with "
+                    f"{error_type} (exhausted retries): {exc}"
+                )
+                break  # Move to next provider
 
     raise ProviderFailoverError(purpose=purpose, attempts=attempts)
 
@@ -1090,7 +1140,17 @@ def _parse_phase1_response(raw_text: str) -> list[dict]:
             if isinstance(parsed, list):
                 return parsed
             if isinstance(parsed, dict):
-                return parsed.get("questions", [])
+                # Check for {"questions": [...]} wrapper
+                if "questions" in parsed and isinstance(parsed["questions"], list):
+                    return parsed["questions"]
+                # Check if the dict IS a single question (has "id" and "label")
+                if "id" in parsed and "label" in parsed:
+                    return [parsed]
+                # Try other common wrapper keys
+                for key in ("data", "items", "result"):
+                    if key in parsed and isinstance(parsed[key], list):
+                        return parsed[key]
+                return []
         except json.JSONDecodeError:
             pass
 
@@ -1159,13 +1219,15 @@ async def _extract_question_structure(
         "6. Sub-items labeled (i), (ii), (iii) or (a), (b), (c) are PARTS — extract them.\n"
         "7. If description has no clear question structure, return empty questions array.\n"
         "8. Keep descriptions to max 5 words each.\n\n"
-        "Return a JSON array of question objects. Each object has: "
-        'id, label, description, marks, marks_explicit, parts (array of same shape).\n\n'
-        "Example output (NO markdown fences, ONLY the JSON array):\n"
-        '[{"id":"Q1","label":"Q1","description":"BST insert","marks":10,'
+        'Return a JSON object with a "questions" key containing an array of question objects. '
+        "Each question object has: id, label, description, marks, marks_explicit, parts (array of same shape).\n\n"
+        "Example output:\n"
+        '{"questions": [{"id":"Q1","label":"Q1","description":"BST insert","marks":10,'
         '"marks_explicit":true,"parts":[{"id":"Q1a","label":"a",'
-        '"description":"insert method","marks":5,"marks_explicit":true,"parts":[]}]}]\n\n'
-        "Output ONLY the JSON array. No wrapping object. No markdown."
+        '"description":"insert method","marks":5,"marks_explicit":true,"parts":[]}]}, '
+        '{"id":"Q2","label":"Q2","description":"OOP concepts","marks":5,'
+        '"marks_explicit":true,"parts":[]}]}\n\n'
+        "IMPORTANT: Include ALL questions (Q1, Q2, Q3, etc.) in the array. Do NOT return just one question."
     )
 
     user_prompt = (
@@ -1183,17 +1245,22 @@ async def _extract_question_structure(
             ],
             temperature=0.1,
             max_tokens=4000,
+            response_format={"type": "json_object"},
         )
 
         raw_text = response.choices[0].message.content or ""
         finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
         logger.info("Phase 1 finish_reason=%s, len=%d", finish_reason, len(raw_text))
+        logger.info("Phase 1 raw preview: %s", raw_text[:500])
         if finish_reason == "length":
             logger.warning("Phase 1 response truncated — repairing")
             raw_text = _repair_truncated_json(raw_text)
 
         # Parse the response — may be a JSON array or a JSON object
         questions = _parse_phase1_response(raw_text)
+        if not questions:
+            logger.warning("Phase 1 parsing returned 0 questions. Raw text type check: starts_with_brace=%s, starts_with_bracket=%s, first_100=%s",
+                raw_text.strip()[:1] == '{', raw_text.strip()[:1] == '[', repr(raw_text.strip()[:100]))
 
         # Infer has_explicit from parsed questions
         has_explicit = any(
@@ -1460,6 +1527,7 @@ Generate the rubric following the question structure above. Total: exactly {max_
             temperature=0.3,
             top_p=0.5,
             max_tokens=5000,
+            response_format={"type": "json_object"},
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1616,6 +1684,7 @@ For each criterion, the sub-item point breakdown in the description MUST sum to 
             temperature=0.3,
             top_p=0.5,
             max_tokens=5000,
+            response_format={"type": "json_object"},
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1906,10 +1975,17 @@ Is this submission relevant to the assignment?"""
             ],
             temperature=0.0,
             max_tokens=500,
+            response_format={"type": "json_object"},
         )
         
         raw_text = response.choices[0].message.content or ""
-        result = _extract_json(raw_text)
+        try:
+            result = _extract_json(raw_text)
+        except (json.JSONDecodeError, Exception):
+            result = {}
+
+        if not isinstance(result, dict):
+            result = {}
 
         flags = result.get("flags", [])
         flags_norm = []
@@ -2121,32 +2197,66 @@ def build_relevance_block_result(
     }
 
 
-SYSTEM_PROMPT = """You are an expert Computer Science instructor grading student submissions.
+SYSTEM_PROMPT = """You are an expert instructor grading student submissions across any subject or assessment type.
 
 ═══════════════════════════════════════════════════════════════
-ANTI-HALLUCINATION RULES (HIGHEST PRIORITY — VIOLATION = WRONG GRADE):
+RULE 1 — GRADE ONLY WHAT EXISTS (ZERO TOLERANCE FOR FABRICATION):
 ═══════════════════════════════════════════════════════════════
-1. NEVER award points for code or work that is NOT PRESENT in the submission.
-   - If a file is EMPTY (0 chars), score 0 for any criterion that file was supposed to address.
-   - If a function/feature is NOT FOUND in ANY submitted file, score MUST be 0 for that criterion.
-   - "Not directly visible" or "might be implemented" = score 0. Do NOT speculate.
-2. NEVER say "the code attempts to..." when there is no code. Empty files = 0 points.
-3. For EACH criterion, you must identify the SPECIFIC FILE and SPECIFIC CODE that earns points.
-   - If you cannot name the file and quote or describe the actual code, score = 0.
-   - Generic justifications like "implementation is correct" without citing specific code = 0.
-4. A FILE CONTENT MANIFEST is provided below. It lists every file with its actual character count.
-   - Files with 0 chars are EMPTY. Do NOT hallucinate content for empty files.
-   - Files about a DIFFERENT topic than the criterion get 0 for that criterion.
-5. When a file format (.docx, .rtf) may corrupt code formatting (e.g., Python indentation):
-   - Evaluate the LOGIC and ALGORITHM, but note that the code may not execute as-is.
-   - Deduct code quality points (typically 20-30% of criterion) for non-executable code.
+• NEVER award points for work that is NOT PRESENT in the submission.
+• If a file is EMPTY (0 chars), score 0 for anything that file was supposed to address.
+• If the required work is NOT FOUND in ANY submitted file, score MUST be 0.
+• "Might be implemented" or "not directly visible" = score 0. Do NOT speculate.
+• A FILE CONTENT MANIFEST is provided. Files with 0 chars are EMPTY — do NOT invent content.
+
+═══════════════════════════════════════════════════════════════
+RULE 2 — QUOTE, NEVER PARAPHRASE:
+═══════════════════════════════════════════════════════════════
+In your justification for EVERY criterion you MUST:
+  1. Name the SPECIFIC FILE where you found evidence.
+  2. QUOTE the student's ACTUAL words, code, or answer verbatim.
+     Do NOT rewrite, correct, or improve what the student wrote.
+     If they wrote broken/incorrect content, quote it exactly as-is.
+  3. If you cannot quote real content from a file → score = 0 for that criterion.
+
+═══════════════════════════════════════════════════════════════
+RULE 3 — FAIR PARTIAL CREDIT:
+═══════════════════════════════════════════════════════════════
+Award partial credit based on the quality of what the student ACTUALLY submitted:
+  • Correct and complete answer           → 100% of points
+  • Mostly correct with minor errors      → 60-80% of points
+  • Right approach / understanding shown but significant errors → 30-50% of points
+  • Minimal attempt or mostly wrong       → 10-20% of points
+  • No attempt or completely irrelevant   → 0%
+
+For CODE specifically:
+  • Code that runs correctly → full credit.
+  • Code with correct logic but minor syntax errors → 50-70%.
+  • Code with right approach but broken/non-executable → 20-40%.
+  • Only boilerplate/data definitions with no actual solution → 0-10%.
+
+For WRITTEN/THEORY answers:
+  • Factually correct and well-explained → full credit.
+  • Partially correct (some right, some wrong) → proportional credit.
+  • Factually incorrect answer → 0%, regardless of how confidently written.
+
+═══════════════════════════════════════════════════════════════
+RULE 4 — HANDLE ANY ASSESSMENT TYPE:
+═══════════════════════════════════════════════════════════════
+Adapt your grading to whatever subject or format is presented:
+  • Programming assignments → evaluate correctness, logic, syntax, output.
+  • Essays / written responses → evaluate argument quality, evidence, structure.
+  • Math / problem-solving → evaluate method, steps, final answer.
+  • Diagrams / visual work → evaluate completeness, accuracy, labeling.
+  • Mixed assessments → apply the appropriate standard per question.
+  • File format issues (.docx, .rtf corrupting indentation) → evaluate logic,
+    but note the formatting issue and apply a small deduction (20-30%).
 
 CRITICAL INSTRUCTIONS FOR IMAGE ANALYSIS:
-1. Carefully analyze ALL provided images, including handwritten notes, diagrams, and screenshots.
+1. Carefully analyze ALL provided images including handwritten notes, diagrams, screenshots.
 2. If OCR text is incomplete, rely on visual evidence from the images.
 3. Grade based on BOTH extracted text and visual evidence.
 4. Mention concrete visual evidence when awarding points.
-5. Do NOT mark a submission blank if at least one image shows meaningful work.
+5. Do NOT mark a submission blank if images show meaningful work.
 
 DETERMINISM PROTOCOL:
 1. For the same evidence and rubric, return the same scores.
@@ -2155,12 +2265,12 @@ DETERMINISM PROTOCOL:
 4. Do not inflate scores for assumed work; grade only verifiable content.
 
 GRADING RULES:
-1. Grade ONLY what is visible or explicitly present in text.
-2. rubric_breakdown criteria names MUST match the provided rubric criteria exactly.
+1. Grade ONLY what is visible or explicitly present.
+2. rubric_breakdown criteria names MUST match the provided rubric criteria EXACTLY.
 3. "max" MUST match rubric max values exactly.
 4. Sum of rubric scores MUST equal total_score.
 5. total_score MUST be within [0, max_score].
-6. Every rubric item must include a justification that names the SPECIFIC FILE and evidence.
+6. Every rubric item MUST include a justification citing the specific file and quoting real content.
 7. If the rubric has a GRADING GUIDE with sub-items, evaluate EACH sub-item independently.
    Award points only for sub-items where you can cite specific evidence.
 
@@ -2171,7 +2281,7 @@ RESPONSE FORMAT - return ONLY valid JSON:
       "criterion": "<EXACT name from rubric>",
       "score": <number>,
       "max": <exact max from rubric>,
-      "justification": "<MUST cite specific file name and describe the actual code/content found>",
+      "justification": "<MUST quote actual student content from a specific file>",
       "citations": [
         {"type": "image", "image_id": "img_0001"},
         {"type": "text", "snippet_id": "txt_0001"}
@@ -2892,6 +3002,7 @@ async def _consolidate_vision_notes(batch_notes: list[dict[str, Any]]) -> tuple[
             top_p=0.1,
             max_tokens=1200,
             seed=42,
+            response_format={"type": "json_object"},
         )
         trace["provider"] = meta.get("provider", "")
         trace["model"] = meta.get("model", "")
@@ -3650,10 +3761,17 @@ def _build_criterion_evidence_plan(
     if len(prompt_block) > 11000:
         prompt_block = prompt_block[:11000] + "\n...[TRUNCATED CANDIDATE LIST]"
 
+    # Build snippet lookup: snippet_id -> {filename, text}
+    snippet_lookup = {
+        snip["snippet_id"]: {"filename": snip.get("filename", ""), "text": snip.get("text", "")}
+        for snip in snippets
+    }
+
     return {
         "prompt_block": prompt_block,
         "candidate_map": candidate_map,
         "text_snippets_indexed": len(snippets),
+        "snippet_lookup": snippet_lookup,
     }
 
 
@@ -4006,6 +4124,7 @@ async def _verify_citations_with_llm(
             seed=42,
             preferred_provider=preferred_provider,
             allow_fallback=bool(SCORING_ALLOW_FALLBACK),
+            response_format={"type": "json_object"},
         )
         trace["provider"] = str(meta.get("provider", ""))
         trace["model"] = str(meta.get("model", ""))
@@ -4127,29 +4246,36 @@ async def _verify_scores_with_llm(
     evidence_capped = text_evidence[:60000] if text_evidence else "(no text evidence)"
 
     system_prompt = (
-        "You are a STRICT SCORE VERIFICATION AUDITOR. Your primary job is to catch "
-        "HALLUCINATED SCORES — where the grader awarded points for work that does NOT "
+        "You are a CAREFUL SCORE VERIFICATION AUDITOR. Your job is to catch "
+        "HALLUCINATED SCORES — where the grader awarded points for work that TRULY does NOT "
         "exist in the student's submission.\n\n"
-        "FOR EACH CRITERION, you must:\n"
-        "1. SEARCH the student evidence for the SPECIFIC code/content that justifies the score.\n"
-        "2. If the grader's justification mentions code or features, VERIFY those actually "
-        "   exist in the evidence text. If they don't exist, the score MUST be lowered to 0.\n"
-        "3. If the grader says 'not directly visible' or 'might be implemented' but still "
-        "   awards points > 0, this is a HALLUCINATION — set verified_score to 0.\n"
-        "4. If the evidence shows the code/content exists but has bugs, keep partial credit.\n"
-        "5. If a file is EMPTY (0 chars) and the grader awarded points for it, set score to 0.\n\n"
-        "HALLUCINATION DETECTION CHECKLIST:\n"
-        "- Does the grader cite a specific file? Is that file actually in the evidence?\n"
-        "- Does the grader describe specific code logic? Can you find that logic in the evidence?\n"
-        "- Does the grader say 'attempts to' or 'partially implements'? Is there actual code?\n"
-        "- If no code exists for a criterion anywhere in the evidence, verified_score MUST be 0.\n\n"
+        "CRITICAL RULES — READ CAREFULLY:\n"
+        "1. SEARCH the student evidence for code/content that addresses each criterion.\n"
+        "2. MINOR ISSUES ARE NOT HALLUCINATIONS. Typos in function/variable names, "
+        "   slight naming mismatches (e.g. 'calculate_choas_score' vs 'calculate_chaos_score'), "
+        "   or different coding styles that achieve the same result are NOT reasons to set score to 0.\n"
+        "3. FUNCTIONAL EQUIVALENCE matters. If the student's code DOES the right thing but names "
+        "   it differently, has a typo, or uses a different approach, the work EXISTS. Keep the score.\n"
+        "4. Only set verified_score=0 when there is genuinely NO code/content AT ALL for that criterion. "
+        "   Not 'slightly wrong code' — ZERO code.\n"
+        "5. If the grader says 'not directly visible' or 'might be implemented' but you CAN find "
+        "   relevant code in the evidence, keep the score.\n"
+        "6. If the evidence shows code with bugs/errors, keep partial credit (do NOT zero it).\n"
+        "7. If a file is EMPTY (0 chars) and the grader awarded points, set score to 0.\n\n"
+        "HALLUCINATION = grader invented code that doesn't exist AT ALL. NOT:\n"
+        "- Code with typos or naming differences\n"
+        "- Code that's partially correct\n"
+        "- Code using a different approach than expected\n"
+        "- Code with bugs but correct intent\n\n"
         "Return JSON:\n"
         '{"verifications": [{"criterion": "...", "original_score": 8, '
-        '"verified_score": 0, "adjustment_reason": "No code found for this criterion in any file", '
+        '"verified_score": 8, "adjustment_reason": "Code exists and addresses criterion", '
         '"confidence": "high"|"medium"|"low", '
         '"evidence_found": true|false}]}\n\n'
-        "Set evidence_found=false when NO code/content for that criterion exists in the submission.\n"
-        "When evidence_found=false, verified_score MUST be 0 and confidence MUST be 'high'."
+        "Set evidence_found=false ONLY when absolutely NO code/content for that criterion exists.\n"
+        "When evidence_found=false, verified_score MUST be 0 and confidence MUST be 'high'.\n"
+        "When in doubt, KEEP the original score. False negatives (zeroing real work) are WORSE "
+        "than false positives (keeping a slightly high score)."
     )
 
     user_prompt = (
@@ -4174,6 +4300,7 @@ async def _verify_scores_with_llm(
             max_tokens=1500,
             seed=42,
             preferred_provider=preferred_provider,
+            response_format={"type": "json_object"},
         )
         trace["provider"] = meta.get("provider", "")
         trace["model"] = meta.get("model", "")
@@ -4187,6 +4314,201 @@ async def _verify_scores_with_llm(
         logger.warning("Score verification failed: %s", exc)
 
     return trace
+
+
+def _verify_justifications_against_content(
+    rubric_breakdown: list[dict[str, Any]],
+    text_content: str,
+    max_score: int,
+) -> dict[str, Any]:
+    """Verify that LLM justifications reference content actually present in submissions.
+
+    Two-pronged approach:
+    1. GLOBAL CHECK: Count actual meaningful code lines vs criteria scoring > 0.
+       If a student has very few code lines but many high-scoring criteria, it's bulk hallucination.
+    2. PER-CRITERION CHECK: Extract the full "relevant code snippet" claim from each
+       justification and verify it exists as a contiguous block in the student content.
+
+    This is a deterministic, fast check — NO additional LLM call.
+    """
+    stats: dict[str, Any] = {
+        "checked": 0,
+        "suspicious": 0,
+        "adjustments": 0,
+        "details": [],
+    }
+    if not rubric_breakdown or not text_content:
+        return stats
+
+    # ── Normalize helper ──
+    def _norm(s: str) -> str:
+        return re.sub(r'\s+', ' ', s.lower().strip())
+
+    content_norm = _norm(text_content)
+
+    # ── Count meaningful code lines in student submission ──
+    # Exclude: blank lines, comments, pure data definitions (list/dict literals),
+    # import statements. Keep: assignments with logic, function defs, loops, prints, returns
+    _DATA_LINE = re.compile(
+        r'^\s*[\[\{"\']|'           # starts with [ { " '  (data literal)
+        r'^\s*\},?\s*$|'            # closing brace
+        r'^\s*\],?\s*$|'            # closing bracket
+        r'^\s*#|'                   # comment
+        r'^\s*import\s|'            # import
+        r'^\s*from\s.*import\s|'    # from...import
+        r'^\s*$'                    # blank
+    )
+    _CODE_KEYWORDS = re.compile(
+        r'\b(def |class |for |while |if |elif |else:|return |print|'
+        r'append|range|len|sorted|max|min|sum|np\.|\.upper|\.lower|'
+        r'\.get|\.items|\.keys|\.values|\.append|deque|enumerate)\b|'
+        r'[a-zA-Z_]\w*\s*=\s*[^=]'  # assignment
+    )
+
+    content_lines = text_content.split('\n')
+    meaningful_code_lines = 0
+    for line in content_lines:
+        stripped = line.strip()
+        if not stripped or len(stripped) < 5:
+            continue
+        if _DATA_LINE.match(stripped):
+            continue
+        if _CODE_KEYWORDS.search(stripped):
+            meaningful_code_lines += 1
+
+    # Count criteria with score > 0
+    criteria_with_score = sum(
+        1 for item in rubric_breakdown
+        if float(item.get("score", 0)) > 0
+    )
+    total_scored_points = sum(
+        float(item.get("score", 0))
+        for item in rubric_breakdown
+        if float(item.get("score", 0)) > 0
+    )
+
+    stats["meaningful_code_lines"] = meaningful_code_lines
+    stats["criteria_with_score"] = criteria_with_score
+
+    # ── GLOBAL SANITY CHECK ──
+    # If student has very few code lines but many scoring criteria,
+    # apply a global reduction factor
+    global_reduction = 1.0  # no reduction by default
+    if meaningful_code_lines <= 3 and criteria_with_score > 5:
+        # Almost no code but many scores → extreme hallucination
+        global_reduction = 0.3
+        stats["global_reduction_reason"] = (
+            f"Only {meaningful_code_lines} meaningful code lines but "
+            f"{criteria_with_score} criteria scored > 0"
+        )
+    elif meaningful_code_lines <= 8 and criteria_with_score > 10:
+        # Very little code for many criteria
+        global_reduction = 0.5
+        stats["global_reduction_reason"] = (
+            f"Only {meaningful_code_lines} meaningful code lines but "
+            f"{criteria_with_score} criteria scored > 0"
+        )
+    elif meaningful_code_lines <= 15 and criteria_with_score > 18:
+        global_reduction = 0.7
+        stats["global_reduction_reason"] = (
+            f"Only {meaningful_code_lines} meaningful code lines for "
+            f"{criteria_with_score} scoring criteria"
+        )
+
+    # ── PER-CRITERION VERIFICATION ──
+    for item in rubric_breakdown:
+        score = float(item.get("score", 0))
+        if score <= 0:
+            continue
+
+        stats["checked"] += 1
+        criterion = str(item.get("criterion", ""))
+        justification = str(item.get("justification", ""))
+        max_pts = float(item.get("max", 1))
+
+        if not justification or len(justification) < 20:
+            continue
+
+        # ── Extract the FULL cited code block from justification ──
+        # LLM format: "The relevant code snippet is: '<FULL CODE HERE>'. Evidence:"
+        # or: "The relevant code snippet is: '<CODE>' and '<CODE>'. Evidence:"
+        full_claim = ""
+        claim_match = re.search(
+            r'(?:relevant|actual|key|specific)\s+(?:code|text)\s+snippet\s+is:\s*(.+?)(?:\.\s*Evidence:|$)',
+            justification,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if claim_match:
+            full_claim = claim_match.group(1).strip()
+
+        if not full_claim:
+            # Try alternative: just the part after "snippet is:" until end
+            claim_match2 = re.search(
+                r'snippet\s+is:\s*(.+?)$',
+                justification,
+                re.IGNORECASE,
+            )
+            if claim_match2:
+                full_claim = claim_match2.group(1).strip()
+
+        if full_claim and len(full_claim) >= 10:
+            # Verify the claimed code exists in student content
+            claim_norm = _norm(full_claim)
+            # Remove surrounding quotes
+            claim_norm = claim_norm.strip("'\"` ")
+
+            # Check: does ANY 20-char contiguous substring of the claim exist in content?
+            claim_found = False
+            check_len = min(20, len(claim_norm) - 1)
+            if check_len >= 10:
+                for start in range(0, len(claim_norm) - check_len + 1, 3):
+                    chunk = claim_norm[start:start + check_len]
+                    # Skip chunks that are mostly common words/punctuation
+                    if chunk in content_norm:
+                        claim_found = True
+                        break
+
+            if not claim_found:
+                stats["suspicious"] += 1
+                # The LLM cited specific code that doesn't exist
+                new_score = round(max(0, score * 0.15), 1)  # Reduce to ~15%
+                stats["details"].append({
+                    "criterion": criterion,
+                    "original_score": score,
+                    "new_score": new_score,
+                    "reason": "cited_code_not_found",
+                    "claim_preview": full_claim[:80],
+                })
+                item["score"] = new_score
+                item["justification"] = (
+                    item.get("justification", "") +
+                    f" [⚠ Cited code not found in submission. Score: {score} → {new_score}]"
+                )[:600]
+                stats["adjustments"] += 1
+                logger.warning(
+                    f"Hallucination: '{criterion}' cited code not in submission, "
+                    f"score {score} -> {new_score}"
+                )
+                continue
+
+        # ── Apply global reduction if triggered ──
+        if global_reduction < 1.0:
+            new_score = round(max(0, score * global_reduction), 1)
+            if new_score < score:
+                stats["details"].append({
+                    "criterion": criterion,
+                    "original_score": score,
+                    "new_score": new_score,
+                    "reason": "global_code_deficit",
+                })
+                item["score"] = new_score
+                item["justification"] = (
+                    item.get("justification", "") +
+                    f" [⚠ Insufficient code evidence in submission. Score: {score} → {new_score}]"
+                )[:600]
+                stats["adjustments"] += 1
+
+    return stats
 
 
 def _apply_score_verification(
@@ -4249,12 +4571,12 @@ def _apply_score_verification(
             stats["details"].append(detail)
             continue
 
-        if confidence == "low" and delta < 3:
+        if confidence == "low":
             stats["skipped_low_confidence"] += 1
-            detail["skip_reason"] = f"low confidence, delta {delta:.1f} < 3"
-        elif confidence == "medium" and delta < 1:
+            detail["skip_reason"] = f"low confidence — never apply low-confidence adjustments"
+        elif confidence == "medium" and delta < 2:
             stats["kept"] += 1
-            detail["skip_reason"] = f"medium confidence, delta {delta:.1f} < 1"
+            detail["skip_reason"] = f"medium confidence, delta {delta:.1f} < 2"
         elif delta > 0:
             # Apply the adjustment (cap at max)
             item["score"] = min(verified, float(item.get("max", 100)))
@@ -4361,6 +4683,7 @@ async def _repair_grading_json(
             seed=42,
             preferred_provider=preferred_provider,
             allow_fallback=bool(SCORING_ALLOW_FALLBACK),
+            response_format={"type": "json_object"},
         )
         repaired_raw = (response.choices[0].message.content or "").strip()
         repaired = _extract_json(repaired_raw)
@@ -4369,29 +4692,79 @@ async def _repair_grading_json(
         return None
 
 
+def _normalize_criterion_key(name: str) -> str:
+    """Normalize a criterion name for matching: lowercase, strip punctuation/whitespace."""
+    s = name.lower().strip()
+    # Remove common prefixes like "[1]", "1.", "Q1a(i) -"
+    s = re.sub(r'^\[\d+\]\s*', '', s)
+    # Collapse whitespace
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+
+def _criterion_similarity(a: str, b: str) -> float:
+    """Score similarity between two criterion names (0.0 to 1.0).
+
+    Uses token overlap (Jaccard) + question-ID prefix matching for robustness
+    against LLM rewording.
+    """
+    # Extract question IDs like Q1a(i), Q2b, etc.
+    qid_pattern = re.compile(r'[Qq]\d+[a-z]?(?:\([ivx]+\))?')
+    a_qids = set(qid_pattern.findall(a))
+    b_qids = set(qid_pattern.findall(b))
+
+    # If both have question IDs and they match, strong signal
+    if a_qids and b_qids:
+        if a_qids == b_qids:
+            return 0.95  # Very likely the same criterion
+        if a_qids & b_qids:
+            return 0.7  # Partial overlap
+
+    # Token-based Jaccard similarity
+    a_tokens = set(re.findall(r'\w+', a.lower()))
+    b_tokens = set(re.findall(r'\w+', b.lower()))
+    if not a_tokens or not b_tokens:
+        return 0.0
+    intersection = a_tokens & b_tokens
+    union = a_tokens | b_tokens
+    jaccard = len(intersection) / len(union)
+
+    # Bonus for substring containment
+    if a.lower() in b.lower() or b.lower() in a.lower():
+        jaccard = max(jaccard, 0.8)
+
+    return jaccard
+
+
 def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) -> dict:
     """Validate and fix the grading result."""
-    
+
     rubric_map = {c['criterion'].lower().strip(): c for c in rubric_criteria}
-    
+
     ai_breakdown = result.get("rubric_breakdown", [])
+    if not isinstance(ai_breakdown, list):
+        ai_breakdown = []
     fixed_breakdown = []
     used_keys = set()
-    
+
     for item in ai_breakdown:
+        if not isinstance(item, dict):
+            continue
         ai_criterion = str(item.get("criterion", "")).strip()
         ai_key = ai_criterion.lower()
-        
+
         if not ai_criterion:
             continue
-        
+
         matched_key = None
         matched_data = None
-        
+
+        # Strategy 1: Exact match
         if ai_key in rubric_map and ai_key not in used_keys:
             matched_key = ai_key
             matched_data = rubric_map[ai_key]
-        
+
+        # Strategy 2: Substring containment
         if not matched_data:
             for rubric_key, rubric_data in rubric_map.items():
                 if rubric_key not in used_keys:
@@ -4399,6 +4772,25 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
                         matched_key = rubric_key
                         matched_data = rubric_data
                         break
+
+        # Strategy 3: Similarity-based matching (handles LLM rewording)
+        if not matched_data:
+            best_score = 0.0
+            best_key = None
+            best_data = None
+            ai_norm = _normalize_criterion_key(ai_criterion)
+            for rubric_key, rubric_data in rubric_map.items():
+                if rubric_key not in used_keys:
+                    rubric_norm = _normalize_criterion_key(rubric_data['criterion'])
+                    sim = _criterion_similarity(ai_norm, rubric_norm)
+                    if sim > best_score:
+                        best_score = sim
+                        best_key = rubric_key
+                        best_data = rubric_data
+            # Require at least 0.5 similarity to avoid false matches
+            if best_score >= 0.5 and best_key and best_data:
+                matched_key = best_key
+                matched_data = best_data
         
         if matched_data and matched_key:
             try:
@@ -4486,12 +4878,32 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
     }
 
 
-def _extract_json(raw_text: str) -> dict:
+def _is_grading_result(obj: dict) -> bool:
+    """Check if a parsed JSON object looks like a grading result (not a random fragment)."""
+    if not isinstance(obj, dict):
+        return False
+    # A valid grading result should have rubric_breakdown or total_score
+    if "rubric_breakdown" in obj:
+        return True
+    if "total_score" in obj:
+        return True
+    # Also accept objects with criterion/score (single rubric item from LLM)
+    if "criterion" in obj and "score" in obj:
+        return True
+    return False
+
+
+def _extract_json(raw_text: str, *, require_grading_result: bool = False) -> dict:
     """Extract JSON from LLM response with robust multi-strategy parsing.
 
     D3 FIX: tries multiple repair strategies before giving up, avoiding the
     expensive fallback API call for JSON repair in most cases.
+
+    When *require_grading_result* is True, validates that extracted JSON looks
+    like a grading result (has rubric_breakdown/total_score) to avoid returning
+    random JSON fragments (e.g., citation objects) from markdown responses.
     """
+    _validate = (lambda obj: _is_grading_result(obj)) if require_grading_result else (lambda obj: True)
     raw_text = raw_text.strip()
 
     # Strip markdown code fences
@@ -4505,7 +4917,9 @@ def _extract_json(raw_text: str) -> dict:
 
     # Strategy 1: direct parse
     try:
-        return json.loads(raw_text)
+        result = json.loads(raw_text)
+        if isinstance(result, dict) and _validate(result):
+            return result
     except json.JSONDecodeError:
         pass
 
@@ -4513,7 +4927,9 @@ def _extract_json(raw_text: str) -> dict:
     match = re.search(r'\{[\s\S]*\}', raw_text)
     if match:
         try:
-            return json.loads(match.group())
+            result = json.loads(match.group())
+            if isinstance(result, dict) and _is_grading_result(result):
+                return result
         except json.JSONDecodeError:
             pass
 
@@ -4529,7 +4945,9 @@ def _extract_json(raw_text: str) -> dict:
     # Replace single-quoted keys/values (conservative: only when preceded by { , or [)
     cleaned = re.sub(r"(?<=[{\[,:])\s*'([^']*?)'\s*", r' "\1" ', cleaned)
     try:
-        return json.loads(cleaned)
+        result = json.loads(cleaned)
+        if isinstance(result, dict) and _validate(result):
+            return result
     except json.JSONDecodeError:
         pass
 
@@ -4537,11 +4955,15 @@ def _extract_json(raw_text: str) -> dict:
     json_block = re.search(r'```json\s*([\s\S]*?)```', raw_text)
     if json_block:
         try:
-            return json.loads(json_block.group(1).strip())
+            result = json.loads(json_block.group(1).strip())
+            if isinstance(result, dict) and _is_grading_result(result):
+                return result
         except json.JSONDecodeError:
             pass
 
     # Strategy 5: bracket-balanced extraction (handles nested objects)
+    # Try LARGEST objects first (most likely to be the full grading result)
+    candidates_found: list[dict] = []
     depth = 0
     start_idx = None
     for i, ch in enumerate(raw_text):
@@ -4555,12 +4977,273 @@ def _extract_json(raw_text: str) -> dict:
                 candidate = raw_text[start_idx:i + 1]
                 candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
                 try:
-                    return json.loads(candidate)
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and _is_grading_result(parsed):
+                        return parsed
+                    candidates_found.append(parsed)
                 except json.JSONDecodeError:
                     pass
                 start_idx = None
 
     raise json.JSONDecodeError("Could not parse JSON", raw_text[:200], 0)
+
+
+def _parse_markdown_grading_response(
+    raw_text: str,
+    rubric_criteria: list[dict[str, Any]],
+    max_score: int,
+) -> Optional[dict[str, Any]]:
+    """Parse a markdown-formatted grading response into structured JSON.
+
+    Handles multiple LLM markdown formats:
+
+    Format A (score on header):
+        1. **Q1a(i) - Count messages per sender**: 0.5 points
+           - Justification: ...
+
+    Format B (max on header, score on sub-line):
+        1. **[1] Q1a(i) - Count messages per sender: 1.0 points**
+           - Score: 0.0
+           - Justification: ...
+
+    Format C (score/max on header):
+        1. Q1a(i) - Count messages per sender: 0.5/1.0
+
+    The key insight: if a sub-line "Score: X" exists, use that as the actual
+    score (the header number is the max). Otherwise, use the header number.
+    """
+    if not raw_text or not raw_text.strip():
+        return None
+
+    text = raw_text.strip()
+
+    # ── Extract LLM's stated total (used for sanity check) ──
+    llm_total = None
+    total_match = re.search(
+        r'(?:total\s+score|overall\s+score)[:\s]*(\d+(?:\.\d+)?)\s*(?:/\s*\d+)?',
+        text,
+        re.IGNORECASE,
+    )
+    if total_match:
+        try:
+            llm_total = float(total_match.group(1))
+        except ValueError:
+            pass
+
+    # ── Split into criterion blocks ──
+    # A criterion header is a numbered line with a recognizable question pattern
+    # or bold text followed by a score-like number.
+    header_pattern = re.compile(
+        r'^'
+        r'\s*(?:\d+[\.\)]\s*)?'              # optional numbering: "1. " or "1) "
+        r'(?:\*{1,2})?'                       # optional opening bold
+        r'(?:\[\d+\]\s*)?'                    # optional [1]
+        r'(.+?)'                              # criterion name (captured)
+        r'(?:\*{1,2})?'                       # optional closing bold
+        r'\s*$',
+    )
+
+    # Score on the header line itself: "criterion: 0.5 points" or "criterion: 0.5/1.0"
+    header_score_pattern = re.compile(
+        r'[:\-–]\s*(\d+(?:\.\d+)?)\s*'
+        r'(?:/\s*(\d+(?:\.\d+)?)\s*)?'       # optional /max
+        r'(?:points?|pts?|marks?)?\s*'
+        r'(?:\*{0,2})\s*$',
+        re.IGNORECASE,
+    )
+
+    # Sub-line patterns for explicit "Score: X"
+    score_line_pattern = re.compile(
+        r'^\s*[-•*]?\s*(?:score|awarded|earned|given)\s*:\s*(\d+(?:\.\d+)?)',
+        re.IGNORECASE,
+    )
+
+    # Sub-line for justification
+    justification_line_pattern = re.compile(
+        r'^\s*[-•*]?\s*(?:justification|feedback|reason(?:ing)?|explanation|comments?)\s*:\s*(.+)',
+        re.IGNORECASE,
+    )
+
+    lines = text.split('\n')
+    blocks: list[dict[str, Any]] = []
+    current_block: Optional[dict[str, Any]] = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Skip section headers like "### Grading Report", "#### Total Score: ..."
+        if stripped.startswith('#'):
+            continue
+
+        # Skip empty lines
+        if not stripped:
+            continue
+
+        # Check if this line is a criterion header
+        # Criterion headers typically have a number prefix AND contain a score/max
+        is_header = False
+        header_name = None
+        header_number = None
+        header_max_number = None
+
+        # Try to match a numbered line with a score
+        numbered_match = re.match(
+            r'^\s*(\d+)[\.\)]\s*(.+)', stripped
+        )
+        if numbered_match:
+            rest = numbered_match.group(2)
+            score_match = header_score_pattern.search(rest)
+            if score_match:
+                is_header = True
+                # Extract name: everything before the score pattern
+                name_part = header_score_pattern.sub('', rest).strip()
+                # Clean bold markers
+                name_part = re.sub(r'^\*{1,2}|\*{1,2}$', '', name_part).strip()
+                name_part = re.sub(r'^\[\d+\]\s*', '', name_part).strip()
+                # Remove trailing colon/dash
+                name_part = re.sub(r'[:\-–]\s*$', '', name_part).strip()
+                header_name = name_part
+                try:
+                    header_number = float(score_match.group(1))
+                except ValueError:
+                    header_number = 0
+                if score_match.group(2):
+                    try:
+                        header_max_number = float(score_match.group(2))
+                    except ValueError:
+                        pass
+
+        if is_header and header_name:
+            # Save previous block
+            if current_block is not None:
+                blocks.append(current_block)
+
+            current_block = {
+                "name": header_name,
+                "header_number": header_number,
+                "header_max": header_max_number,
+                "explicit_score": None,  # from "Score: X" sub-line
+                "justification_parts": [],
+            }
+        elif current_block is not None:
+            # Check for explicit "Score: X" line
+            sm = score_line_pattern.match(stripped)
+            if sm:
+                try:
+                    current_block["explicit_score"] = float(sm.group(1))
+                except ValueError:
+                    pass
+                continue
+
+            # Check for explicit "Justification: ..." line
+            jm = justification_line_pattern.match(stripped)
+            if jm:
+                current_block["justification_parts"].append(jm.group(1).strip())
+                continue
+
+            # Otherwise, collect as justification (skip citation lines)
+            clean = re.sub(r'^\s*[-•*]\s*', '', stripped)
+            if clean and not clean.startswith('Citations:') and not clean.startswith('[{'):
+                current_block["justification_parts"].append(clean)
+
+    # Save last block
+    if current_block is not None:
+        blocks.append(current_block)
+
+    if not blocks:
+        return None
+
+    # ── Determine actual score for each block ──
+    extracted_items = []
+    for block in blocks:
+        name = block["name"]
+        header_num = block["header_number"] or 0
+        header_max = block["header_max"]
+        explicit_score = block["explicit_score"]
+
+        # Decision logic for which number is the score:
+        if explicit_score is not None:
+            # "Score: X" sub-line exists → use it (header_num was the max)
+            score = explicit_score
+        elif header_max is not None:
+            # Format "0.5/1.0" → header_num is score, header_max is max
+            score = header_num
+        else:
+            # Only one number on header → it's the score
+            score = header_num
+
+        justification = ' '.join(block["justification_parts"]).strip()
+        extracted_items.append({
+            "criterion": name,
+            "score": score,
+            "justification": justification[:500],
+        })
+
+    logger.info(
+        f"Markdown parser extracted {len(extracted_items)} criteria from non-JSON response"
+    )
+
+    # ── Sanity check: compare parsed total vs LLM's stated total ──
+    parsed_total = sum(item["score"] for item in extracted_items)
+    if llm_total is not None and abs(parsed_total - llm_total) > max_score * 0.15:
+        logger.warning(
+            f"Markdown parser total ({parsed_total}) differs significantly from "
+            f"LLM stated total ({llm_total}). Using LLM total as reference and "
+            f"scaling scores."
+        )
+        # Scale individual scores to match LLM's stated total
+        if parsed_total > 0:
+            scale = llm_total / parsed_total
+            for item in extracted_items:
+                item["score"] = round(item["score"] * scale, 1)
+            parsed_total = sum(item["score"] for item in extracted_items)
+
+    # Build result in the standard format
+    result = {
+        "rubric_breakdown": [
+            {
+                "criterion": item["criterion"],
+                "score": item["score"],
+                "max": 0,  # will be filled by _validate_result
+                "justification": item.get("justification", "")[:500],
+            }
+            for item in extracted_items
+        ],
+        "total_score": parsed_total,
+        "overall_feedback": "",
+        "strengths": [],
+        "weaknesses": [],
+        "confidence": "medium",
+        "confidence_reasoning": "Parsed from markdown response (non-JSON LLM output)",
+    }
+
+    # Extract overall feedback if present
+    feedback_match = re.search(
+        r'(?:overall\s+feedback|summary|general\s+comments?)[:\s]*(.+?)(?:\n#{2,}|\n\d+\.\s|\Z)',
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if feedback_match:
+        result["overall_feedback"] = feedback_match.group(1).strip()[:500]
+
+    # Validate against rubric to fix criterion names and clamp scores
+    validated = _validate_result(result, rubric_criteria, max_score)
+
+    # Final sanity check: if validated total is wildly different from LLM total, flag it
+    if llm_total is not None:
+        validated_total = validated.get("total_score", 0)
+        if abs(validated_total - llm_total) > max_score * 0.3:
+            logger.warning(
+                f"Post-validation total ({validated_total}) still differs greatly from "
+                f"LLM stated total ({llm_total}). Adjusting confidence to low."
+            )
+            validated["confidence"] = "low"
+            validated["confidence_reasoning"] = (
+                f"Markdown parsing produced total {validated_total} but LLM stated {llm_total}. "
+                f"Results may be unreliable."
+            )
+
+    return validated
 
 
 def compute_grading_hash(student_files: list, rubric: str, max_score: int) -> str:
@@ -5072,11 +5755,12 @@ async def _single_pass_grade(
         seed=42,
         preferred_provider=scoring_primary,
         allow_fallback=scoring_allow_fallback,
+        response_format={"type": "json_object"},
     )
 
     raw_text = response.choices[0].message.content or ""
     try:
-        result = _extract_json(raw_text)
+        result = _extract_json(raw_text, require_grading_result=True)
         validated = _validate_result(result, rubric_criteria, max_score)
     except json.JSONDecodeError:
         repaired = await _repair_grading_json(raw_text, rubric_criteria, max_score, scoring_primary)
@@ -5564,6 +6248,7 @@ async def grade_student(
                 seed=42,
                 preferred_provider=scoring_primary,
                 allow_fallback=scoring_allow_fallback,
+                response_format={"type": "json_object"},
             )
             grading_model = str(call_meta.get("model") or "")
             provider_key = str(call_meta.get("provider_key") or "")
@@ -5581,42 +6266,83 @@ async def grade_student(
             usage = getattr(response, "usage", None)
             transparency["llm_call"]["response_preview"] = raw_text[:400]
 
+            # Handle empty responses (LLM returned nothing)
+            if not raw_text.strip():
+                logger.warning(f"LLM returned empty response on attempt {attempt + 1}/3")
+                transparency["llm_call"]["empty_response"] = True
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                    continue  # Retry with fresh call
+                # On final attempt, create error result instead of crashing
+                raise json.JSONDecodeError("LLM returned empty response", raw_text, 0)
+
             try:
-                result = _extract_json(raw_text)
+                result = _extract_json(raw_text, require_grading_result=True)
                 validated = _validate_result(result, rubric_criteria, max_score)
             except json.JSONDecodeError:
+                # Strategy A: Try LLM-based JSON repair
                 repaired = await _repair_grading_json(raw_text, rubric_criteria, max_score, scoring_primary)
-                if repaired is None:
-                    raise
-                validated = repaired
-                transparency["llm_call"]["json_repaired"] = True
-                transparency["llm_call"]["json_repair_attempt"] = attempt + 1
+                if repaired is not None:
+                    validated = repaired
+                    transparency["llm_call"]["json_repaired"] = True
+                    transparency["llm_call"]["json_repair_attempt"] = attempt + 1
+                else:
+                    # Strategy B: Try parsing markdown-formatted response
+                    md_parsed = _parse_markdown_grading_response(raw_text, rubric_criteria, max_score)
+                    if md_parsed is not None and md_parsed.get("total_score", 0) > 0:
+                        validated = md_parsed
+                        transparency["llm_call"]["markdown_parsed"] = True
+                        logger.info(f"Recovered grading from markdown response: {md_parsed.get('total_score')}/{max_score}")
+                    else:
+                        logger.warning(
+                            f"JSON parse failed on attempt {attempt + 1}/3, raw preview: {raw_text[:200]}"
+                        )
+                        raise
+
+            # Safety: ensure criterion_evidence is a dict
+            if not isinstance(criterion_evidence, dict):
+                criterion_evidence = {}
+            _ce_candidate_map = criterion_evidence.get("candidate_map", {})
+            if not isinstance(_ce_candidate_map, dict):
+                _ce_candidate_map = {}
 
             citation_stats = _attach_rubric_citations(
                 validated,
                 evidence_map,
-                criterion_evidence.get("candidate_map", {}),
+                _ce_candidate_map,
             )
             verifier_trace = await _verify_citations_with_llm(
                 validated.get("rubric_breakdown", []),
                 evidence_map,
-                criterion_evidence.get("candidate_map", {}),
+                _ce_candidate_map,
                 scoring_primary,
             )
             verifier_apply = _apply_llm_citation_verdict(
                 validated.get("rubric_breakdown", []),
                 evidence_map,
-                criterion_evidence.get("candidate_map", {}),
+                _ce_candidate_map,
                 verifier_trace,
             )
             _ev_lookup = {
                 str(ev.get("image_id", "")): ev for ev in evidence_map
-                if str(ev.get("image_id", "")).strip()
+                if isinstance(ev, dict) and str(ev.get("image_id", "")).strip()
             }
+            _snip_lookup = criterion_evidence.get("snippet_lookup", {})
+            if not isinstance(_snip_lookup, dict):
+                _snip_lookup = {}
             image_cited_count = 0
             for rb_item in validated.get("rubric_breakdown", []):
-                citations = _normalize_citation_objects(rb_item.get("citations", []), evidence_lookup=_ev_lookup)
-                if any(str(c.get("image_id", "")).strip() for c in citations):
+                if not isinstance(rb_item, dict):
+                    continue
+                citations = _normalize_citation_objects(
+                    rb_item.get("citations", []),
+                    evidence_lookup=_ev_lookup,
+                    snippet_lookup=_snip_lookup,
+                )
+                # Update the citations in the result so filenames are resolved
+                if citations:
+                    rb_item["citations"] = citations
+                if any(isinstance(c, dict) and str(c.get("image_id", "")).strip() for c in citations):
                     image_cited_count += 1
             citation_stats["criteria_with_image_citation"] = image_cited_count
             citation_stats["verifier_overrides_applied"] = int(verifier_apply.get("applied", 0))
@@ -5696,9 +6422,16 @@ async def grade_student(
 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON error (attempt {attempt + 1}): {e}")
+            transparency["llm_call"].setdefault("json_parse_failures", 0)
+            transparency["llm_call"]["json_parse_failures"] += 1
             if attempt < 2:
+                # On retry, add an explicit JSON reinforcement to the system prompt
+                # to increase chances of getting valid JSON on next attempt
+                if attempt == 1:
+                    logger.info("JSON retry: adding reinforcement instruction for attempt 3")
                 await _rate_limiter.acquire()
                 continue
+            # Final fallback: flag with error but mark for review instead of just returning 0
             return {
                 "error": f"JSON parse error: {str(e)}",
                 "total_score": 0,
@@ -5707,13 +6440,22 @@ async def grade_student(
                 "letter_grade": "F",
                 "confidence": "low",
                 "grading_hash": grading_hash,
-                "rubric_breakdown": [{"criterion": c['criterion'], "score": 0, "max": c['max'], "justification": "Parse error"} for c in rubric_criteria],
-                "transparency": transparency
+                "rubric_breakdown": [{"criterion": c['criterion'], "score": 0, "max": c['max'], "justification": "JSON parse error — needs manual review or regrade"} for c in rubric_criteria],
+                "transparency": transparency,
+                "_provider_error": True,  # Mark as provider error so it shows as retryable
             }
 
         except ProviderFailoverError as e:
             msg = str(e)
-            logger.error(msg)
+            logger.error(f"Provider failover (attempt {attempt + 1}/3): {msg}")
+            if attempt < 2:
+                # Exponential backoff: 5s, 15s - give providers time to recover
+                backoff = 5 * (3 ** attempt)
+                logger.info(f"Retrying after {backoff}s backoff (attempt {attempt + 1})")
+                await asyncio.sleep(backoff)
+                # Clear any cooldowns so providers are re-tried
+                _provider_cooldown_until.clear()
+                continue
             return {
                 "error": msg,
                 "total_score": 0,
@@ -5722,11 +6464,14 @@ async def grade_student(
                 "letter_grade": "F",
                 "confidence": "low",
                 "grading_hash": grading_hash,
-                "rubric_breakdown": [{"criterion": c['criterion'], "score": 0, "max": c['max'], "justification": "All providers failed"} for c in rubric_criteria],
-                "transparency": transparency
+                "rubric_breakdown": [{"criterion": c['criterion'], "score": 0, "max": c['max'], "justification": "All providers failed after 3 attempts"} for c in rubric_criteria],
+                "transparency": transparency,
+                "_provider_error": True,
             }
         except Exception as e:
-            logger.exception(f"API error (attempt {attempt + 1})")
+            import traceback as _tb
+            tb_str = _tb.format_exc()
+            logger.exception(f"API error (attempt {attempt + 1}): {e}\n{tb_str}")
             if attempt < 2:
                 await asyncio.sleep(2)
                 continue
@@ -5738,8 +6483,10 @@ async def grade_student(
                 "letter_grade": "F",
                 "confidence": "low",
                 "grading_hash": grading_hash,
-                "rubric_breakdown": [{"criterion": c['criterion'], "score": 0, "max": c['max'], "justification": "API error"} for c in rubric_criteria],
-                "transparency": transparency
+                "rubric_breakdown": [{"criterion": c['criterion'], "score": 0, "max": c['max'], "justification": f"API error — needs regrade: {str(e)[:100]}"} for c in rubric_criteria],
+                "transparency": transparency,
+                "_provider_error": True,
+                "_traceback": tb_str[:1000],
             }
     
     return {

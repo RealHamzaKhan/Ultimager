@@ -358,7 +358,15 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
                       </td>
                       <td className="px-4 py-3">
                         {student.is_flagged && (
-                          <Flag className="h-4 w-4 text-amber-500" />
+                          <span
+                            title={student.flag_reason || 'Flagged for review'}
+                            className="inline-flex items-center gap-1.5 cursor-help"
+                          >
+                            <Flag className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+                            <span className="text-xs text-amber-500/80 max-w-[140px] truncate">
+                              {student.flag_reason || 'Review'}
+                            </span>
+                          </span>
                         )}
                       </td>
                     </tr>

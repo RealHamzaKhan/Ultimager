@@ -142,7 +142,11 @@ class GradingWorker:
                 student_files=extracted_contents,
                 rubric=rubric_text
             )
-            
+            # Safety: ensure relevance is always a dict
+            if not isinstance(relevance, dict):
+                logger.warning(f"[RELEVANCE] Non-dict relevance for {student_identifier}: {type(relevance)}")
+                relevance = {"is_relevant": True, "confidence": "low", "flags": [], "reasoning": "relevance check returned invalid type"}
+
             # DEBUG: Log relevance result
             logger.info(f"[RELEVANCE] Student {student_identifier}: is_relevant={relevance.get('is_relevant')}, flags={relevance.get('flags')}, reasoning={relevance.get('reasoning', '')[:100]}")
             
@@ -287,6 +291,9 @@ class GradingWorker:
                         timeout=45,
                     )
 
+                    if not isinstance(acmag_pack, dict):
+                        logger.error(f"ACMAG returned non-dict for {student_identifier}: {type(acmag_pack)}")
+                        acmag_pack = {"result": {}}
                     result = dict(acmag_pack.get("result") or {})
 
                     # Update ACMAG runtime state
@@ -337,6 +344,123 @@ class GradingWorker:
                     student_dir=str(student_dir) if student_dir else None,
                 )
             
+            # Safety: ensure result is always a dict
+            if not isinstance(result, dict):
+                logger.error(f"[GRADER] grade_student returned non-dict for {student_identifier}: {type(result)}")
+                result = {
+                    "error": f"Unexpected result type: {type(result).__name__}",
+                    "total_score": 0,
+                    "max_score": max_score,
+                    "percentage": 0,
+                    "letter_grade": "F",
+                    "confidence": "low",
+                    "rubric_breakdown": [],
+                    "_provider_error": True,
+                }
+
+            # Detect provider errors that grade_student handled internally
+            # (returns total_score=0 with _provider_error=True instead of raising)
+            if result.get("_provider_error"):
+                error_msg = result.get("error", "Provider error")
+                logger.warning(
+                    f"[GRADER] Provider error for {student_identifier}: {error_msg[:200]}"
+                )
+                worker_submission.status = "error"
+                worker_submission.error_message = error_msg[:500]
+                worker_submission.retry_count = (worker_submission.retry_count or 0) + 1
+                db.commit()
+
+                if self.sse_callback:
+                    self.sse_callback(self.session_id, {
+                        "type": "student_error",
+                        "worker_id": self.worker_id,
+                        "student_id": student_id,
+                        "student": student_identifier,
+                        "error": error_msg[:200],
+                        "will_retry": True,
+                    })
+                return {"status": "error", "student_id": student_id, "error": error_msg}
+
+            # ── Post-grading validation ──
+            # Flag submissions where something looks suspicious so teacher can verify
+            total_score = float(result.get("total_score", 0))
+            max_possible = float(max_score) if max_score else 50
+            has_error = bool(result.get("error"))
+            breakdown = result.get("rubric_breakdown", [])
+            if not isinstance(breakdown, list):
+                breakdown = []
+            # Safety: ensure each item in breakdown is a dict
+            breakdown = [item for item in breakdown if isinstance(item, dict)]
+            all_zero = all(float(item.get("score", 0)) == 0 for item in breakdown) if breakdown else True
+            all_not_assessed = all(
+                "not assessed" in str(item.get("justification", "")).lower()
+                for item in breakdown
+            ) if breakdown else False
+            text_chars = int(result.get("text_chars_processed", 0))
+            has_content = text_chars > 100  # Student submitted meaningful content
+            transparency = result.get("transparency") or {}
+            if not isinstance(transparency, dict):
+                transparency = {}
+            llm_call = transparency.get("llm_call") or {}
+            if not isinstance(llm_call, dict):
+                llm_call = {}
+
+            flag_reasons = []
+
+            # 1. Grading errors
+            if has_error:
+                flag_reasons.append(f"Grading error: {str(result.get('error', ''))[:100]}")
+
+            # 2. All criteria scored 0 despite having content
+            if all_zero and has_content and not has_error:
+                flag_reasons.append(
+                    f"All criteria scored 0 despite {text_chars} chars of content — likely grading failure"
+                )
+
+            # 3. All criteria "Not assessed by AI"
+            if all_not_assessed and has_content:
+                flag_reasons.append("All criteria 'Not assessed by AI' — LLM response may not have parsed correctly")
+
+            # 4. Low confidence from LLM
+            if str(result.get("confidence", "")).lower() == "low":
+                flag_reasons.append(f"Low confidence: {result.get('confidence_reasoning', '')[:100]}")
+
+            # 5. Ingestion warnings (nested student folders, cross-contamination, parse failures)
+            if ingestion_report_dict:
+                ing_warnings = ingestion_report_dict.get("warnings", [])
+                ing_errors = ingestion_report_dict.get("errors", [])
+                ing_failed = ingestion_report_dict.get("files_failed", [])
+                if ing_warnings:
+                    for w in ing_warnings[:3]:
+                        flag_reasons.append(f"File issue: {str(w)[:120]}")
+                if ing_errors:
+                    for e in ing_errors[:2]:
+                        flag_reasons.append(f"Parse error: {str(e)[:120]}")
+                if ing_failed:
+                    failed_names = [f.get("filename", "?") for f in ing_failed[:3]]
+                    flag_reasons.append(f"Failed to parse: {', '.join(failed_names)}")
+
+            # 6. LLM response was repaired (markdown→JSON, truncation repair)
+            if llm_call.get("markdown_parsed"):
+                flag_reasons.append("LLM returned non-JSON response — parsed from markdown (scores may be inaccurate)")
+            if llm_call.get("json_repaired"):
+                flag_reasons.append("LLM response had malformed JSON — repaired automatically")
+
+            # 7. Score is suspiciously perfect (100%) or very high with low content
+            if total_score >= max_possible and text_chars < 500 and has_content:
+                flag_reasons.append(f"Perfect score ({total_score}/{max_possible}) with minimal content ({text_chars} chars)")
+
+            # 8. Retries were needed (connection instability)
+            retries = llm_call.get("retries", 0)
+            if retries and retries >= 2:
+                flag_reasons.append(f"Required {retries} retries to reach LLM — connection instability")
+
+            if flag_reasons:
+                result["_grading_warnings"] = flag_reasons
+                logger.warning(
+                    f"[GRADER] Flagging {student_identifier}: {'; '.join(flag_reasons)}"
+                )
+
             # Save result
             worker_submission.ai_result = json.dumps(result)
             worker_submission.ai_score = result.get("total_score", 0)
@@ -350,7 +474,13 @@ class GradingWorker:
                 worker_submission.test_results = json.dumps(_tr)
                 worker_submission.tests_passed = int(_tr.get("passed", 0))
                 worker_submission.tests_total = int(_tr.get("total", 0))
-            if relevance_gate.get("review_required"):
+            # Flag for relevance warnings OR grading anomalies
+            if flag_reasons and worker_submission.flagged_by != "user":
+                worker_submission.is_flagged = True
+                worker_submission.flag_reason = "; ".join(flag_reasons)[:500]
+                worker_submission.flagged_by = "system"
+                worker_submission.flagged_at = datetime.utcnow()
+            elif relevance_gate.get("review_required"):
                 worker_submission.is_flagged = True
                 if worker_submission.flagged_by != "user":
                     worker_submission.flag_reason = "Relevance warnings require manual review"
@@ -588,19 +718,31 @@ class ParallelGrader:
                 # DEBUG: Log task completion
                 logger.info(f"[PARALLEL_GRADER] Worker {completed_worker.worker_id} completed student {completed_sub.student_identifier} (ID: {completed_sub_id})")
                 
-                result = task.result()
+                try:
+                    result = task.result()
+                except Exception as task_exc:
+                    logger.exception(f"[PARALLEL_GRADER] Task exception for {completed_sub.student_identifier}")
+                    result = {"status": "error", "error": str(task_exc), "student_id": completed_sub_id}
+
+                # Safety: ensure result is always a dict with a status key
+                if not isinstance(result, dict):
+                    logger.error(f"[PARALLEL_GRADER] Non-dict result for {completed_sub.student_identifier}: {type(result)}")
+                    result = {"status": "error", "error": f"Unexpected result type: {type(result).__name__}", "student_id": completed_sub_id}
+                if "status" not in result:
+                    result["status"] = "error"
+
                 results.append(result)
-                
+
                 # DEBUG: Log result status
                 logger.info(f"[PARALLEL_GRADER] Result for {completed_sub.student_identifier}: status={result.get('status')}, reason={result.get('reason', 'N/A')}")
-                
+
                 if result["status"] == "success":
                     self.processed += 1
-                
+
                 elif result["status"] == "rate_limited":
                     self.rate_limited += 1
                     retry_count = retry_queue.get(completed_sub_id, 0)
-                    
+
                     if retry_count < max_retries:
                         # Re-queue with backoff
                         await asyncio.sleep(random.uniform(1, 3))  # Random backoff
@@ -610,19 +752,35 @@ class ParallelGrader:
                     else:
                         self.failed += 1
                         logger.warning(f"Max retries reached for {completed_sub.student_identifier}")
-                
+
                 elif result["status"] == "skipped":
                     self.processed += 1  # Count as processed (skipped)
-                
+
                 else:  # error
                     retry_count = retry_queue.get(completed_sub_id, 0)
                     if retry_count < max_retries:
-                        # Retry other errors too
-                        await asyncio.sleep(1)
+                        # Exponential backoff: longer for provider errors
+                        error_msg = str(result.get("error", ""))
+                        is_provider_error = (
+                            "provider" in error_msg.lower()
+                            or "connection" in error_msg.lower()
+                            or "timeout" in error_msg.lower()
+                        )
+                        backoff = random.uniform(8, 15) if is_provider_error else random.uniform(1, 3)
+                        logger.info(
+                            f"[PARALLEL_GRADER] Retrying {completed_sub.student_identifier} "
+                            f"(attempt {retry_count + 1}/{max_retries}, backoff={backoff:.1f}s, "
+                            f"provider_error={is_provider_error})"
+                        )
+                        await asyncio.sleep(backoff)
                         pending.append(completed_sub)
                         retry_queue[completed_sub_id] = retry_count + 1
                     else:
                         self.failed += 1
+                        logger.warning(
+                            f"[PARALLEL_GRADER] Max retries ({max_retries}) reached for "
+                            f"{completed_sub.student_identifier}, marking as failed"
+                        )
 
             # If stopped, break out of the retry/pending loop
             if self.stopped:

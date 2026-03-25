@@ -44,7 +44,11 @@ VISION_ENTRY_TRANSCRIPTION_LIMIT: int = int(os.getenv("VISION_ENTRY_TRANSCRIPTIO
 VISION_ENTRY_SUMMARY_LIMIT: int = int(os.getenv("VISION_ENTRY_SUMMARY_LIMIT", "800"))
 
 # ── Score Verification ───────────────────────────────────────────
-SCORE_VERIFICATION_ENABLED: bool = os.getenv("SCORE_VERIFICATION_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+# DISABLED: The verification LLM was incorrectly zeroing scores where
+# the grading LLM correctly awarded partial credit (e.g. typos in function
+# names treated as "no evidence").  The primary grading pass has strong
+# enough prompt guardrails; a second pass with less context does more harm.
+SCORE_VERIFICATION_ENABLED: bool = os.getenv("SCORE_VERIFICATION_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # ── ACMAG (Anchor-Calibrated Multi-Agent Grading) ────────────────
 # ACMAG can be enabled explicitly via env when needed. Keep default off for

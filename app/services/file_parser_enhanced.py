@@ -1650,7 +1650,16 @@ def process_student_submission(student_dir: Path, student_id: str,
     
     extracted_contents = []
     
-    # Find all files recursively
+    # Find all files — only from the IMMEDIATE student directory.
+    # Do NOT descend into nested subdirectories that look like other students'
+    # folders (e.g., "Muhammad_fasihullah_23P-0627/") to prevent cross-contamination.
+    # We allow ONE level of nesting for common structures (e.g., "src/", "code/")
+    # but skip directories whose names look like student identifiers.
+    import re as _re_parser
+    _student_dir_pattern = _re_parser.compile(
+        r'^\d{2}[pPiI][-_]?\d{3,5}|^[A-Z][a-z]+[-_ ][A-Z][a-z]+|^[A-Z][a-z]+_\d{2}[pPiI]',
+    )
+
     all_files = []
     for file_path in student_dir.rglob("*"):
         if file_path.is_file():
@@ -1662,6 +1671,28 @@ def process_student_submission(student_dir: Path, student_id: str,
                 continue
             if _is_transient_or_system_file(file_path):
                 continue
+
+            # Cross-contamination guard: skip files inside nested directories
+            # that look like other student submissions (name patterns like
+            # "23P-0627_Name", "Name_23P0627", "Firstname Lastname")
+            if len(rel_parts) >= 2:
+                # Check if ANY intermediate directory looks like a student folder
+                skip = False
+                for dir_part in rel_parts[:-1]:  # all dirs, not the filename
+                    if _student_dir_pattern.search(dir_part):
+                        skip = True
+                        break
+                if skip:
+                    logger.info(
+                        f"[FILE_PARSER] Skipping nested student file: "
+                        f"{'/'.join(rel_parts)} (probable cross-contamination)"
+                    )
+                    report.warnings.append(
+                        f"Nested student folder detected: {rel_parts[0]} — "
+                        f"skipped {'/'.join(rel_parts)} to prevent cross-contamination"
+                    )
+                    continue
+
             all_files.append(file_path)
     
     # Record received files

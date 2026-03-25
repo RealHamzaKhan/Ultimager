@@ -791,16 +791,20 @@ async def stop_grading(session_id: int, db: Session = Depends(get_db)):
     
     # Set stop flag
     _stop_grading_flags[session_id] = True
-    
+
     # Update session status
     session.status = "paused"
     session.completed_at = datetime.now(timezone.utc)
     db.commit()
-    
-    # Update progress tracking
-    if session_id in _active_grading:
-        _active_grading[session_id]["status"] = "stopped"
-        _active_grading[session_id]["stage"] = "Stopped by user"
+
+    # Clean up active grading state so start_grading can work again
+    _active_grading.pop(session_id, None)
+
+    # Clean up stop flag after a short delay (give workers time to see it)
+    async def _cleanup_stop_flag():
+        await asyncio.sleep(5)
+        _stop_grading_flags.pop(session_id, None)
+    asyncio.create_task(_cleanup_stop_flag())
     
     # Broadcast stop event
     _broadcast_sse(session_id, {
@@ -1037,7 +1041,10 @@ def _grade_single_student_sync(session_id: int, student_id: int):
             student_files=student_files,
             rubric=str(session.rubric) if session.rubric else ""
         ))
-        
+        # Safety: ensure relevance is always a dict
+        if not isinstance(relevance, dict):
+            relevance = {"is_relevant": True, "confidence": "low", "flags": [], "reasoning": "relevance returned non-dict"}
+
         sub.is_relevant = relevance.get("is_relevant", True)
         sub.relevance_flags = json.dumps(relevance.get("flags", []))
         db.commit()
@@ -1116,6 +1123,8 @@ def _grade_single_student_sync(session_id: int, student_id: int):
                         run_secondary=True,
                         moderation_delta=1.0,
                     ), timeout=45))
+                    if not isinstance(acmag_pack, dict):
+                        acmag_pack = {"result": {}}
                     result = dict(acmag_pack.get("result") or {})
                     if acmag_pack.get("moderation"):
                         _broadcast_sse(session_id, {
@@ -1180,25 +1189,69 @@ def _grade_single_student_sync(session_id: int, student_id: int):
                         student_dir=str(student_dir) if student_dir else None,
                     ))
 
-        if isinstance(result, dict) and not result.get("grading_hash"):
+        # Safety: ensure result is always a dict
+        if not isinstance(result, dict):
+            logger.error(f"grade_student returned non-dict for regrade of {sub.student_identifier}: {type(result)}")
+            result = {
+                "error": f"Unexpected result type: {type(result).__name__}",
+                "total_score": 0,
+                "max_score": max_score_value,
+                "percentage": 0,
+                "letter_grade": "F",
+                "confidence": "low",
+                "rubric_breakdown": [],
+            }
+        if not result.get("grading_hash"):
             result["grading_hash"] = grading_hash
-        if isinstance(result, dict):
-            result["relevance_gate"] = relevance_gate
-        if isinstance(result, dict):
-            result = _annotate_regrade_consistency(result, previous_ai_score)
-        
+        result["relevance_gate"] = relevance_gate
+        result = _annotate_regrade_consistency(result, previous_ai_score)
+
         if result.get("error"):
             sub.status = "error"
             sub.error_message = result.get('error')
             sub.ai_result = json.dumps(result)
         else:
+            # ── Post-grading validation for single regrade ──
+            total_score = float(result.get("total_score", 0))
+            breakdown = result.get("rubric_breakdown", [])
+            if not isinstance(breakdown, list):
+                breakdown = []
+            # Safety: filter out non-dict items
+            breakdown = [item for item in breakdown if isinstance(item, dict)]
+            all_zero = all(float(item.get("score", 0)) == 0 for item in breakdown) if breakdown else True
+            all_not_assessed = all(
+                "not assessed" in str(item.get("justification", "")).lower()
+                for item in breakdown
+            ) if breakdown else False
+            text_chars = int(result.get("text_chars_processed", 0))
+            has_content = text_chars > 100
+
+            flag_reasons = []
+            if all_zero and has_content:
+                flag_reasons.append(
+                    f"All criteria scored 0 despite {text_chars} chars of content — possible grading failure"
+                )
+            if all_not_assessed and has_content:
+                flag_reasons.append("All criteria show 'Not assessed by AI' — LLM response may not have been parsed")
+            if str(result.get("confidence", "")).lower() == "low":
+                flag_reasons.append(f"Low confidence: {result.get('confidence_reasoning', '')[:100]}")
+
+            if flag_reasons:
+                result["_grading_warnings"] = flag_reasons
+
             sub.ai_result = json.dumps(result)
             sub.ai_score = result.get("total_score")
             sub.ai_letter_grade = result.get("letter_grade")
             sub.ai_confidence = result.get("confidence")
             sub.status = "graded"
             sub.graded_at = datetime.now(timezone.utc)
-            if relevance_gate.get("block_grading") or relevance_gate.get("review_required"):
+
+            if flag_reasons and sub.flagged_by != "user":
+                sub.is_flagged = True
+                sub.flag_reason = "; ".join(flag_reasons)[:500]
+                sub.flagged_by = "system"
+                sub.flagged_at = datetime.now(timezone.utc)
+            elif relevance_gate.get("block_grading") or relevance_gate.get("review_required"):
                 sub.is_flagged = True
                 if sub.flagged_by != "user":
                     sub.flag_reason = relevance_gate.get("reason") or "Relevance warnings require manual review"
@@ -1290,6 +1343,120 @@ def _grade_single_student_sync(session_id: int, student_id: int):
             _active_grading.pop(session_id, None)
             _sse_queues.pop(session_id, None)
         threading.Thread(target=_cleanup, daemon=True).start()
+
+
+@app.post("/session/{session_id}/upload-student")
+async def upload_student(
+    session_id: int,
+    student_name: str = Form(...),
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload and grade a single student directly to an existing session.
+
+    This is for cases where the bulk zip failed on a student's folder structure,
+    so the user can manually upload that student's files and get them graded.
+    """
+    # ── Validate session ──
+    session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Reject while session is actively grading
+    active_info = _active_grading.get(session_id)
+    is_actually_grading = (
+        session.status == "grading"
+        or (active_info is not None and active_info.get("status") == "grading")
+    )
+    if is_actually_grading:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot upload a student while grading is in progress. Stop grading first.",
+        )
+
+    # ── Validate inputs ──
+    student_name = student_name.strip()
+    if not student_name:
+        raise HTTPException(status_code=422, detail="student_name cannot be empty")
+
+    # Check for duplicate student name in this session
+    existing = db.query(StudentSubmission).filter(
+        StudentSubmission.session_id == session_id,
+        StudentSubmission.student_identifier == student_name,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Student '{student_name}' already exists in this session (id={existing.id}). "
+                   "Use the regrade endpoint to re-grade them, or choose a different name.",
+        )
+
+    # Filter out empty uploads
+    valid_files = [f for f in files if f.filename and f.filename.strip()]
+    if not valid_files:
+        raise HTTPException(status_code=422, detail="No valid files provided")
+
+    # ── Save files to disk ──
+    student_dir = UPLOAD_DIR / str(session_id) / student_name
+    student_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_file_meta: list[dict] = []
+    for upload_file in valid_files:
+        safe_name = Path(upload_file.filename).name  # strip directory components
+        dest = student_dir / safe_name
+        content = await upload_file.read()
+        dest.write_bytes(content)
+        saved_file_meta.append({
+            "filename": safe_name,
+            "size": len(content),
+            "content_type": upload_file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream",
+        })
+
+    # ── Create StudentSubmission record ──
+    max_order = db.query(StudentSubmission.processing_order).filter(
+        StudentSubmission.session_id == session_id,
+    ).order_by(StudentSubmission.processing_order.desc()).first()
+    next_order = (max_order[0] + 1) if max_order and max_order[0] is not None else 0
+
+    sub = StudentSubmission(
+        session_id=session_id,
+        student_identifier=student_name,
+        status="pending",
+        file_count=len(saved_file_meta),
+        files=json.dumps(saved_file_meta),
+        processing_order=next_order,
+    )
+    db.add(sub)
+
+    # Update session total
+    session.total_students = (session.total_students or 0) + 1
+    db.commit()
+    db.refresh(sub)
+
+    student_id = sub.id
+
+    # ── Trigger background grading (reuses single-student grading flow) ──
+    _stop_grading_flags[session_id] = False
+    _active_grading[session_id] = {
+        "status": "grading",
+        "current_student": student_name,
+        "graded_count": session.graded_count or 0,
+        "failed_count": session.error_count or 0,
+        "total": session.total_students or 0,
+        "stage": f"Extraction + OCR (upload) {student_name}",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    asyncio.get_event_loop().run_in_executor(
+        None, _grade_single_student_sync, session_id, student_id
+    )
+
+    return JSONResponse({
+        "message": f"Student '{student_name}' uploaded and grading started",
+        "student_id": student_id,
+        "status": "pending",
+        "file_count": len(saved_file_meta),
+    })
 
 
 def _grade_all_students_parallel(session_id: int, use_acmag: bool = False):
