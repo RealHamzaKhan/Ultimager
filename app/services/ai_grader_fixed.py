@@ -129,19 +129,31 @@ class _ResponseShim:
 class RateLimiter:
     """Async-safe sliding-window rate limiter.
 
-    Uses an asyncio.Lock so it never blocks the event loop — multiple
-    coroutines can wait concurrently without serialising all workers.
+    Uses an asyncio.Lock created lazily per event-loop so it is safe to use
+    across different loops (e.g. main FastAPI loop vs regrade background loop).
     """
 
     def __init__(self, max_requests: int = RATE_LIMIT_RPM, per_seconds: int = 60):
         self.max_requests = max_requests
         self.per_seconds = per_seconds
         self.timestamps: list[float] = []
-        self._lock: Optional[asyncio.Lock] = None  # created lazily in the running loop
+        self._lock: Optional[asyncio.Lock] = None
+        self._lock_loop_id: Optional[int] = None  # id() of the loop that owns _lock
 
     def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
+        """Return an asyncio.Lock bound to the *current* running loop.
+
+        If the loop has changed (e.g. regrade creates a new loop), discard the
+        old Lock and create a fresh one.  This prevents "attached to a different
+        loop" RuntimeErrors.
+        """
+        try:
+            current_loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            current_loop_id = None
+        if self._lock is None or self._lock_loop_id != current_loop_id:
             self._lock = asyncio.Lock()
+            self._lock_loop_id = current_loop_id
         return self._lock
 
     async def acquire(self):
@@ -1056,7 +1068,12 @@ def _repair_or_fallback_rubric(
 
 
 def _repair_truncated_json(raw_text: str) -> str:
-    """Attempt to repair a truncated JSON response by closing open brackets/braces."""
+    """Attempt to repair a truncated JSON response by closing open brackets/braces.
+
+    BUG-10 fix: properly tracks whether we are inside a JSON string so that
+    braces/brackets inside string values (e.g. code snippets in justifications)
+    are not counted.
+    """
     # Strip markdown fences
     text = raw_text.strip()
     if text.startswith("```"):
@@ -1067,13 +1084,25 @@ def _repair_truncated_json(raw_text: str) -> str:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    # Find the last complete object/array entry and truncate there
-    # Then close all open brackets
+    # String-aware bracket counting
     open_braces = 0
     open_brackets = 0
     last_complete = 0
+    in_string = False
+    escape_next = False
 
     for i, ch in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue  # skip braces inside strings
         if ch == '{':
             open_braces += 1
         elif ch == '}':
@@ -1093,10 +1122,23 @@ def _repair_truncated_json(raw_text: str) -> str:
     # Remove trailing comma
     result = result.rstrip().rstrip(',')
 
-    # Close remaining open brackets/braces
+    # String-aware recount for closing
     open_b = 0
     open_k = 0
+    in_str = False
+    esc = False
     for ch in result:
+        if esc:
+            esc = False
+            continue
+        if ch == '\\' and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
         if ch == '{':
             open_b += 1
         elif ch == '}':
@@ -1106,7 +1148,7 @@ def _repair_truncated_json(raw_text: str) -> str:
         elif ch == ']':
             open_k -= 1
 
-    result += ']' * open_k + '}' * open_b
+    result += ']' * max(0, open_k) + '}' * max(0, open_b)
     return result
 
 
@@ -2554,8 +2596,10 @@ def _extract_text_content(student_files: list, max_chars: int = 120000) -> str:
     total_chars = 0
     for filename, file_type, content in raw_files:
         header = f"\n=== {filename} ({file_type}) ===\n"
-        # Each file gets fair_share OR the remaining budget, whichever is larger.
-        file_budget = max(fair_share, content_budget - total_chars) if total_chars < content_budget else 0
+        # BUG-16 fix: each file gets exactly fair_share, not the entire remaining budget.
+        # This ensures later files aren't starved by earlier ones.
+        remaining = content_budget - total_chars
+        file_budget = min(fair_share, remaining) if remaining > 0 else 0
         if file_budget <= 0:
             text_parts.append(header)
             text_parts.append("[TRUNCATED — budget exhausted]")
@@ -2924,81 +2968,94 @@ def _vision_batch_with_failover(
     prompt = _build_vision_batch_prompt(chunk, chunk_id, total_chunks_hint)
     for spec, model in candidates:
         provider_key = "nvidia" if spec.name == "nvidia_nim" else spec.name
-        client = _get_client(spec)
-        try:
-            user_content: list[dict] = [{"type": "text", "text": prompt}]
-            for img in chunk:
-                user_content.append({
-                    "type": "text",
-                    "text": (
-                        f"[Image id={img.get('image_id')}] "
-                        f"file={img.get('filename')} page={img.get('page')} desc={img.get('description')}"
-                    ),
-                })
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{img.get('media_type', 'image/png')};base64,{img.get('base64', '')}",
-                        "detail": "high",
-                    },
-                })
-            response = _chat_completion(
-                client,
-                _spec=spec,
-                purpose="vision_preanalysis",
-                provider_name=provider_key,
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are analyzing student-submission images for grading support. "
-                            "Extract visible handwritten/typed content precisely. "
-                            "If unreadable, explicitly say unreadable."
+        # Retry up to 3 times for transient errors (BUG-09 fix)
+        for retry_idx in range(3):
+            client = _get_client(spec)
+            try:
+                user_content: list[dict] = [{"type": "text", "text": prompt}]
+                for img in chunk:
+                    user_content.append({
+                        "type": "text",
+                        "text": (
+                            f"[Image id={img.get('image_id')}] "
+                            f"file={img.get('filename')} page={img.get('page')} desc={img.get('description')}"
                         ),
-                    },
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.0,
-                top_p=0.1,
-                max_tokens=1200,
-                seed=42,
-            )
-            notes = (response.choices[0].message.content or "").strip()
-            usage_obj = getattr(response, "usage", None)
-            usage = None
-            if usage_obj:
-                usage = {
-                    "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
-                    "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
-                    "total_tokens": getattr(usage_obj, "total_tokens", 0),
-                }
+                    })
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{img.get('media_type', 'image/png')};base64,{img.get('base64', '')}",
+                            "detail": "high",
+                        },
+                    })
+                response = _chat_completion(
+                    client,
+                    _spec=spec,
+                    purpose="vision_preanalysis",
+                    provider_name=provider_key,
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are analyzing student-submission images for grading support. "
+                                "Extract visible handwritten/typed content precisely. "
+                                "If unreadable, explicitly say unreadable."
+                            ),
+                        },
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.0,
+                    top_p=0.1,
+                    # BUG-25 fix: scale tokens with chunk size (~250 tokens per image)
+                    max_tokens=min(4000, max(1200, len(chunk) * 250)),
+                    seed=42,
+                )
+                notes = (response.choices[0].message.content or "").strip()
+                usage_obj = getattr(response, "usage", None)
+                usage = None
+                if usage_obj:
+                    usage = {
+                        "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                        "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+                        "total_tokens": getattr(usage_obj, "total_tokens", 0),
+                    }
 
-            entries = _parse_vision_entries(notes, chunk)
-            return notes, entries, {
-                "provider": provider_key,
-                "provider_key": provider_key,
-                "model": model,
-                "usage": usage,
-                "attempts_before_success": attempts,
-            }
-        except Exception as exc:
-            error_type = _classify_provider_error(exc)
-            _apply_provider_cooldown(provider_key, error_type)
-            attempts.append({
-                "provider": provider_key,
-                "provider_key": provider_key,
-                "model": model,
-                "error_type": error_type,
-                "error": str(exc)[:500],
-            })
-            logger.warning(
-                "vision_preanalysis: provider %s/%s failed with %s: %s",
-                spec.name,
-                model,
-                error_type,
-                exc,
-            )
+                entries = _parse_vision_entries(notes, chunk)
+                return notes, entries, {
+                    "provider": provider_key,
+                    "provider_key": provider_key,
+                    "model": model,
+                    "usage": usage,
+                    "attempts_before_success": attempts,
+                    "retries": retry_idx,
+                }
+            except Exception as exc:
+                error_type = _classify_provider_error(exc)
+                attempts.append({
+                    "provider": provider_key,
+                    "provider_key": provider_key,
+                    "model": model,
+                    "error_type": error_type,
+                    "error": str(exc)[:500],
+                    "retry": retry_idx,
+                })
+                # Retry transient errors with backoff
+                if error_type in _RETRYABLE and retry_idx < 2:
+                    wait = BASE_BACKOFF * (2 ** retry_idx)
+                    logger.warning(
+                        "vision_preanalysis: provider %s/%s %s (attempt %d/3), retrying in %ds: %s",
+                        spec.name, model, error_type, retry_idx + 1, wait, exc,
+                    )
+                    time.sleep(wait)
+                    continue
+                # Non-retryable or exhausted retries — move to next provider
+                _apply_provider_cooldown(provider_key, error_type)
+                logger.warning(
+                    "vision_preanalysis: provider %s/%s failed with %s: %s",
+                    spec.name, model, error_type, exc,
+                )
+                break  # exit retry loop, try next provider
 
     raise ProviderFailoverError(purpose="vision_preanalysis", attempts=attempts)
 
@@ -4597,22 +4654,27 @@ def _apply_score_verification(
             "reason": reason,
         }
 
-        # Priority 1: If verifier says NO evidence found, always force to 0
+        # BUG-01 fix: NEVER zero out a score based on low-confidence verification.
+        # The verifier is a second LLM that may not see the same context as the
+        # grading LLM. Low confidence = the verifier itself is unsure.
+        if confidence == "low":
+            stats["skipped_low_confidence"] += 1
+            detail["skip_reason"] = "low confidence — never apply low-confidence adjustments"
+            stats["details"].append(detail)
+            continue
+
+        # Priority 1: If verifier says NO evidence found with high/medium confidence
         if evidence_found is False and original > 0:
             item["score"] = 0.0
             item["justification"] = (
                 item.get("justification", "")
-                + f" [VERIFICATION: Score reduced from {original} to 0 — "
+                + f" [VERIFICATION ({confidence}): Score reduced from {original} to 0 — "
                 + f"no evidence found for this criterion in any submitted file]"
             )
             detail["applied"] = True
             stats["adjusted"] += 1
             stats["details"].append(detail)
             continue
-
-        if confidence == "low":
-            stats["skipped_low_confidence"] += 1
-            detail["skip_reason"] = f"low confidence — never apply low-confidence adjustments"
         elif confidence == "medium" and delta < 2:
             stats["kept"] += 1
             detail["skip_reason"] = f"medium confidence, delta {delta:.1f} < 2"
@@ -4835,8 +4897,9 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
                         best_score = sim
                         best_key = rubric_key
                         best_data = rubric_data
-            # Lowered threshold from 0.5 to 0.4 to catch more borderline matches
-            if best_score >= 0.4 and best_key and best_data:
+            # BUG-12 fix: 0.4 was too permissive, could cross-match similar criteria
+            # (e.g. "Binary Search" vs "Binary Tree"). Raised back to 0.5.
+            if best_score >= 0.5 and best_key and best_data:
                 matched_key = best_key
                 matched_data = best_data
 
@@ -5034,15 +5097,32 @@ def _extract_json(raw_text: str, *, require_grading_result: bool = False) -> dic
     except json.JSONDecodeError:
         pass
 
-    # Strategy 2: extract outermost { ... } block
-    match = re.search(r'\{[\s\S]*\}', raw_text)
-    if match:
+    # Strategy 2: extract the LARGEST valid JSON object from the text.
+    # BUG-11 fix: greedy {.*} can merge two separate JSON objects; instead
+    # try each top-level '{' as a potential start and parse greedily from it.
+    match = None
+    _brace_starts = [i for i, c in enumerate(raw_text) if c == '{']
+    for _start in _brace_starts:
+        _candidate = raw_text[_start:]
+        # Find the last '}' in the candidate
+        _last_brace = _candidate.rfind('}')
+        if _last_brace < 1:
+            continue
+        _candidate = _candidate[:_last_brace + 1]
         try:
-            result = json.loads(match.group())
+            result = json.loads(_candidate)
             if isinstance(result, dict) and _is_grading_result(result):
+                match = type('M', (), {'group': lambda self, _c=_candidate: _c})()
                 return result
         except json.JSONDecodeError:
-            pass
+            if match is None:
+                match = type('M', (), {'group': lambda self, _c=_candidate: _c})()
+    # If we found a brace block but it didn't parse, keep match for Strategy 3
+    if not match and _brace_starts:
+        _start = _brace_starts[0]
+        _last = raw_text.rfind('}')
+        if _last > _start:
+            match = type('M', (), {'group': lambda self, _t=raw_text[_start:_last+1]: _t})()
 
     # Strategy 3: fix common LLM JSON mistakes
     # - trailing commas before } or ]
@@ -5833,16 +5913,30 @@ def _adaptive_max_tokens(rubric_criteria: list[dict], input_char_count: int = 0)
 
 
 def _score_to_letter(score: float, max_score: int) -> str:
-    """Convert numeric score to letter grade."""
+    """Convert numeric score to letter grade (fine-grained, matches _validate_result)."""
     if max_score <= 0:
         return "F"
     pct = score / max_score * 100
-    if pct >= 90:
+    if pct >= 97:
+        return "A+"
+    elif pct >= 93:
         return "A"
-    elif pct >= 80:
+    elif pct >= 90:
+        return "A-"
+    elif pct >= 87:
+        return "B+"
+    elif pct >= 83:
         return "B"
-    elif pct >= 70:
+    elif pct >= 80:
+        return "B-"
+    elif pct >= 77:
+        return "C+"
+    elif pct >= 73:
         return "C"
+    elif pct >= 70:
+        return "C-"
+    elif pct >= 67:
+        return "D+"
     elif pct >= 60:
         return "D"
     return "F"
@@ -5870,9 +5964,13 @@ async def _single_pass_grade(
     """Execute a single grading pass on one content window."""
     await _rate_limiter.acquire()
 
-    # Build the user prompt with optional prior evidence injection
+    # BUG-05 fix: In multi-pass mode, do NOT pass student_files because the
+    # file manifest describes ALL files but the window only has a subset.
+    # The LLM could hallucinate content from files described in the manifest
+    # but not present in the window.  Pass empty list so no manifest is built.
+    _files_for_prompt = student_files if total_passes <= 1 else []
     user_text = _build_user_prompt(
-        title, description, rubric, max_score, student_files, questions,
+        title, description, rubric, max_score, _files_for_prompt, questions,
         criterion_evidence_context=prior_evidence if prior_evidence else None,
         reference_solution=reference_solution,
         test_results=test_results,
@@ -5903,7 +6001,9 @@ async def _single_pass_grade(
         {"role": "user", "content": user_content},
     ]
 
-    response, call_meta = _chat_completion_with_failover(
+    # Run blocking OpenAI call in thread (BUG-07 fix)
+    response, call_meta = await asyncio.to_thread(
+        _chat_completion_with_failover,
         purpose=f"grade_student_pass_{pass_id}",
         needs_vision=img_count > 0,
         messages=messages,
@@ -6397,8 +6497,10 @@ async def grade_student(
     for attempt in range(3):
         try:
             # D1 FIX: Always use full messages with evidence context on retry
-            # (previously used fallback_messages that stripped criterion_evidence_context)
-            response, call_meta = _chat_completion_with_failover(
+            # Run blocking OpenAI call in thread so event loop stays free for
+            # other parallel grading tasks (BUG-07 fix).
+            response, call_meta = await asyncio.to_thread(
+                _chat_completion_with_failover,
                 purpose="grade_student",
                 needs_vision=img_count > 0,
                 messages=messages,
@@ -6599,6 +6701,72 @@ async def grade_student(
             }
             validated["transparency"] = transparency
 
+            # ── Comprehensive Flagging ────────────────────────────────
+            # Collect EVERY condition that could affect grading accuracy.
+            _warnings: list[str] = []
+
+            # 1. JSON repair was needed
+            if transparency.get("llm_call", {}).get("json_repaired"):
+                _warnings.append("JSON repair: LLM response required JSON repair — scores may differ from AI intent")
+            if transparency.get("llm_call", {}).get("markdown_parsed"):
+                _warnings.append("Markdown fallback: LLM returned markdown instead of JSON — less reliable score extraction")
+
+            # 2. Score verification made adjustments
+            _sv = transparency.get("score_verification", {})
+            if int(_sv.get("adjustments_applied", 0)) > 0:
+                _adj_details = _sv.get("details", [])
+                _adj_summary = "; ".join(
+                    f"{d.get('criterion','?')}: {d.get('original',0)}→{d.get('verified',0)}"
+                    for d in _adj_details if isinstance(d, dict) and d.get("applied")
+                )[:200]
+                _warnings.append(f"Score verification adjusted {_sv['adjustments_applied']} criteria: {_adj_summary}")
+
+            # 3. Vision pre-analysis had errors
+            _vp = transparency.get("vision_preanalysis", {})
+            if isinstance(_vp, dict) and _vp.get("error"):
+                _warnings.append(f"Vision error: {str(_vp['error'])[:150]} — handwritten/image content may be inaccurate")
+
+            # 4. Retries were needed
+            _fallback_attempts = transparency.get("llm_call", {}).get("fallback_attempts")
+            if _fallback_attempts and len(_fallback_attempts) > 0:
+                _warnings.append(f"Required {len(_fallback_attempts)} retry attempt(s) before successful grading")
+            if transparency.get("llm_call", {}).get("fallback_used"):
+                _warnings.append("Fallback provider used — primary scorer was unavailable")
+
+            # 5. Low confidence
+            if str(validated.get("confidence", "")).lower() == "low":
+                _warnings.append(f"Low confidence from AI grader: {str(validated.get('confidence_reasoning', ''))[:150]}")
+
+            # 6. All criteria scored 0 but content exists
+            _breakdown = validated.get("rubric_breakdown", [])
+            _all_zero = all(float(item.get("score", 0)) == 0 for item in _breakdown if isinstance(item, dict)) if _breakdown else True
+            _has_content = len(text_content) > 100
+            if _all_zero and _has_content:
+                _warnings.append(f"All criteria scored 0 despite {len(text_content)} chars of content — possible grading failure")
+
+            # 7. All criteria "Not assessed"
+            _all_not_assessed = all(
+                "not assessed" in str(item.get("justification", "")).lower()
+                for item in _breakdown if isinstance(item, dict)
+            ) if _breakdown else False
+            if _all_not_assessed and _has_content:
+                _warnings.append("All criteria show 'Not assessed by AI' — LLM response may have been truncated or unparseable")
+
+            # 8. Content was truncated
+            if transparency.get("selection_pool_truncated"):
+                _warnings.append(
+                    f"Image pool truncated: {transparency.get('images_available_total', 0)} available, "
+                    f"only {transparency.get('images_selected_total', 0)} selected"
+                )
+
+            # 9. JSON parse failures occurred (even if later succeeded)
+            if int(transparency.get("llm_call", {}).get("json_parse_failures", 0)) > 0:
+                _warnings.append(f"JSON parse failed {transparency['llm_call']['json_parse_failures']} time(s) before success")
+
+            if _warnings:
+                validated["_grading_warnings"] = _warnings
+                logger.info(f"Flagged {len(_warnings)} warning(s) for grading: {_warnings}")
+
             logger.info(
                 f"Graded: {validated['total_score']}/{max_score} ({validated['letter_grade']}) hash={grading_hash} provider={transparency['llm_call']['provider']} model={grading_model}"
             )
@@ -6637,8 +6805,12 @@ async def grade_student(
                 backoff = 5 * (3 ** attempt)
                 logger.info(f"Retrying after {backoff}s backoff (attempt {attempt + 1})")
                 await asyncio.sleep(backoff)
-                # Clear any cooldowns so providers are re-tried
-                _provider_cooldown_until.clear()
+                # Clear only EXPIRED cooldowns so active cooldowns from other
+                # concurrent tasks are preserved (BUG-17 fix).
+                _now = time.time()
+                expired = [k for k, v in _provider_cooldown_until.items() if v <= _now]
+                for k in expired:
+                    _provider_cooldown_until.pop(k, None)
                 continue
             return {
                 "error": msg,

@@ -12,7 +12,7 @@ Key features:
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Callable
 import random
@@ -35,44 +35,56 @@ from app.services.file_parser_enhanced import process_student_submission
 logger = logging.getLogger(__name__)
 
 
+# Module-level shared rate limiter state (shared across ALL GradingWorker instances)
+_shared_rate_limiter_lock: Optional[threading.Lock] = None
+_shared_request_timestamps: list = []
+
+
 @dataclass
 class GradingWorker:
     """Single grading worker that processes one student at a time."""
     worker_id: int
     session_id: int
-    
-    # Rate limiting - shared across workers
-    _rate_limiter_lock = None
-    _request_timestamps: list = field(default_factory=list)
-    
+
     # Callback for progress updates
     progress_callback: Optional[Callable] = None
     sse_callback: Optional[Callable] = None  # For SSE broadcast
-    
+
     @classmethod
     def set_rate_limiter(cls, lock, timestamps):
-        cls._rate_limiter_lock = lock
-        cls._request_timestamps = timestamps
+        global _shared_rate_limiter_lock, _shared_request_timestamps
+        _shared_rate_limiter_lock = lock
+        _shared_request_timestamps = timestamps
     
     async def acquire_rate_limit(self, rpm: int = RATE_LIMIT_RPM):
-        """Acquire rate limit permission, waiting if necessary."""
+        """Acquire rate limit permission, waiting if necessary.
+
+        Uses the module-level ``_shared_request_timestamps`` list so that
+        the combined request rate across *all* workers stays within the
+        configured RPM.
+        """
         import time
-        
+        global _shared_rate_limiter_lock, _shared_request_timestamps
+
         while True:
-            with self._rate_limiter_lock:
+            if _shared_rate_limiter_lock is None:
+                return  # No rate limiter configured
+            with _shared_rate_limiter_lock:
                 now = time.time()
                 # Remove timestamps older than 1 minute
-                self._request_timestamps[:] = [t for t in self._request_timestamps if now - t < 60]
-                
-                if len(self._request_timestamps) < rpm:
+                _shared_request_timestamps[:] = [
+                    t for t in _shared_request_timestamps if now - t < 60
+                ]
+
+                if len(_shared_request_timestamps) < rpm:
                     # Under limit, proceed
-                    self._request_timestamps.append(now)
+                    _shared_request_timestamps.append(now)
                     return
-                
+
                 # At limit, calculate wait time
-                oldest = self._request_timestamps[0]
+                oldest = _shared_request_timestamps[0]
                 wait_time = 60 - (now - oldest) + 0.1
-            
+
             # Wait outside lock
             await asyncio.sleep(min(wait_time, 2))  # Cap at 2 seconds
     
@@ -259,9 +271,11 @@ class GradingWorker:
                         "flags": relevance_gate.get("flags", []),
                     })
             
-            # Acquire rate limit before API call
-            await self.acquire_rate_limit()
-            
+            # NOTE: Rate limiting is handled inside ai_grader_fixed.py on each
+            # actual LLM call.  Do NOT call acquire_rate_limit() here — doing so
+            # causes double rate-limiting and reduces effective RPM far below the
+            # configured limit.
+
             # Grade
             if use_acmag and acmag_runtime:
                 from app.services.acmag import grade_submission_acmag
@@ -404,6 +418,12 @@ class GradingWorker:
             llm_call = transparency.get("llm_call") or {}
             if not isinstance(llm_call, dict):
                 llm_call = {}
+            score_verification = transparency.get("score_verification") or {}
+            if not isinstance(score_verification, dict):
+                score_verification = {}
+            vision_preanalysis = transparency.get("vision_preanalysis") or {}
+            if not isinstance(vision_preanalysis, dict):
+                vision_preanalysis = {}
 
             flag_reasons = []
 
@@ -423,7 +443,7 @@ class GradingWorker:
 
             # 4. Low confidence from LLM
             if str(result.get("confidence", "")).lower() == "low":
-                flag_reasons.append(f"Low confidence: {result.get('confidence_reasoning', '')[:100]}")
+                flag_reasons.append(f"Low confidence from AI grader: {result.get('confidence_reasoning', 'no reasoning provided')[:100]}")
 
             # 5. Ingestion warnings (nested student folders, cross-contamination, parse failures)
             if ingestion_report_dict:
@@ -432,28 +452,85 @@ class GradingWorker:
                 ing_failed = ingestion_report_dict.get("files_failed", [])
                 if ing_warnings:
                     for w in ing_warnings[:3]:
-                        flag_reasons.append(f"File issue: {str(w)[:120]}")
+                        flag_reasons.append(f"Ingestion warning: {str(w)[:120]}")
                 if ing_errors:
                     for e in ing_errors[:2]:
-                        flag_reasons.append(f"Parse error: {str(e)[:120]}")
+                        flag_reasons.append(f"Ingestion parse error: {str(e)[:120]}")
                 if ing_failed:
                     failed_names = [f.get("filename", "?") for f in ing_failed[:3]]
-                    flag_reasons.append(f"Failed to parse: {', '.join(failed_names)}")
+                    flag_reasons.append(f"Failed to parse files during ingestion: {', '.join(failed_names)}")
 
             # 6. LLM response was repaired (markdown→JSON, truncation repair)
-            if llm_call.get("markdown_parsed"):
-                flag_reasons.append("LLM returned non-JSON response — parsed from markdown (scores may be inaccurate)")
             if llm_call.get("json_repaired"):
-                flag_reasons.append("LLM response had malformed JSON — repaired automatically")
+                flag_reasons.append(
+                    "LLM response had malformed JSON that was auto-repaired — scores may differ from what the AI intended"
+                )
+            if llm_call.get("markdown_parsed"):
+                flag_reasons.append(
+                    "LLM returned non-JSON response — scores were extracted from markdown fallback parsing (less reliable)"
+                )
 
-            # 7. Score is suspiciously perfect (100%) or very high with low content
+            # 7. Score verification made adjustments
+            if score_verification.get("adjustments_applied"):
+                adjustments = score_verification.get("adjustments_applied")
+                if isinstance(adjustments, list):
+                    adj_desc = "; ".join(str(a)[:80] for a in adjustments[:3])
+                else:
+                    adj_desc = str(adjustments)[:200]
+                flag_reasons.append(
+                    f"Score verification adjusted results after grading: {adj_desc}"
+                )
+
+            # 8. Vision pre-analysis had errors
+            if vision_preanalysis.get("error"):
+                flag_reasons.append(
+                    f"Vision/image pre-analysis failed: {str(vision_preanalysis['error'])[:150]} — "
+                    "handwritten or image content may not have been graded accurately"
+                )
+
+            # 9. Retries / fallback attempts were needed
+            fallback_attempts = llm_call.get("fallback_attempts", 0)
+            retries = llm_call.get("retries", 0)
+            if fallback_attempts and int(fallback_attempts) > 0:
+                flag_reasons.append(
+                    f"Grading required {fallback_attempts} fallback attempt(s) — "
+                    "initial LLM call(s) failed before a successful response was obtained"
+                )
+            elif retries and int(retries) >= 2:
+                flag_reasons.append(f"Required {retries} retries to reach LLM — connection instability")
+
+            # 10. Relevance gate flagged for review (but did not block)
+            if relevance_gate.get("review_required"):
+                gate_flags = relevance_gate.get("flags", [])
+                gate_confidence = relevance_gate.get("confidence", "unknown")
+                flag_reasons.append(
+                    f"Relevance gate flagged for teacher review (confidence={gate_confidence}, "
+                    f"flags={', '.join(str(f) for f in gate_flags[:5])})"
+                )
+
+            # 11. Score is suspiciously perfect (100%) or very high with low content
             if total_score >= max_possible and text_chars < 500 and has_content:
                 flag_reasons.append(f"Perfect score ({total_score}/{max_possible}) with minimal content ({text_chars} chars)")
 
-            # 8. Retries were needed (connection instability)
-            retries = llm_call.get("retries", 0)
-            if retries and retries >= 2:
-                flag_reasons.append(f"Required {retries} retries to reach LLM — connection instability")
+            # 12. Regrade showed score changed by more than 20%
+            regrade_info = result.get("regrade") or transparency.get("regrade") or {}
+            if isinstance(regrade_info, dict):
+                original_score = regrade_info.get("original_score")
+                new_score = regrade_info.get("new_score")
+                if original_score is not None and new_score is not None:
+                    try:
+                        orig = float(original_score)
+                        new = float(new_score)
+                        if max_possible > 0:
+                            pct_change = abs(new - orig) / max_possible * 100
+                            if pct_change > 20:
+                                flag_reasons.append(
+                                    f"Regrade changed score by {pct_change:.0f}% "
+                                    f"(from {orig} to {new} out of {max_possible}) — "
+                                    "large discrepancy suggests grading inconsistency"
+                                )
+                    except (ValueError, TypeError):
+                        pass
 
             if flag_reasons:
                 result["_grading_warnings"] = flag_reasons

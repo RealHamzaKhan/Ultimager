@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import statistics
 import threading
 import urllib.parse
@@ -70,7 +71,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Location"],
 )
-app.add_middleware(SessionMiddleware, secret_key="change-this-in-production")
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "gradeforge-dev-" + str(os.getpid())))
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
@@ -825,11 +826,12 @@ async def regrade_all(session_id: int, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # Reset all submissions to pending
+    # Mark submissions for re-grading but keep existing results until new grade succeeds.
+    # We set status to "regrading" so the grading pipeline knows to overwrite only on success.
     submissions = db.query(StudentSubmission).filter(
         StudentSubmission.session_id == session_id
     ).all()
-    
+
     for sub in submissions:
         sub.status = "pending"
         sub.error_message = None
@@ -840,13 +842,11 @@ async def regrade_all(session_id: int, db: Session = Depends(get_db)):
             sub.flag_reason = None
             sub.flagged_by = None
             sub.flagged_at = None
-    
-    session.graded_count = 0
-    session.error_count = 0
+
     session.status = "pending"
     db.commit()
-    
-    # Start grading
+
+    # Start grading (graded_count / error_count will be recalculated by the grading pipeline)
     return await start_grading(session_id, db)
 
 

@@ -887,12 +887,14 @@ def _parse_pdf_mixed(file_path: Path, max_text_chars: int = 80000,
 
     images = []
     image_hashes: list[int] = []
+    MAX_IMAGE_RENDER_PAGES = 30  # Cap page-to-image rendering to limit memory usage
     pages_converted = min(page_count, max_pages)
+    pages_rendered = min(pages_converted, MAX_IMAGE_RENDER_PAGES)
     embedded_count = 0
     deduplicated_count = 0
 
-    # Phase 1: Render pages to images
-    for page_num in range(pages_converted):
+    # Phase 1: Render pages to images (capped to avoid memory blowup on large PDFs)
+    for page_num in range(pages_rendered):
         try:
             page = doc[page_num]
             pix = page.get_pixmap(dpi=dpi)
@@ -1119,6 +1121,26 @@ def _parse_image_file(file_path: Path, max_size: int = 5*1024*1024) -> Extracted
     if ext == "tif":
         ext = "tiff"
 
+    # SVG cannot be processed by PIL — read raw bytes and treat as PNG for downstream
+    PIL_UNSUPPORTED_FORMATS = {"svg"}
+    if ext in PIL_UNSUPPORTED_FORMATS:
+        img_bytes = file_path.read_bytes()
+        b64 = base64.b64encode(img_bytes).decode()
+        return ExtractedContent(
+            filename=file_path.name,
+            file_type="image",
+            images=[{
+                "base64": b64,
+                "media_type": f"image/svg+xml",
+                "size_bytes": len(img_bytes),
+                "original_size": file_path.stat().st_size,
+                "source": "raw_file",
+            }],
+            extraction_method="raw_bytes",
+            size_bytes=file_path.stat().st_size,
+            metadata={"format": "svg", "note": "SVG not processed by PIL"},
+        )
+
     resized = False
     try:
         with Image.open(file_path) as img:
@@ -1272,7 +1294,7 @@ def _parse_notebook_file(file_path: Path, max_chars: int) -> ExtractedContent:
         filename=file_path.name,
         file_type="notebook",
         text_content=full_text[:max_chars] if truncated else full_text,
-        images=images if images else None,
+        images=images if images else [],
         extraction_method="nbformat_with_images" if images else "nbformat",
         size_bytes=file_path.stat().st_size,
         metadata={
@@ -1374,7 +1396,7 @@ def _parse_excel_file(file_path: Path) -> ExtractedContent:
                 filename=file_path.name,
                 file_type="excel",
                 text_content="\n".join(parts),
-                images=images if images else None,
+                images=images if images else [],
                 extraction_method="openpyxl" + ("_with_images" if images else ""),
                 size_bytes=file_path.stat().st_size,
                 metadata={
@@ -1508,7 +1530,7 @@ def _parse_powerpoint_file(file_path: Path) -> ExtractedContent:
             filename=file_path.name,
             file_type="powerpoint",
             text_content="\n".join(parts),
-            images=images if images else None,
+            images=images if images else [],
             extraction_method="python-pptx" + ("_with_images" if images else ""),
             size_bytes=file_path.stat().st_size,
             metadata={

@@ -105,8 +105,8 @@ IMAGE_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 IGNORED_NAMES: set[str] = {
     "__MACOSX", ".DS_Store", "__pycache__", ".git", ".gitignore",
     "test_datasets", "tests", "test", "testing",
-    "carol_cpp", "eve_pdf_text", "nick_mixed", "jake_flat", 
-    "grace_notebook", "bob_java", "frank_pdf_scanned", "dan_docx",
-    "karen_macos_junk", "leo_empty", "iris_nested", "olivia_unsupported",
-    "mia_unicode", "alice_perfect", "henry_images"
+    "__test__carol_cpp", "__test__eve_pdf_text", "__test__nick_mixed", "__test__jake_flat",
+    "__test__grace_notebook", "__test__bob_java", "__test__frank_pdf_scanned", "__test__dan_docx",
+    "__test__karen_macos_junk", "__test__leo_empty", "__test__iris_nested", "__test__olivia_unsupported",
+    "__test__mia_unicode", "__test__alice_perfect", "__test__henry_images"
 }
