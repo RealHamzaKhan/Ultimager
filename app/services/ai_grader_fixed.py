@@ -2343,18 +2343,25 @@ def _build_user_prompt(
             parts.append(f"Q{i}: {q.get('text', q.get('question', ''))}")
         parts.append("")
     
-    parts.append("RUBRIC (USE THESE EXACT CRITERIA IN YOUR RESPONSE):")
+    parts.append("RUBRIC — YOU MUST RETURN EVERY CRITERION BELOW (copy-paste criterion names EXACTLY):")
     parts.append("=" * 60)
+    criterion_names_list = []
     for idx, item in enumerate(rubric_criteria, 1):
         crit_name = item.get("criterion", f"Criterion {idx}")
         crit_max = item.get("max", 0)
         crit_desc = item.get("description", "")
-        parts.append(f"  [{idx}] {crit_name}: {crit_max} points")
+        criterion_names_list.append(crit_name)
+        parts.append(f"  [{idx}] \"{crit_name}\": {crit_max} points")
         if crit_desc:
             parts.append(f"      GRADING GUIDE: {crit_desc}")
         parts.append("")
     parts.append(f"  TOTAL: {max_score} points")
     parts.append("=" * 60)
+    parts.append("")
+    parts.append("⚠ CRITICAL: Your rubric_breakdown MUST contain EXACTLY these criterion names (copy-paste them):")
+    for cn in criterion_names_list:
+        parts.append(f'  - "{cn}"')
+    parts.append("If you use different names, the grading will FAIL. Copy-paste the names exactly as shown above.")
     parts.append("")
     
     # ── File Content Manifest ──────────────────────────────────────
@@ -4746,6 +4753,15 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
         ai_breakdown = []
     fixed_breakdown = []
     used_keys = set()
+    unmatched_ai_items: list[str] = []
+
+    # Log what LLM returned vs expected for debugging
+    logger.debug(
+        "validate_result: %d AI items vs %d rubric criteria. AI names: %s",
+        len(ai_breakdown),
+        len(rubric_criteria),
+        [str(item.get("criterion", ""))[:60] if isinstance(item, dict) else str(item)[:60] for item in ai_breakdown[:20]],
+    )
 
     for item in ai_breakdown:
         if not isinstance(item, dict):
@@ -4787,10 +4803,27 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
                         best_score = sim
                         best_key = rubric_key
                         best_data = rubric_data
-            # Require at least 0.5 similarity to avoid false matches
-            if best_score >= 0.5 and best_key and best_data:
+            # Lowered threshold from 0.5 to 0.4 to catch more borderline matches
+            if best_score >= 0.4 and best_key and best_data:
                 matched_key = best_key
                 matched_data = best_data
+
+        # Strategy 4: Q-ID prefix matching as last resort
+        # e.g. AI returns "Q1a(i)" and rubric has "Q1a(i) - Count messages per sender"
+        if not matched_data:
+            qid_pattern = re.compile(r'[Qq]\d+[a-z]?(?:\([ivx]+\))?')
+            ai_qids = set(qid_pattern.findall(ai_criterion))
+            if ai_qids:
+                for rubric_key, rubric_data in rubric_map.items():
+                    if rubric_key not in used_keys:
+                        rubric_qids = set(qid_pattern.findall(rubric_data['criterion']))
+                        if ai_qids and rubric_qids and ai_qids == rubric_qids:
+                            matched_key = rubric_key
+                            matched_data = rubric_data
+                            break
+
+        if not matched_data:
+            unmatched_ai_items.append(ai_criterion)
         
         if matched_data and matched_key:
             try:
@@ -4812,14 +4845,59 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
             fixed_breakdown.append(fixed_item)
             used_keys.add(matched_key)
     
+    missing_keys = [k for k in rubric_map if k not in used_keys]
+    if unmatched_ai_items:
+        logger.warning(
+            "validate_result: %d AI criteria could not be matched to rubric: %s",
+            len(unmatched_ai_items), unmatched_ai_items[:10],
+        )
+    if missing_keys:
+        logger.warning(
+            "validate_result: %d rubric criteria had no matching AI response: %s",
+            len(missing_keys), missing_keys[:10],
+        )
+
     for rubric_key, rubric_data in rubric_map.items():
         if rubric_key not in used_keys:
-            fixed_breakdown.append({
-                "criterion": rubric_data['criterion'],
-                "score": 0,
-                "max": rubric_data['max'],
-                "justification": "Not assessed by AI"
-            })
+            # Try one more time: check if any unmatched AI item has the same Q-ID prefix
+            rescue_item = None
+            rubric_qids = set(re.findall(r'[Qq]\d+[a-z]?(?:\([ivx]+\))?', rubric_key))
+            if rubric_qids and unmatched_ai_items:
+                for uai in unmatched_ai_items:
+                    uai_qids = set(re.findall(r'[Qq]\d+[a-z]?(?:\([ivx]+\))?', uai.lower()))
+                    if rubric_qids & uai_qids:
+                        # Found a match by Q-ID — find the original item
+                        for orig_item in ai_breakdown:
+                            if isinstance(orig_item, dict) and str(orig_item.get("criterion", "")).strip() == uai:
+                                rescue_item = orig_item
+                                break
+                        if rescue_item:
+                            unmatched_ai_items.remove(uai)
+                            break
+
+            if rescue_item:
+                try:
+                    score = float(rescue_item.get("score", 0))
+                except (ValueError, TypeError):
+                    score = 0
+                score = max(0, min(score, rubric_data['max']))
+                fixed_breakdown.append({
+                    "criterion": rubric_data['criterion'],
+                    "score": round(score, 1),
+                    "max": rubric_data['max'],
+                    "justification": str(rescue_item.get("justification", rescue_item.get("feedback", "")))[:500],
+                })
+                logger.info(
+                    "validate_result: rescued criterion '%s' from unmatched AI item '%s' via Q-ID match",
+                    rubric_data['criterion'], str(rescue_item.get("criterion", ""))[:60],
+                )
+            else:
+                fixed_breakdown.append({
+                    "criterion": rubric_data['criterion'],
+                    "score": 0,
+                    "max": rubric_data['max'],
+                    "justification": "Not assessed by AI"
+                })
     
     total = 0
     for item in fixed_breakdown:
@@ -6298,6 +6376,29 @@ async def grade_student(
                             f"JSON parse failed on attempt {attempt + 1}/3, raw preview: {raw_text[:200]}"
                         )
                         raise
+
+            # ── Catastrophic failure detection: ALL criteria "Not assessed" ──
+            # If _validate_result couldn't match ANY LLM criteria to the rubric,
+            # every item will be "Not assessed by AI" with score 0. This is a
+            # matching failure, not a real grade — retry with a fresh LLM call.
+            _vb = validated.get("rubric_breakdown", [])
+            _all_not_assessed = (
+                len(_vb) > 0
+                and all(
+                    "not assessed" in str(item.get("justification", "")).lower()
+                    for item in _vb
+                    if isinstance(item, dict)
+                )
+            )
+            if _all_not_assessed and len(rubric_criteria) > 0 and attempt < 2:
+                logger.warning(
+                    f"ALL {len(_vb)} criteria are 'Not assessed by AI' on attempt {attempt + 1}/3 — "
+                    f"LLM returned criteria that didn't match rubric. Retrying..."
+                )
+                transparency["llm_call"].setdefault("all_not_assessed_retries", 0)
+                transparency["llm_call"]["all_not_assessed_retries"] += 1
+                await asyncio.sleep(1)
+                continue  # Retry with fresh LLM call
 
             # Safety: ensure criterion_evidence is a dict
             if not isinstance(criterion_evidence, dict):
