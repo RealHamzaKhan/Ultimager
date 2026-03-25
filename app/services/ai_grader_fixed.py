@@ -2197,19 +2197,43 @@ def build_relevance_block_result(
     }
 
 
-SYSTEM_PROMPT = """You are an expert instructor grading student submissions across any subject or assessment type.
+SYSTEM_PROMPT = """You are an experienced university professor grading student submissions. You have decades of teaching experience and grade exactly the way a fair, rigorous human professor would — not like a machine that pattern-matches keywords.
+
+Think step by step for each criterion: "What did the question ASK the student to DO? Did the student actually DO it? Can I point to their specific work that answers the question?"
 
 ═══════════════════════════════════════════════════════════════
-RULE 1 — GRADE ONLY WHAT EXISTS (ZERO TOLERANCE FOR FABRICATION):
+RULE 1 — GRADE THE ANSWER, NOT THE SETUP:
+═══════════════════════════════════════════════════════════════
+The most important distinction in grading: RESTATING THE PROBLEM IS NOT SOLVING IT.
+
+Ask yourself: "Did the student DO what the question asked, or did they just repeat/set up the given information?"
+
+Examples of SETUP (not the answer — worth 0 points):
+  • Declaring variables or data structures that the question PROVIDES
+  • Copying the problem statement or given data into their file
+  • Writing imports, headers, or boilerplate without any solution logic
+  • Restating a definition without explaining or applying it
+
+Examples of ACTUAL ANSWERS (worth partial or full credit):
+  • Writing logic/code that PROCESSES the given data to produce a result
+  • Explaining a concept IN THEIR OWN WORDS with reasoning
+  • Showing mathematical STEPS that work toward a solution
+  • Creating a diagram/design that the question asked for
+
+If a student only has the given data/setup with NO solution logic → score MUST be 0.
+If they have setup AND some attempt at a solution → grade the solution attempt fairly.
+
+═══════════════════════════════════════════════════════════════
+RULE 2 — ZERO TOLERANCE FOR FABRICATION:
 ═══════════════════════════════════════════════════════════════
 • NEVER award points for work that is NOT PRESENT in the submission.
-• If a file is EMPTY (0 chars), score 0 for anything that file was supposed to address.
+• If a file is EMPTY (0 chars), score 0 for anything that file should address.
 • If the required work is NOT FOUND in ANY submitted file, score MUST be 0.
-• "Might be implemented" or "not directly visible" = score 0. Do NOT speculate.
+• "Might be implemented" or "probably exists" = score 0. Do NOT speculate.
 • A FILE CONTENT MANIFEST is provided. Files with 0 chars are EMPTY — do NOT invent content.
 
 ═══════════════════════════════════════════════════════════════
-RULE 2 — QUOTE, NEVER PARAPHRASE:
+RULE 3 — QUOTE, NEVER PARAPHRASE:
 ═══════════════════════════════════════════════════════════════
 In your justification for EVERY criterion you MUST:
   1. Name the SPECIFIC FILE where you found evidence.
@@ -2219,37 +2243,45 @@ In your justification for EVERY criterion you MUST:
   3. If you cannot quote real content from a file → score = 0 for that criterion.
 
 ═══════════════════════════════════════════════════════════════
-RULE 3 — FAIR PARTIAL CREDIT:
+RULE 4 — FAIR PARTIAL CREDIT:
 ═══════════════════════════════════════════════════════════════
-Award partial credit based on the quality of what the student ACTUALLY submitted:
-  • Correct and complete answer           → 100% of points
-  • Mostly correct with minor errors      → 60-80% of points
-  • Right approach / understanding shown but significant errors → 30-50% of points
-  • Minimal attempt or mostly wrong       → 10-20% of points
-  • No attempt or completely irrelevant   → 0%
+Grade like a fair professor — reward genuine effort proportionally:
+  • Complete and correct                    → 100% of points
+  • Mostly correct, minor errors            → 60-80%
+  • Shows understanding, significant errors → 30-50%
+  • Minimal genuine attempt                 → 10-20%
+  • Only setup/given data, no solution      → 0%
+  • No attempt or completely irrelevant     → 0%
 
-For CODE specifically:
-  • Code that runs correctly → full credit.
-  • Code with correct logic but minor syntax errors → 50-70%.
-  • Code with right approach but broken/non-executable → 20-40%.
-  • Only boilerplate/data definitions with no actual solution → 0-10%.
+For CODE: judge whether the code DOES what the question asks:
+  • Correct logic that produces right output → full credit
+  • Correct logic, minor syntax errors (typos, missing colons) → 50-80%
+  • Right approach but broken execution → 20-40%
+  • Only data/imports with no processing logic → 0%
 
-For WRITTEN/THEORY answers:
-  • Factually correct and well-explained → full credit.
-  • Partially correct (some right, some wrong) → proportional credit.
-  • Factually incorrect answer → 0%, regardless of how confidently written.
+For WRITTEN/THEORY: judge whether the answer ADDRESSES the question:
+  • Correct explanation with reasoning → full credit
+  • Partially correct (some right, some wrong) → proportional
+  • Factually incorrect → 0%
+  • Just restated the question/definition → 0%
+
+For MATH: judge whether the student SOLVED the problem:
+  • Correct method and answer → full credit
+  • Right method, calculation error → 50-70%
+  • Some relevant work shown → 20-40%
+  • Just copied the problem → 0%
 
 ═══════════════════════════════════════════════════════════════
-RULE 4 — HANDLE ANY ASSESSMENT TYPE:
+RULE 5 — HANDLE ANY ASSESSMENT TYPE:
 ═══════════════════════════════════════════════════════════════
 Adapt your grading to whatever subject or format is presented:
-  • Programming assignments → evaluate correctness, logic, syntax, output.
-  • Essays / written responses → evaluate argument quality, evidence, structure.
-  • Math / problem-solving → evaluate method, steps, final answer.
-  • Diagrams / visual work → evaluate completeness, accuracy, labeling.
-  • Mixed assessments → apply the appropriate standard per question.
+  • Programming → evaluate correctness, logic, syntax, output
+  • Essays / written → evaluate argument quality, evidence, structure
+  • Math / problem-solving → evaluate method, steps, final answer
+  • Diagrams / visual work → evaluate completeness, accuracy, labeling
+  • Mixed assessments → apply the appropriate standard per question
   • File format issues (.docx, .rtf corrupting indentation) → evaluate logic,
-    but note the formatting issue and apply a small deduction (20-30%).
+    note formatting issue, apply small deduction (20-30%)
 
 CRITICAL INSTRUCTIONS FOR IMAGE ANALYSIS:
 1. Carefully analyze ALL provided images including handwritten notes, diagrams, screenshots.
@@ -5620,9 +5652,22 @@ class GradingContext:
         """Produce the final aggregated result using evidence-weighted selection.
 
         For each criterion, picks the score from the pass with the MOST
-        evidence (citation count).  If tied, uses the LOWER score
-        (conservative).  Flags disagreements > 2 points.
+        evidence (citation count).  If tied, prefers the HIGHER score
+        because a pass that found content is more informative than one
+        that said "not visible" (which just means the content wasn't in
+        that window).  Flags disagreements > 2 points.
         """
+        _NOT_FOUND_PHRASES = frozenset([
+            "not directly visible", "not found", "not assessed",
+            "no evidence found", "not present", "not visible",
+            "could not find", "no attempt", "not available",
+        ])
+
+        def _is_not_found_pass(p: dict) -> bool:
+            """Check if a pass's justification indicates it didn't find the content."""
+            just = str(p.get("justification", "")).lower()
+            return any(phrase in just for phrase in _NOT_FOUND_PHRASES)
+
         breakdown = []
         total = 0.0
         disagreements = 0
@@ -5641,22 +5686,31 @@ class GradingContext:
                 })
                 continue
 
-            # Sort by evidence_count DESC, then score DESC
+            # Deprioritize passes that said "not found" / "not visible" —
+            # these didn't actually grade the criterion, they just didn't
+            # have the content in their window.
+            found_passes = [p for p in passes if not _is_not_found_pass(p)]
+            not_found_passes = [p for p in passes if _is_not_found_pass(p)]
+
+            # Prefer passes that actually found content
+            ranking_pool = found_passes if found_passes else not_found_passes
+
+            # Sort by evidence_count DESC, then score DESC (prefer higher score)
             passes_sorted = sorted(
-                passes,
+                ranking_pool,
                 key=lambda p: (p["evidence_count"], p["score"]),
                 reverse=True,
             )
 
             top_evidence = passes_sorted[0]["evidence_count"]
-            # All passes with the top evidence count
             top_passes = [p for p in passes_sorted if p["evidence_count"] == top_evidence]
 
             if len(top_passes) == 1:
                 best = top_passes[0]
             else:
-                # Tie in evidence count: use LOWER score (conservative)
-                top_passes.sort(key=lambda p: p["score"])
+                # Tie in evidence count: prefer HIGHER score (the pass that
+                # found more content is more informative)
+                top_passes.sort(key=lambda p: p["score"], reverse=True)
                 best = top_passes[0]
 
             # Flag significant disagreements for transparency
@@ -5748,9 +5802,33 @@ def _distribute_images_to_windows(
     return buckets
 
 
-def _adaptive_max_tokens(rubric_criteria: list[dict]) -> int:
-    """Compute max_tokens budget based on rubric complexity."""
-    return max(3000, 800 + len(rubric_criteria) * 250)
+def _adaptive_max_tokens(rubric_criteria: list[dict], input_char_count: int = 0) -> int:
+    """Compute max_tokens budget dynamically from model capacity.
+
+    Strategy:
+    1. Estimate input tokens from actual prompt character count.
+    2. Subtract from model context window to get available output budget.
+    3. Apply a per-criterion minimum so no rubric item gets truncated.
+    4. If input is so large that output budget is too small, use a safe minimum.
+    """
+    from app.config import MODEL_CONTEXT_TOKENS, MODEL_RESERVED_TOKENS, CHARS_PER_TOKEN_ESTIMATE
+
+    # Per-criterion budget: each criterion needs ~350 tokens for score + justification + citations
+    per_criterion = 350
+    criteria_need = max(2500, len(rubric_criteria) * per_criterion + 800)  # baseline output need
+
+    if input_char_count > 0:
+        estimated_input_tokens = int(input_char_count / CHARS_PER_TOKEN_ESTIMATE)
+        available_output = MODEL_CONTEXT_TOKENS - estimated_input_tokens - 500  # 500 token safety margin
+        # Use the larger of: what criteria need, or 60% of available output (leave headroom)
+        dynamic_budget = max(criteria_need, int(available_output * 0.6))
+        # But never exceed what the model can actually produce
+        dynamic_budget = min(dynamic_budget, available_output)
+        # And never go below a safe minimum
+        return max(3000, dynamic_budget)
+    else:
+        # Fallback: no input size known, use criteria-based estimate
+        return max(3000, criteria_need)
 
 
 def _score_to_letter(score: float, max_score: int) -> str:
@@ -5811,7 +5889,8 @@ async def _single_pass_grade(
         )
         text_window = window_header + text_window
 
-    max_tokens = _adaptive_max_tokens(rubric_criteria)
+    _input_chars = len(user_text) + len(text_window) + len(str(system_content or ""))
+    max_tokens = _adaptive_max_tokens(rubric_criteria, input_char_count=_input_chars)
 
     # Build multimodal content
     user_content, img_count, images_info = _build_multimodal_content(
@@ -6223,7 +6302,8 @@ async def grade_student(
             # Fall through to single-pass as safety net
 
     # ── Single-pass grading (original path) ─────────────────────────
-    max_tokens = _adaptive_max_tokens(rubric_criteria)
+    _input_chars_single = len(user_text) + len(text_content) + len(system_content)
+    max_tokens = _adaptive_max_tokens(rubric_criteria, input_char_count=_input_chars_single)
     user_content, img_count, images_info = _build_multimodal_content(user_text, text_content, final_images)
 
     messages = [

@@ -73,11 +73,22 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'grading.db'}"
 
 # ── Multi-Pass Grading ────────────────────────────────────────────
-# When a student's content exceeds a single context window, the grader
-# splits into multiple passes and aggregates with MAX-score-per-criterion.
-MULTI_PASS_TEXT_THRESHOLD: int = int(os.getenv("MULTI_PASS_TEXT_THRESHOLD", "28000"))
-MULTI_PASS_WINDOW_SIZE: int = int(os.getenv("MULTI_PASS_WINDOW_SIZE", "24000"))
-MULTI_PASS_OVERLAP: int = int(os.getenv("MULTI_PASS_OVERLAP", "2000"))  # overlap chars between windows
+# Multi-pass splits content into windows when it exceeds the model's
+# effective context.  Llama 4 Maverick has 128K tokens (~400K chars),
+# so we set the threshold high — multi-pass should only trigger for
+# truly massive submissions, not normal 3-4 file assignments.
+MODEL_CONTEXT_TOKENS: int = int(os.getenv("MODEL_CONTEXT_TOKENS", "128000"))
+# Reserve tokens for system prompt + output — the rest is available for student content
+MODEL_RESERVED_TOKENS: int = int(os.getenv("MODEL_RESERVED_TOKENS", "12000"))
+# Chars-per-token estimate (conservative for Llama tokenizer)
+CHARS_PER_TOKEN_ESTIMATE: float = float(os.getenv("CHARS_PER_TOKEN_ESTIMATE", "3.2"))
+# Effective char limit = (128000 - 12000) * 3.2 ≈ 371,200 chars
+MULTI_PASS_TEXT_THRESHOLD: int = int(os.getenv(
+    "MULTI_PASS_TEXT_THRESHOLD",
+    str(int((MODEL_CONTEXT_TOKENS - MODEL_RESERVED_TOKENS) * CHARS_PER_TOKEN_ESTIMATE))
+))
+MULTI_PASS_WINDOW_SIZE: int = int(os.getenv("MULTI_PASS_WINDOW_SIZE", "100000"))
+MULTI_PASS_OVERLAP: int = int(os.getenv("MULTI_PASS_OVERLAP", "4000"))  # overlap chars between windows
 FINAL_IMAGE_CAP: int = int(os.getenv("FINAL_IMAGE_CAP", "6"))  # images per LLM request
 
 # ── Code execution limits ─────────────────────────────────────────
