@@ -4931,14 +4931,15 @@ def _validate_result(result: dict, rubric_criteria: list[dict], max_score: int) 
                     "justification": "Not assessed by AI"
                 })
     
-    total = 0
+    # Sum using integer tenths to avoid floating-point drift
+    # e.g. round(0.1 + 0.2, 1) might give 0.30000000000000004
+    total_tenths = 0
     for item in fixed_breakdown:
         try:
-            total += float(item.get("score", 0))
+            total_tenths += round(float(item.get("score", 0)) * 10)
         except (ValueError, TypeError):
             pass
-    
-    total = round(total, 1)
+    total = round(total_tenths / 10, 1)
     total = max(0, min(total, max_score))
     
     percentage = round((total / max_score) * 100, 1) if max_score > 0 else 0
@@ -5719,7 +5720,7 @@ class GradingContext:
             if disagreement_flag:
                 disagreements += 1
 
-            score = min(float(best["score"]), float(rc["max"]))
+            score = round(min(float(best["score"]), float(rc["max"])), 1)
             item = {
                 "criterion": crit,
                 "score": score,
@@ -5733,7 +5734,7 @@ class GradingContext:
             breakdown.append(item)
             total += score
 
-        total = min(total, float(max_score))
+        total = round(min(total, float(max_score)), 1)
         pct = round(total / max_score * 100, 1) if max_score else 0
         grade = _score_to_letter(total, max_score)
 
@@ -6034,11 +6035,12 @@ async def _multi_pass_grade(
         max_score,
     )
     if score_adj_stats.get("adjusted", 0) > 0:
-        new_total = sum(
+        new_total = round(sum(
             float(item.get("score", 0))
             for item in aggregated.get("rubric_breakdown", [])
-        )
-        new_total = min(new_total, float(max_score))
+            if isinstance(item, dict)
+        ), 1)
+        new_total = round(min(new_total, float(max_score)), 1)
         aggregated["total_score"] = new_total
         aggregated["percentage"] = round(new_total / max_score * 100, 1) if max_score else 0
         aggregated["letter_grade"] = _score_to_letter(new_total, max_score)
@@ -6571,11 +6573,12 @@ async def grade_student(
                 max_score,
             )
             if score_adj_stats.get("adjusted", 0) > 0:
-                new_total = sum(
+                new_total = round(sum(
                     float(item.get("score", 0))
                     for item in validated.get("rubric_breakdown", [])
-                )
-                new_total = min(new_total, float(max_score))
+                    if isinstance(item, dict)
+                ), 1)
+                new_total = round(min(new_total, float(max_score)), 1)
                 validated["total_score"] = new_total
                 validated["percentage"] = round(new_total / max_score * 100, 1) if max_score else 0
                 validated["letter_grade"] = _score_to_letter(new_total, max_score)
