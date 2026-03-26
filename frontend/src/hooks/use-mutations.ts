@@ -73,9 +73,9 @@ export function useStopGrading() {
 export function useRegradeStudent() {
   const queryClient = useQueryClient()
 
-  return useMutation<{ message: string; student_id: number }, Error, { sessionId: number; studentId: number }>({
-    mutationFn: ({ sessionId, studentId }) =>
-      regradeStudent(sessionId, studentId),
+  return useMutation<{ message: string; student_id: number }, Error, { sessionId: number; studentId: number; force?: boolean }>({
+    mutationFn: ({ sessionId, studentId, force }) =>
+      regradeStudent(sessionId, studentId, force),
     onSuccess: (_data, { sessionId }) => {
       queryClient.invalidateQueries({
         queryKey: ['students', sessionId],
