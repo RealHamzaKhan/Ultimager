@@ -7,8 +7,9 @@ import { Input } from '@/components/ui/input'
 import { useStudents, type StudentFilters } from '@/hooks/use-students'
 import { useUIStore } from '@/stores/ui-store'
 import { scoreToGrade, formatScore, cn } from '@/lib/utils'
+import { regradeStudent } from '@/lib/api'
 import type { Submission } from '@/lib/types'
-import { Search, Flag, ChevronUp, ChevronDown, RotateCcw } from 'lucide-react'
+import { Search, Flag, ChevronUp, ChevronDown, RotateCcw, Loader2 } from 'lucide-react'
 import Link from 'next/link'
 
 interface StudentTableProps {
@@ -50,6 +51,7 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [isRegrading, setIsRegrading] = useState(false)
 
   const {
     selectedStudents,
@@ -60,6 +62,23 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
     tableSortColumn,
     tableSortDirection,
   } = useUIStore()
+
+  const handleRegradeSelected = useCallback(async () => {
+    if (selectedStudents.size === 0 || isRegrading) return
+    setIsRegrading(true)
+    try {
+      const ids = Array.from(selectedStudents)
+      // Fire all regrade requests in parallel
+      await Promise.allSettled(
+        ids.map((studentId) => regradeStudent(sessionId, studentId))
+      )
+      clearStudentSelection()
+    } catch (err) {
+      console.error('Regrade selected failed:', err)
+    } finally {
+      setIsRegrading(false)
+    }
+  }, [selectedStudents, sessionId, isRegrading, clearStudentSelection])
 
   // Debounce search input
   useEffect(() => {
@@ -189,9 +208,15 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
             variant="outline"
             size="sm"
             className="gap-2"
+            onClick={handleRegradeSelected}
+            disabled={isRegrading}
           >
-            <RotateCcw className="h-4 w-4" />
-            Regrade Selected
+            {isRegrading ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RotateCcw className="h-4 w-4" />
+            )}
+            {isRegrading ? 'Regrading...' : 'Regrade Selected'}
           </Button>
         </div>
       )}
