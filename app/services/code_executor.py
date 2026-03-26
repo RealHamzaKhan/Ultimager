@@ -97,7 +97,7 @@ def _execute_single(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         # Copy student files
-        for item in student_dir.rglob("*"):
+        for item in sorted(student_dir.rglob("*")):
             if item.is_file():
                 rel = item.relative_to(student_dir)
                 dest = tmp_path / rel
@@ -200,7 +200,7 @@ def _run_subprocess(
 
 def _detect_run_command(student_dir: Path) -> Optional[str]:
     """Try to auto-detect the correct run command from file extensions."""
-    files = list(student_dir.rglob("*"))
+    files = sorted(student_dir.rglob("*"))
     extensions = {f.suffix.lower() for f in files if f.is_file()}
 
     if ".py" in extensions:

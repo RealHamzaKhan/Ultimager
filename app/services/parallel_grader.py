@@ -15,7 +15,6 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Callable
-import random
 import threading
 import json
 
@@ -821,8 +820,9 @@ class ParallelGrader:
                     retry_count = retry_queue.get(completed_sub_id, 0)
 
                     if retry_count < max_retries:
-                        # Re-queue with backoff
-                        await asyncio.sleep(random.uniform(1, 3))  # Random backoff
+                        # Re-queue with deterministic exponential backoff
+                        backoff_secs = 2 ** retry_count  # 1s, 2s, 4s, ...
+                        await asyncio.sleep(backoff_secs)
                         pending.append(completed_sub)
                         retry_queue[completed_sub_id] = retry_count + 1
                         logger.info(f"Rate limited, will retry ({retry_count + 1}/{max_retries})")
@@ -843,7 +843,7 @@ class ParallelGrader:
                             or "connection" in error_msg.lower()
                             or "timeout" in error_msg.lower()
                         )
-                        backoff = random.uniform(8, 15) if is_provider_error else random.uniform(1, 3)
+                        backoff = (2 ** retry_count) * (10 if is_provider_error else 2)  # 10/20/40s or 2/4/8s
                         logger.info(
                             f"[PARALLEL_GRADER] Retrying {completed_sub.student_identifier} "
                             f"(attempt {retry_count + 1}/{max_retries}, backoff={backoff:.1f}s, "

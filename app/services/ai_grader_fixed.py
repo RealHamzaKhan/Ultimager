@@ -3006,7 +3006,7 @@ def _vision_batch_with_failover(
                         {"role": "user", "content": user_content},
                     ],
                     temperature=0.0,
-                    top_p=0.1,
+                    top_p=1.0,
                     # BUG-25 fix: scale tokens with chunk size (~250 tokens per image)
                     max_tokens=min(4000, max(1200, len(chunk) * 250)),
                     seed=42,
@@ -3095,7 +3095,7 @@ async def _consolidate_vision_notes(batch_notes: list[dict[str, Any]]) -> tuple[
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.0,
-            top_p=0.1,
+            top_p=1.0,
             max_tokens=1200,
             seed=42,
             response_format={"type": "json_object"},
@@ -3481,6 +3481,7 @@ def _select_images_for_preanalysis(images: list[dict], max_images: int) -> list[
             key=lambda x: (
                 float(x.get("content_score", 0.0) or 0.0),
                 int(x.get("size_bytes", 0) or 0),
+                str(x.get("description", "")),
             ),
         )
         anchors.append(best)
@@ -3618,7 +3619,8 @@ def _pick_diverse_images_for_grading(images: list[dict], max_images: int) -> lis
 
     # 1) Coverage pass: choose best image per file, preferring visual-heavy.
     file_best: list[tuple[float, str, dict]] = []
-    for fname, file_imgs in by_file.items():
+    for fname in sorted(by_file.keys()):
+        file_imgs = by_file[fname]
         # Prefer visual-heavy from this file; fall back to any
         visual_in_file = [x for x in file_imgs if x.get("_ocr_needs_visual", True)]
         candidate_pool = visual_in_file if visual_in_file else file_imgs
@@ -3631,6 +3633,8 @@ def _pick_diverse_images_for_grading(images: list[dict], max_images: int) -> lis
             key=lambda x: (
                 float(x.get("content_score", 0.0) or 0.0),
                 int(x.get("size_bytes", 0) or 0),
+                str(x.get("filename", "")),
+                int(x.get("page", 0) or 0),
             ),
         )
         file_best.append((float(best.get("content_score", 0.0) or 0.0), fname, best))
@@ -3653,6 +3657,8 @@ def _pick_diverse_images_for_grading(images: list[dict], max_images: int) -> lis
             0 if x.get("is_focus") else 1,
             -float(x.get("content_score", 0.0) or 0.0),
             -int(x.get("size_bytes", 0) or 0),
+            str(x.get("filename", "")),
+            int(x.get("page", 0) or 0),
         ),
     )
     for img in visual_remaining:
@@ -3667,6 +3673,8 @@ def _pick_diverse_images_for_grading(images: list[dict], max_images: int) -> lis
             0 if x.get("is_focus") else 1,
             -float(x.get("content_score", 0.0) or 0.0),
             -int(x.get("size_bytes", 0) or 0),
+            str(x.get("filename", "")),
+            int(x.get("page", 0) or 0),
         ),
     )
     for img in text_remaining:
@@ -4215,7 +4223,7 @@ async def _verify_citations_with_llm(
                 {"role": "user", "content": verifier_prompt},
             ],
             temperature=0.0,
-            top_p=0.1,
+            top_p=1.0,
             max_tokens=1200,
             seed=42,
             preferred_provider=preferred_provider,
@@ -4392,7 +4400,7 @@ async def _verify_scores_with_llm(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.0,
-            top_p=0.1,
+            top_p=1.0,
             max_tokens=1500,
             seed=42,
             preferred_provider=preferred_provider,
@@ -4779,7 +4787,7 @@ async def _repair_grading_json(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
-            top_p=0.1,
+            top_p=1.0,
             max_tokens=1800,
             seed=42,
             preferred_provider=preferred_provider,
@@ -6008,7 +6016,7 @@ async def _single_pass_grade(
         needs_vision=img_count > 0,
         messages=messages,
         temperature=0.0,
-        top_p=0.1,
+        top_p=1.0,
         max_tokens=max_tokens,
         seed=42,
         preferred_provider=scoring_primary,
@@ -6505,7 +6513,7 @@ async def grade_student(
                 needs_vision=img_count > 0,
                 messages=messages,
                 temperature=0.0,
-                top_p=0.1,
+                top_p=1.0,
                 max_tokens=max_tokens,
                 seed=42,
                 preferred_provider=scoring_primary,

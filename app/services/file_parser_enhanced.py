@@ -1683,7 +1683,7 @@ def process_student_submission(student_dir: Path, student_id: str,
     )
 
     all_files = []
-    for file_path in student_dir.rglob("*"):
+    for file_path in sorted(student_dir.rglob("*")):
         if file_path.is_file():
             # Skip hidden and system files (only check relative path parts, not parent dirs)
             rel_parts = file_path.relative_to(student_dir).parts
