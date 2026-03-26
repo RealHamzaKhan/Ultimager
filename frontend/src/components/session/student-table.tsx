@@ -89,11 +89,17 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
     try {
       const ids = Array.from(selectedStudents)
       const count = ids.length
-      const results = await Promise.allSettled(
-        ids.map((studentId) => regradeStudent(sessionId, studentId))
-      )
-      const succeeded = results.filter((r) => r.status === 'fulfilled').length
-      const failed = results.filter((r) => r.status === 'rejected').length
+      let succeeded = 0
+      let failed = 0
+      // Send regrades sequentially to avoid backend 409 conflicts
+      for (const studentId of ids) {
+        try {
+          await regradeStudent(sessionId, studentId)
+          succeeded++
+        } catch {
+          failed++
+        }
+      }
       clearStudentSelection()
       await refetch()
       if (failed > 0) {

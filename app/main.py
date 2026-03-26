@@ -741,6 +741,7 @@ async def start_grading(session_id: int, db: Session = Depends(get_db)):
     # Initialize progress tracking
     _active_grading[session_id] = {
         "status": "grading",
+        "_batch_grading": True,  # Mark as batch grading to block individual regrades
         "current_student": "",
         "graded_count": 0,
         "failed_count": 0,
@@ -748,7 +749,7 @@ async def start_grading(session_id: int, db: Session = Depends(get_db)):
         "stage": "Initializing pipeline (upload/extract/OCR/vision/grading/moderation)...",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     # Disable ACMAG in live grading runs for stability; fall back to standard grading.
     use_acmag = False
     if ACMAG_ENABLED:
@@ -860,31 +861,36 @@ async def regrade_student(
     session = db.query(GradingSession).filter(GradingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Prevent regrade while session is actively grading
-    # Check actual grading status, not stale _active_grading entries
+
+    # Prevent regrade while a FULL batch grading is in progress.
+    # Individual regrades (from "Regrade Selected") are allowed concurrently.
     active_info = _active_grading.get(session_id)
-    is_actually_grading = (
+    is_batch_grading = (
         session.status == "grading"
-        or (active_info is not None and active_info.get("status") == "grading")
+        and active_info is not None
+        and active_info.get("_batch_grading", False)
     )
-    if is_actually_grading:
+    if is_batch_grading:
         return JSONResponse(
-            {"message": "Cannot regrade while grading is in progress. Stop grading first."},
+            {"message": "Cannot regrade while batch grading is in progress. Stop grading first."},
             status_code=409,
         )
-    # Clean up any stale active_grading entry
-    if active_info is not None and active_info.get("status") != "grading":
-        _active_grading.pop(session_id, None)
-    
+
     sub = db.query(StudentSubmission).filter(
         StudentSubmission.id == student_id,
         StudentSubmission.session_id == session_id
     ).first()
-    
+
     if not sub:
         raise HTTPException(status_code=404, detail="Student not found")
-    
+
+    # Prevent regrading a student that's already being regraded
+    if sub.status == "grading":
+        return JSONResponse(
+            {"message": "Student is already being graded", "student_id": student_id},
+            status_code=409,
+        )
+
     # Reset submission
     sub.status = "pending"
     sub.error_message = None
@@ -899,19 +905,20 @@ async def regrade_student(
 
     # Track a lightweight active job so SSE remains open for single re-grade.
     _stop_grading_flags[session_id] = False
-    _active_grading[session_id] = {
-        "status": "grading",
-        "current_student": sub.student_identifier,
-        "graded_count": session.graded_count or 0,
-        "failed_count": session.error_count or 0,
-        "total": session.total_students or 0,
-        "stage": f"Extraction + OCR (regrade) {sub.student_identifier}",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }
-    
+    if session_id not in _active_grading:
+        _active_grading[session_id] = {
+            "status": "grading",
+            "current_student": sub.student_identifier,
+            "graded_count": session.graded_count or 0,
+            "failed_count": session.error_count or 0,
+            "total": session.total_students or 0,
+            "stage": f"Regrade {sub.student_identifier}",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     # Grade this student immediately
     asyncio.get_event_loop().run_in_executor(None, _grade_single_student_sync, session_id, student_id)
-    
+
     return JSONResponse({"message": "Re-grading started", "student_id": student_id})
 
 
