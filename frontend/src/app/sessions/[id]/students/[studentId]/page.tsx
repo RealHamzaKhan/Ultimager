@@ -127,7 +127,7 @@ export default function StudentDetailPage() {
     setIsRegrading(true)
     setRegradeError(null)
     try {
-      await regradeStudent(sessionId, studentId, true)
+      await regradeStudent(sessionId, studentId)
       // Immediately invalidate cache so next poll gets fresh data
       queryClient.removeQueries({ queryKey: ['student', sessionId, studentId] })
 

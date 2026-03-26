@@ -855,7 +855,6 @@ async def regrade_all(session_id: int, db: Session = Depends(get_db)):
 async def regrade_student(
     session_id: int,
     student_id: int,
-    force: bool = Query(False, description="Force fresh grading, bypassing determinism guard"),
     db: Session = Depends(get_db),
 ):
     """Re-grade a single student."""
@@ -918,7 +917,7 @@ async def regrade_student(
         }
 
     # Grade this student immediately
-    asyncio.get_event_loop().run_in_executor(None, _grade_single_student_sync, session_id, student_id, force)
+    asyncio.get_event_loop().run_in_executor(None, _grade_single_student_sync, session_id, student_id)
 
     return JSONResponse({"message": "Re-grading started", "student_id": student_id})
 
@@ -966,8 +965,8 @@ def _broadcast_sse(session_id: int, event: dict):
             pass
 
 
-def _grade_single_student_sync(session_id: int, student_id: int, force: bool = False):
-    """Grade a single student in background. If force=True, bypass determinism guard."""
+def _grade_single_student_sync(session_id: int, student_id: int):
+    """Grade a single student in background."""
     db = SessionLocal()
     sub = None
     
@@ -1076,39 +1075,6 @@ def _grade_single_student_sync(session_id: int, student_id: int, force: bool = F
         )
         relevance_gate = evaluate_relevance_gate(relevance, image_count=_img_count)
         result: dict[str, Any]
-
-        # ── Determinism guard: reuse own previous result if hash unchanged ──
-        # LLMs are NOT deterministic even with temperature=0 + seed=42.
-        # If the student's content hasn't changed (same grading_hash), reuse
-        # their own previous successful result to prevent score fluctuation.
-        # Bypassed when force=True (teacher wants a fresh grading).
-        if not force and sub.ai_result and previous_ai_score is not None:
-            prev_result = _safe_json_load(sub.ai_result)
-            prev_hash = prev_result.get("grading_hash", "")
-            if prev_hash == grading_hash and not prev_result.get("error") and str(prev_result.get("confidence", "")).lower() != "low":
-                logger.info(
-                    f"Determinism guard: hash unchanged for {sub.student_identifier}, "
-                    f"reusing previous score {previous_ai_score}/{max_score_value}"
-                )
-                result = prev_result
-                result["_reused_deterministic"] = True
-                result["relevance_gate"] = relevance_gate
-                # Still update graded_at timestamp
-                sub.ai_result = json.dumps(result)
-                sub.status = "graded"
-                sub.graded_at = datetime.now(timezone.utc)
-                db.commit()
-                _active_grading.pop(session_id, None)
-                _broadcast_sse(session_id, {
-                    "type": "student_complete",
-                    "student_id": sub.id,
-                    "student": sub.student_identifier,
-                    "score": previous_ai_score,
-                    "max_score": max_score_value,
-                    "status": "graded",
-                    "message": "Deterministic result reused (content unchanged)",
-                })
-                return
 
         if relevance_gate.get("block_grading"):
             logger.warning(
