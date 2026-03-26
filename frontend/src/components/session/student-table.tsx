@@ -63,22 +63,7 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
     tableSortDirection,
   } = useUIStore()
 
-  const handleRegradeSelected = useCallback(async () => {
-    if (selectedStudents.size === 0 || isRegrading) return
-    setIsRegrading(true)
-    try {
-      const ids = Array.from(selectedStudents)
-      // Fire all regrade requests in parallel
-      await Promise.allSettled(
-        ids.map((studentId) => regradeStudent(sessionId, studentId))
-      )
-      clearStudentSelection()
-    } catch (err) {
-      console.error('Regrade selected failed:', err)
-    } finally {
-      setIsRegrading(false)
-    }
-  }, [selectedStudents, sessionId, isRegrading, clearStudentSelection])
+  const [regradeMessage, setRegradeMessage] = useState<string | null>(null)
 
   // Debounce search input
   useEffect(() => {
@@ -95,7 +80,36 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
     sortDir: tableSortDirection ?? undefined,
   }
 
-  const { students, isLoading } = useStudents(sessionId, filters)
+  const { students, isLoading, refetch } = useStudents(sessionId, filters)
+
+  const handleRegradeSelected = useCallback(async () => {
+    if (selectedStudents.size === 0 || isRegrading) return
+    setIsRegrading(true)
+    setRegradeMessage(null)
+    try {
+      const ids = Array.from(selectedStudents)
+      const count = ids.length
+      const results = await Promise.allSettled(
+        ids.map((studentId) => regradeStudent(sessionId, studentId))
+      )
+      const succeeded = results.filter((r) => r.status === 'fulfilled').length
+      const failed = results.filter((r) => r.status === 'rejected').length
+      clearStudentSelection()
+      await refetch()
+      if (failed > 0) {
+        setRegradeMessage(`Regrade started for ${succeeded}/${count} students (${failed} failed)`)
+      } else {
+        setRegradeMessage(`Regrade started for ${count} student${count > 1 ? 's' : ''}`)
+      }
+      setTimeout(() => setRegradeMessage(null), 5000)
+    } catch (err) {
+      console.error('Regrade selected failed:', err)
+      setRegradeMessage('Regrade failed — check console for details')
+      setTimeout(() => setRegradeMessage(null), 5000)
+    } finally {
+      setIsRegrading(false)
+    }
+  }, [selectedStudents, sessionId, isRegrading, clearStudentSelection, refetch])
 
   const handleSort = useCallback(
     (column: SortColumn) => {
@@ -218,6 +232,13 @@ export function StudentTable({ sessionId, maxScore }: StudentTableProps) {
             )}
             {isRegrading ? 'Regrading...' : 'Regrade Selected'}
           </Button>
+        </div>
+      )}
+
+      {/* Regrade status message */}
+      {regradeMessage && (
+        <div className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-4 py-2 text-sm text-indigo-300">
+          {regradeMessage}
         </div>
       )}
 
