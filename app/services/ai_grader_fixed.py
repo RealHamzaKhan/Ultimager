@@ -30,6 +30,7 @@ from app.config import (
     NVIDIA_API_KEY,
     NVIDIA_BASE_URL,
     NVIDIA_MODEL,
+    GLM_TEXT_MODEL,
     LLM_PROVIDER_ORDER,
     NVIDIA_MAX_IMAGES_PER_REQUEST,
     ENABLE_VISION_PREANALYSIS,
@@ -302,6 +303,26 @@ def _get_client(spec: ProviderSpec) -> Any:
     with _provider_state_lock:
         _provider_clients[key] = client
     return client
+
+
+def _call_rubric_model(
+    messages: list[dict],
+    temperature: float = 0.3,
+    max_tokens: int = 5000,
+) -> Any:
+    """Call NVIDIA_MODEL for rubric generation.
+
+    Returns an OpenAI-compatible response object (response.choices[0].message.content).
+    """
+    client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY, timeout=60.0)
+    response = client.chat.completions.create(
+        model=NVIDIA_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+    )
+    return response
 
 
 def _is_qwen_model(model_name: str) -> bool:
@@ -1278,16 +1299,14 @@ async def _extract_question_structure(
     )
 
     try:
-        response, _meta = _chat_completion_with_failover(
-            purpose="extract_questions",
-            needs_vision=False,
+        response = await asyncio.to_thread(
+            _call_rubric_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
             max_tokens=4000,
-            response_format={"type": "json_object"},
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1559,17 +1578,14 @@ Output ONLY valid JSON. No markdown fences. No extra text."""
 Generate the rubric following the question structure above. Total: exactly {max_score} points."""
 
     try:
-        response, _meta = _chat_completion_with_failover(
-            purpose="generate_rubric_phase2",
-            needs_vision=False,
+        response = await asyncio.to_thread(
+            _call_rubric_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            top_p=0.5,
             max_tokens=5000,
-            response_format={"type": "json_object"},
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1716,17 +1732,14 @@ Generate a {strictness} rubric with {detail_level} detail, summing to exactly {m
 For each criterion, the sub-item point breakdown in the description MUST sum to the criterion's max points."""
 
     try:
-        response, _meta = _chat_completion_with_failover(
-            purpose="generate_rubric",
-            needs_vision=False,
+        response = await asyncio.to_thread(
+            _call_rubric_model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            top_p=0.5,
             max_tokens=5000,
-            response_format={"type": "json_object"},
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1759,21 +1772,8 @@ For each criterion, the sub-item point breakdown in the description MUST sum to 
         }
 
     except Exception as e:
-        logger.exception("Failed to generate rubric with AI, using deterministic fallback")
-        fallback_criteria = _build_fallback_rubric(assignment_description, max_score, strictness)
-        return {
-            "success": True,
-            "fallback_used": True,
-            "error": str(e),
-            "rubric_text": _format_rubric_text(fallback_criteria, max_score),
-            "rubric_display": _format_rubric_display(fallback_criteria, max_score),
-            "criteria": fallback_criteria,
-            "questions": [],
-            "strictness": strictness,
-            "max_score": max_score,
-            "reasoning": "AI rubric generation failed; deterministic assignment-specific rubric was generated.",
-            "quality_warnings": ["ai_generation_failed"],
-        }
+        logger.exception("Failed to generate rubric with AI")
+        raise
 
 
 async def validate_submission_relevance(
@@ -6183,6 +6183,7 @@ async def grade_student(
     test_cases: Optional[str] = None,
     run_command: Optional[str] = None,
     student_dir: Optional[str] = None,
+    checkpoints: Optional[dict[str, list[dict]]] = None,
 ) -> dict[str, Any]:
     """Grade a student submission with full transparency."""
     
@@ -6342,6 +6343,86 @@ async def grade_student(
 
     scoring_primary = str(SCORING_PRIMARY_PROVIDER or "").strip().lower()
     scoring_allow_fallback = bool(SCORING_ALLOW_FALLBACK)
+
+    # ── Checkpoint-based grading (if checkpoints available) ─────────
+    if checkpoints and isinstance(checkpoints, dict) and any(checkpoints.values()):
+        logger.info(
+            "Using checkpoint-based grading (%d criteria with checkpoints)",
+            len(checkpoints),
+        )
+        try:
+            from app.services.checkpoint_grader import grade_with_checkpoints
+
+            # Build messages with images for the checkpoint grader
+            img_count = len(final_images)
+            _cp_user_content, _cp_img_count, _ = _build_multimodal_content(
+                "", text_content, final_images,
+            )
+            _cp_messages = [{"role": "user", "content": _cp_user_content}] if img_count > 0 else []
+
+            cp_result = await grade_with_checkpoints(
+                checkpoints_by_criterion=checkpoints,
+                criteria=rubric_criteria,
+                student_files=student_files,
+                title=title,
+                description=description,
+                max_score=max_score,
+                messages_with_images=_cp_messages,
+                vision_notes=full_vision_transcript if notes_attached_to_grading else None,
+                reference_solution=reference_solution,
+                _llm_call_fn=_chat_completion_with_failover,
+                _rate_limiter=_rate_limiter,
+                _extract_json_fn=_extract_json,
+                preferred_provider=scoring_primary,
+            )
+
+            # Enrich with standard fields
+            cp_result["grading_hash"] = grading_hash
+            cp_result["images_processed"] = selected_count
+            cp_result["text_chars_processed"] = len(text_content)
+            cp_result["evidence_map"] = evidence_map
+
+            # Build transparency report
+            _cp_call_meta = cp_result.pop("_call_meta", {})
+            cp_result["transparency"] = {
+                "text_chars_sent": len(text_content),
+                "images_sent": img_count,
+                "images_available_total": int(total_available_images),
+                "images_selected_total": selected_count,
+                "selection_pool_limit": selection_pool_limit,
+                "grading_method": "checkpoint",
+                "checkpoint_stats": cp_result.get("checkpoint_stats", {}),
+                "verification_rate": cp_result.get("verification_rate", 0),
+                "files_processed": [],
+                "images_info": [],
+                "evidence_map": evidence_map,
+                "llm_call": {
+                    "provider": _cp_call_meta.get("provider", scoring_primary or "auto"),
+                    "model": _cp_call_meta.get("model", ""),
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+            if vision_trace.get("enabled"):
+                cp_result["transparency"]["vision_preanalysis"] = dict(vision_trace)
+            for f in student_files:
+                if hasattr(f, "filename"):
+                    cp_result["transparency"]["files_processed"].append({
+                        "filename": f.filename,
+                        "type": f.file_type,
+                        "text_length": len(f.text_content) if f.text_content else 0,
+                        "image_count": len(f.images) if f.images else 0,
+                    })
+
+            logger.info(
+                "Checkpoint grading complete: %s/%s (%s) — verification rate: %s",
+                cp_result["total_score"], max_score, cp_result["letter_grade"],
+                cp_result.get("verification_rate", "?"),
+            )
+            return cp_result
+
+        except Exception as exc:
+            logger.error("Checkpoint grading failed, falling back to standard: %s", exc, exc_info=True)
+            # Fall through to standard grading
 
     # ── Multi-pass routing decision ─────────────────────────────────
     needs_multi_pass = len(text_content) > int(MULTI_PASS_TEXT_THRESHOLD)

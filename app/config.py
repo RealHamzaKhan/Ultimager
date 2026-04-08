@@ -10,14 +10,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 # ── NVIDIA NIM API ────────────────────────────────────────────────
-# Primary and only provider for this grading system
+# Primary provider — used for complex reasoning and code analysis
 NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
 # Llama 4 Maverick (17B MoE) - faster and more efficient than Qwen
 NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "meta/llama-4-maverick-17b-128e-instruct")
+# GLM 4.7 — used for text-only tasks like rubric generation (better instruction following)
+GLM_TEXT_MODEL: str = os.getenv("GLM_TEXT_MODEL", "z-ai/glm4.7")
 
 # Vision capabilities for the model
 NVIDIA_MAX_IMAGES_PER_REQUEST: int = int(os.getenv("NVIDIA_MAX_IMAGES_PER_REQUEST", "8"))
+# Images sent per file during routing — low detail for efficiency (routing needs content type, not fine detail)
+MAX_IMAGES_PER_FILE_FOR_ROUTING: int = int(os.getenv("MAX_IMAGES_PER_FILE_FOR_ROUTING", "2"))
 
 # Only use NVIDIA as the single provider
 LLM_PROVIDER_ORDER: str = os.getenv("LLM_PROVIDER_ORDER", "nvidia")
@@ -102,11 +106,14 @@ CODE_EXTENSIONS: set[str] = {
     ".css", ".r", ".m",
 }
 IMAGE_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+
+# M-3 fix: IGNORED_NAMES is applied to entries inside student archives.
+# Removed: generic stems "test"/"tests"/"testing" — these are valid student filenames
+#   (e.g. test.py, testing_approach.txt, unit_tests/).
+# Removed: all "__test__*" CI fixture names — dev artefacts never present in real uploads.
+# Kept:   OS junk that is ALWAYS safe to skip regardless of context.
 IGNORED_NAMES: set[str] = {
     "__MACOSX", ".DS_Store", "__pycache__", ".git", ".gitignore",
-    "test_datasets", "tests", "test", "testing",
-    "__test__carol_cpp", "__test__eve_pdf_text", "__test__nick_mixed", "__test__jake_flat",
-    "__test__grace_notebook", "__test__bob_java", "__test__frank_pdf_scanned", "__test__dan_docx",
-    "__test__karen_macos_junk", "__test__leo_empty", "__test__iris_nested", "__test__olivia_unsupported",
-    "__test__mia_unicode", "__test__alice_perfect", "__test__henry_images"
+    "test_datasets",    # explicit dataset folder used in dev — safe to ignore
+    "Thumbs.db", "desktop.ini",
 }

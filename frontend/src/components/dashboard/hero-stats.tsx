@@ -1,10 +1,7 @@
 'use client'
 
-import { Card } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
-import { formatScore } from '@/lib/utils'
 import type { Session } from '@/lib/types'
-import { BarChart3, Users, AlertTriangle, CheckCircle } from 'lucide-react'
+import { BarChart3, Users, AlertTriangle, Zap } from 'lucide-react'
 
 interface HeroStatsProps {
   sessions: Session[]
@@ -14,59 +11,58 @@ interface HeroStatsProps {
 
 export function HeroStats({ sessions, isLoading, isError }: HeroStatsProps) {
   if (isError) {
-    return <div className="text-center py-8 text-rose-500">Unable to load stats</div>
+    return <div style={{ textAlign: 'center', color: '#ef4444', padding: '20px 0', fontSize: 13 }}>Unable to load stats</div>
   }
 
   if (isLoading) {
     return (
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4" data-testid="hero-stats-skeleton">
-        {[1, 2, 3, 4].map((i) => (
-          <Card key={i} className="animate-pulse">
-            <div className="h-4 w-20 bg-slate-200 dark:bg-slate-700 rounded mb-2" />
-            <div className="h-8 w-16 bg-slate-200 dark:bg-slate-700 rounded" />
-          </Card>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }} data-testid="hero-stats-skeleton">
+        {[...Array(4)].map((_, i) => (
+          <div key={i} style={{ height: 80, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10 }} />
         ))}
       </div>
     )
   }
 
   const totalSessions = sessions.length
-  const activeSessions = sessions.filter((s) => s.status === 'grading').length
+  const activeSessions = sessions.filter(s => s.status === 'grading').length
   const totalStudents = sessions.reduce((acc, s) => acc + s.total_students, 0)
   const totalErrors = sessions.reduce((acc, s) => acc + s.error_count, 0)
 
   const stats = [
-    { label: 'Total Sessions', value: String(totalSessions), icon: BarChart3, color: 'text-indigo-500' },
-    {
-      label: 'Active Sessions',
-      value: String(activeSessions),
-      icon: CheckCircle,
-      color: 'text-emerald-500',
-      pulse: activeSessions > 0,
-    },
-    { label: 'Total Students', value: String(totalStudents), icon: Users, color: 'text-sky-500' },
-    { label: 'Errors', value: String(totalErrors), icon: AlertTriangle, color: totalErrors > 0 ? 'text-rose-500' : 'text-slate-500' },
+    { label: 'Sessions', value: totalSessions, Icon: BarChart3, color: '#818cf8' },
+    { label: 'Active', value: activeSessions, Icon: Zap, color: activeSessions > 0 ? '#22c55e' : '#555' },
+    { label: 'Students', value: totalStudents, Icon: Users, color: '#38bdf8' },
+    { label: 'Errors', value: totalErrors, Icon: AlertTriangle, color: totalErrors > 0 ? '#ef4444' : '#555' },
   ]
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4" data-testid="hero-stats">
-      {stats.map((stat) => (
-        <Card key={stat.label}>
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-[var(--text-muted)]">{stat.label}</p>
-              <p className={`text-2xl font-bold ${stat.color}`}>
-                {stat.value}
-              </p>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }} data-testid="hero-stats">
+      {stats.map(({ label, value, Icon, color }) => (
+        <div key={label} style={{
+          background: 'var(--bg-card)',
+          border: '1px solid var(--border)',
+          borderRadius: 10,
+          padding: '14px 16px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 10,
+        }}>
+          <div>
+            <div style={{ fontSize: 10, color: '#666', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+              {label}
             </div>
-            <stat.icon className={`h-8 w-8 ${stat.color} opacity-60 ${stat.pulse ? 'animate-pulse' : ''}`} />
+            <div style={{
+              fontSize: 26, fontWeight: 700, color,
+              fontFamily: 'var(--font-mono), monospace',
+              letterSpacing: '-0.04em', lineHeight: 1,
+            }}>
+              {value}
+            </div>
           </div>
-          {stat.pulse && (
-            <Badge variant="success" pulse className="mt-2">
-              Live
-            </Badge>
-          )}
-        </Card>
+          <Icon style={{ width: 22, height: 22, color, opacity: 0.5, flexShrink: 0 }} />
+        </div>
       ))}
     </div>
   )

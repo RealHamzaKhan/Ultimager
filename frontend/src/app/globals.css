@@ -33,20 +33,25 @@
 }
 
 [data-theme="dark"] {
-  --bg-page: #080c14;
-  --bg-card: #0f172a;
-  --bg-card-hover: #1e293b;
-  --border: #1e293b;
-  --border-muted: #334155;
+  --bg-page: #08080e;
+  --bg-sidebar: #0a0a14;
+  --bg-card: #0e0e1a;
+  --bg-card-hover: #141420;
+  --border: #18181f;
+  --border-muted: #1e1e2e;
 
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #475569;
-  --text-disabled: #334155;
+  --text-primary: #ffffff;
+  --text-secondary: #888;
+  --text-muted: #444;
+  --text-disabled: #2a2a3a;
 
-  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
-  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.4);
-  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.5);
+  --color-review: #ef4444;
+  --color-low: #f97316;
+  --color-pass: #22c55e;
+
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.4);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.6);
 }
 
 @theme inline {

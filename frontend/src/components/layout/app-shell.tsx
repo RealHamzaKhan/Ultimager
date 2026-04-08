@@ -19,7 +19,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         )}
       >
         <Topbar />
-        <main className="p-6 overflow-auto">{children}</main>
+        <main className="p-6">{children}</main>
       </div>
       <CommandPalette />
     </div>

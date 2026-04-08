@@ -2,39 +2,23 @@
 
 import { useParams } from 'next/navigation'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { AppShell } from '@/components/layout/app-shell'
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { fetchSession } from '@/lib/api'
-import type { SessionStatus } from '@/lib/types'
+import { fetchSession, fetchStudents, uploadSubmissions, overrideScore } from '@/lib/api'
+import type { SessionStatus, Submission } from '@/lib/types'
 import Link from 'next/link'
 import {
-  BarChart3,
-  Download,
-  Play,
-  Square,
-  Users,
-  CheckCircle2,
-  AlertTriangle,
-  Gauge,
-  Upload,
-  RefreshCw,
-  ChevronDown,
-  ChevronUp,
-  FileText,
-  BookOpen,
-  ArrowLeft,
-  Clock,
-  UserPlus,
+  BarChart3, Download, Play, Square, AlertTriangle,
+  RefreshCw, FileText, BookOpen, ArrowLeft, UserPlus, CheckCheck,
 } from 'lucide-react'
-import { StudentTable } from '@/components/session/student-table'
+import { StudentSidebar } from '@/components/session/student-sidebar'
+import { StudentReviewPanel } from '@/components/session/student-review-panel'
 import { GradingTheater } from '@/components/session/grading-theater'
 import { UploadZone } from '@/components/session/upload-zone'
 import { AddStudentDialog } from '@/components/session/add-student-dialog'
 import { useStartGrading, useStopGrading } from '@/hooks/use-mutations'
-import { uploadSubmissions } from '@/lib/api'
 
 const statusVariant: Record<SessionStatus, 'default' | 'success' | 'warning' | 'error' | 'info'> = {
   pending: 'default',
@@ -51,41 +35,52 @@ const statusVariant: Record<SessionStatus, 'default' | 'success' | 'warning' | '
 const statusLabel: Record<string, string> = {
   pending: 'Pending',
   uploading: 'Uploading',
-  grading: 'Grading',
+  grading: 'Grading…',
   complete: 'Complete',
   completed: 'Complete',
-  completed_with_errors: 'Completed with Errors',
+  completed_with_errors: 'Done with errors',
   error: 'Error',
   stopped: 'Stopped',
   paused: 'Stopped',
 }
 
-function isCompleted(status: SessionStatus): boolean {
+function isCompleted(status: SessionStatus) {
   return status === 'complete' || status === 'completed' || status === 'completed_with_errors'
 }
-
-function isGrading(status: SessionStatus): boolean {
+function isGrading(status: SessionStatus) {
   return status === 'grading'
 }
 
-type TabKey = 'students' | 'description' | 'rubric'
+function getEffectiveScore(s: Submission): number | null {
+  return s.override_score ?? s.ai_score ?? null
+}
+
+function sortStudents(students: Submission[]): Submission[] {
+  return [...students].sort((a, b) => {
+    const aErr = a.status === 'error' || a.is_flagged
+    const bErr = b.status === 'error' || b.is_flagged
+    if (aErr && !bErr) return -1
+    if (!aErr && bErr) return 1
+    if (!a.is_reviewed && b.is_reviewed) return -1
+    if (a.is_reviewed && !b.is_reviewed) return 1
+    const aS = getEffectiveScore(a) ?? Infinity
+    const bS = getEffectiveScore(b) ?? Infinity
+    return aS - bS
+  })
+}
 
 export default function SessionDetailPage() {
   const params = useParams()
   const sessionId = Number(params.id)
-
   const queryClient = useQueryClient()
   const startGrading = useStartGrading()
   const stopGrading = useStopGrading()
-  const [activeTab, setActiveTab] = useState<TabKey>('students')
-  const [descExpanded, setDescExpanded] = useState(false)
-  const [addStudentOpen, setAddStudentOpen] = useState(false)
 
-  const handleUpload = async (file: File) => {
-    await uploadSubmissions(sessionId, file)
-    queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
-    queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
-  }
+  const [selectedStudentId, setSelectedStudentId] = useState<number | null>(null)
+  const [addStudentOpen, setAddStudentOpen] = useState(false)
+  const [infoTab, setInfoTab] = useState<'description' | 'rubric' | null>(null)
+  const [bulkApproving, setBulkApproving] = useState(false)
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null)
 
   const { data: session, isLoading, isError } = useQuery({
     queryKey: ['session', sessionId],
@@ -96,23 +91,79 @@ export default function SessionDetailPage() {
     },
   })
 
+  const { data: students } = useQuery({
+    queryKey: ['students', sessionId],
+    queryFn: () => fetchStudents(sessionId),
+    // Always fetch when session is loaded — we need students during grading too
+    // so GradingTheater can seed the live-feed with already-graded students
+    enabled: !!session,
+    refetchInterval: session && isGrading(session.status as SessionStatus) ? 3000 : false,
+  })
+
+  // Auto-select: prefer first graded/error student, fall back to first student overall
+  // so the panel is never empty even when grading is just starting.
+  useEffect(() => {
+    if (!students || students.length === 0 || selectedStudentId !== null) return
+    const sorted = sortStudents(students)
+    const firstGraded = sorted.find(s => s.status === 'graded' || s.status === 'error')
+    const first = firstGraded ?? sorted[0]
+    if (first) setSelectedStudentId(first.id)
+  }, [students, selectedStudentId])
+
+  const handleNext = useCallback(() => {
+    if (!students || !selectedStudentId) return
+    const sorted = sortStudents(students)
+    const idx = sorted.findIndex(s => s.id === selectedStudentId)
+    const next = sorted[idx + 1]
+    if (next) setSelectedStudentId(next.id)
+  }, [students, selectedStudentId])
+
+  const handleUpload = async (file: File) => {
+    await uploadSubmissions(sessionId, file)
+    queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
+    queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
+  }
+
+  // Bulk approve: approve all students that are graded, not yet reviewed,
+  // not flagged, and AI confidence is not low — the "clearly fine" students.
+  const handleBulkApprove = useCallback(async () => {
+    if (!students || bulkApproving) return
+    const eligible = students.filter(s =>
+      s.status === 'graded' &&
+      !s.is_reviewed &&
+      !s.is_flagged &&
+      s.ai_confidence !== 'low'
+    )
+    if (eligible.length === 0) return
+    setBulkApproving(true)
+    setBulkProgress({ done: 0, total: eligible.length })
+    let done = 0
+    for (const s of eligible) {
+      try {
+        const score = s.override_score ?? s.ai_score ?? 0
+        await overrideScore(sessionId, s.id, { score, comments: 'Bulk approved', is_reviewed: true })
+        done++
+        setBulkProgress({ done, total: eligible.length })
+      } catch {
+        // continue even if one fails
+      }
+    }
+    queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
+    queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
+    setBulkApproving(false)
+    setBulkProgress(null)
+  }, [students, bulkApproving, sessionId, queryClient])
+
   if (isLoading) {
     return (
       <AppShell>
-        <div className="max-w-7xl mx-auto space-y-6">
-          {/* Skeleton header */}
-          <div className="space-y-3">
-            <div className="h-5 w-32 bg-zinc-800 rounded animate-pulse" />
-            <div className="h-9 w-80 bg-zinc-800 rounded animate-pulse" />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ height: 14, width: 120, background: '#111', borderRadius: 4 }} />
+          <div style={{ height: 44, background: '#0e0e1a', borderRadius: 8 }} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 8 }}>
+            {[...Array(5)].map((_, i) => <div key={i} style={{ height: 64, background: '#0e0e1a', borderRadius: 8 }} />)}
           </div>
-          {/* Skeleton stats */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {[...Array(4)].map((_, i) => (
-              <div key={i} className="h-28 bg-zinc-800/60 rounded-xl animate-pulse border border-zinc-700/50" />
-            ))}
-          </div>
-          {/* Skeleton table */}
-          <div className="h-96 bg-zinc-800/60 rounded-xl animate-pulse border border-zinc-700/50" />
+          <div style={{ height: 400, background: '#0e0e1a', borderRadius: 10 }} />
         </div>
       </AppShell>
     )
@@ -121,17 +172,11 @@ export default function SessionDetailPage() {
   if (isError || !session) {
     return (
       <AppShell>
-        <div className="max-w-7xl mx-auto text-center py-20">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-rose-500/10 mb-4">
-            <AlertTriangle className="h-8 w-8 text-rose-400" />
-          </div>
-          <p className="text-rose-400 text-lg font-medium">Session not found</p>
-          <p className="text-zinc-500 text-sm mt-1">This session may have been deleted or does not exist.</p>
+        <div style={{ textAlign: 'center', padding: '60px 0' }}>
+          <AlertTriangle style={{ width: 36, height: 36, margin: '0 auto 10px', color: '#ef4444' }} />
+          <p style={{ color: '#555', fontSize: 13 }}>Session not found</p>
           <Link href="/">
-            <Button variant="outline" className="mt-6 gap-2">
-              <ArrowLeft className="h-4 w-4" />
-              Back to Dashboard
-            </Button>
+            <Button variant="outline" style={{ marginTop: 14 }}>← Back</Button>
           </Link>
         </div>
       </AppShell>
@@ -141,372 +186,258 @@ export default function SessionDetailPage() {
   const progress = session.total_students > 0
     ? Math.round((session.graded_count / session.total_students) * 100)
     : 0
+  const hasStudents = session.total_students > 0
+  const showUpload = !isGrading(session.status) &&
+    (session.status === 'pending' || session.status === 'stopped' || session.status === 'paused' || session.total_students === 0)
+  const canStartGrading = hasStudents && !isCompleted(session.status) && !isGrading(session.status)
+  // Show split panel whenever students exist — lets teacher see the roster and
+  // review already-graded students even while grading is actively running.
+  const showSplitPanel = hasStudents
 
-  const canStartGrading = session.total_students > 0 && !isCompleted(session.status) && !isGrading(session.status)
-  const showUpload = (session.status === 'pending' || session.status === 'stopped' || session.status === 'paused' || session.total_students === 0) && !isGrading(session.status)
-
-  const descriptionLines = session.description?.split('\n') || []
-  const hasLongDescription = session.description ? session.description.length > 200 || descriptionLines.length > 3 : false
-
-  const canAddStudent = !isGrading(session.status)
-
-  const tabs: { key: TabKey; label: string; icon: React.ReactNode; count?: number }[] = [
-    { key: 'students', label: 'Students', icon: <Users className="h-4 w-4" />, count: session.total_students },
-    { key: 'description', label: 'Description', icon: <FileText className="h-4 w-4" /> },
-    { key: 'rubric', label: 'Rubric', icon: <BookOpen className="h-4 w-4" /> },
-  ]
+  // Compute avg score
+  const avgScore = (() => {
+    if (!students || students.length === 0) return '—'
+    const graded = students.filter(s => s.ai_score !== null)
+    if (graded.length === 0) return '—'
+    const avg = graded.reduce((sum, s) => sum + (s.override_score ?? s.ai_score ?? 0), 0) / graded.length
+    return avg.toFixed(1)
+  })()
 
   return (
     <AppShell>
-      <div className="max-w-7xl mx-auto space-y-6">
-        {/* Breadcrumb */}
-        <Link href="/" className="inline-flex items-center gap-1.5 text-sm text-zinc-500 hover:text-zinc-300 transition-colors">
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Sessions
-        </Link>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
 
-        {/* Header Card */}
-        <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 p-6">
-          <div className="flex items-start justify-between gap-4">
-            {/* Left: Title + status + short description */}
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-3 flex-wrap">
-                <h1 className="text-2xl font-bold text-zinc-100 truncate">
-                  {session.title}
-                </h1>
-                <Badge
-                  variant={statusVariant[session.status] || 'default'}
-                  pulse={isGrading(session.status)}
-                >
-                  {statusLabel[session.status] || session.status}
-                </Badge>
-              </div>
-
-              {/* Inline short description preview */}
-              {session.description && (
-                <div className="mt-3">
-                  <p className={`text-sm text-zinc-400 leading-relaxed whitespace-pre-wrap ${!descExpanded && hasLongDescription ? 'line-clamp-3' : ''}`}>
-                    {session.description}
-                  </p>
-                  {hasLongDescription && (
-                    <button
-                      onClick={() => setDescExpanded(!descExpanded)}
-                      className="mt-1.5 inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors font-medium"
-                    >
-                      {descExpanded ? (
-                        <>Show less <ChevronUp className="h-3 w-3" /></>
-                      ) : (
-                        <>Show more <ChevronDown className="h-3 w-3" /></>
-                      )}
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Right: Action buttons */}
-            <div className="flex items-center gap-2 shrink-0">
-              {isGrading(session.status) ? (
-                <Button
-                  variant="danger"
-                  size="sm"
-                  onClick={() => stopGrading.mutate({ sessionId })}
-                  disabled={stopGrading.isPending}
-                  className="gap-1.5"
-                >
-                  <Square className="h-3.5 w-3.5" />
-                  Stop Grading
-                </Button>
-              ) : canStartGrading ? (
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => startGrading.mutate({ sessionId })}
-                  disabled={startGrading.isPending}
-                  className="gap-1.5"
-                >
-                  {startGrading.isPending ? (
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Play className="h-3.5 w-3.5" />
-                  )}
-                  {startGrading.isPending ? 'Starting...' : 'Start Grading'}
-                </Button>
-              ) : null}
-              {isCompleted(session.status) && (
-                <Link href={`/sessions/${sessionId}/results`}>
-                  <Button variant="outline" size="sm" className="gap-1.5">
-                    <BarChart3 className="h-3.5 w-3.5" />
-                    Results
-                  </Button>
-                </Link>
-              )}
-              {session.total_students > 0 && (
-                <a href={`http://localhost:8000/session/${sessionId}/export/csv`}>
-                  <Button variant="outline" size="sm" className="gap-1.5">
-                    <Download className="h-3.5 w-3.5" />
-                    CSV
-                  </Button>
-                </a>
-              )}
-            </div>
+        {/* ── Header ──────────────────────────────────────────────── */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          gap: 12, paddingBottom: 12, flexShrink: 0,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+            <Link href="/" style={{ color: '#444', textDecoration: 'none', flexShrink: 0, display: 'flex', alignItems: 'center' }}>
+              <ArrowLeft style={{ width: 14, height: 14 }} />
+            </Link>
+            <h1 style={{
+              fontSize: 17, fontWeight: 700, color: '#fff',
+              letterSpacing: '-0.02em', overflow: 'hidden',
+              textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              {session.title}
+            </h1>
+            <Badge variant={statusVariant[session.status] || 'default'} pulse={isGrading(session.status)}>
+              {statusLabel[session.status] || session.status}
+            </Badge>
           </div>
-        </div>
 
-        {/* Stats Cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard
-            icon={<Users className="h-5 w-5" />}
-            iconBg="bg-indigo-500/10"
-            iconColor="text-indigo-400"
-            label="Total Students"
-            value={session.total_students}
-          />
-          <StatCard
-            icon={<CheckCircle2 className="h-5 w-5" />}
-            iconBg="bg-emerald-500/10"
-            iconColor="text-emerald-400"
-            label="Graded"
-            value={session.graded_count}
-            accent="emerald"
-          />
-          <StatCard
-            icon={<AlertTriangle className="h-5 w-5" />}
-            iconBg="bg-rose-500/10"
-            iconColor="text-rose-400"
-            label="Errors"
-            value={session.error_count}
-            accent={session.error_count > 0 ? 'rose' : undefined}
-          />
-          <StatCard
-            icon={<Gauge className="h-5 w-5" />}
-            iconBg="bg-violet-500/10"
-            iconColor="text-violet-400"
-            label="Progress"
-            value={`${progress}%`}
-            accent="violet"
-            progressBar={progress}
-          />
-        </div>
-
-        {/* Grading Theater - shown during active grading */}
-        {isGrading(session.status) && (
-          <GradingTheater
-            sessionId={sessionId}
-            onComplete={() => {
-              queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
-              queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
-            }}
-          />
-        )}
-
-        {/* Upload Zone */}
-        {showUpload && (
-          <UploadZone
-            sessionId={sessionId}
-            onUpload={handleUpload}
-          />
-        )}
-
-        {/* Tabs */}
-        <div>
-          {/* Tab bar */}
-          <div className="flex items-center gap-1 border-b border-zinc-700/50 mb-0">
-            {tabs.map((tab) => (
-              <button
-                key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
-                className={`
-                  inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors relative
-                  ${activeTab === tab.key
-                    ? 'text-zinc-100'
-                    : 'text-zinc-500 hover:text-zinc-300'
-                  }
-                `}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+            {isGrading(session.status) ? (
+              <Button variant="danger" size="sm"
+                onClick={() => stopGrading.mutate({ sessionId })}
+                disabled={stopGrading.isPending}
               >
-                {tab.icon}
-                {tab.label}
-                {tab.count !== undefined && tab.count > 0 && (
-                  <span className={`
-                    text-xs px-1.5 py-0.5 rounded-full
-                    ${activeTab === tab.key
-                      ? 'bg-indigo-500/20 text-indigo-300'
-                      : 'bg-zinc-700/50 text-zinc-500'
-                    }
-                  `}>
-                    {tab.count}
-                  </span>
-                )}
-                {/* Active indicator */}
-                {activeTab === tab.key && (
-                  <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-indigo-500 rounded-full" />
-                )}
-              </button>
-            ))}
-          </div>
+                <Square style={{ width: 12, height: 12 }} /> Stop
+              </Button>
+            ) : canStartGrading ? (
+              <Button variant="primary" size="sm"
+                onClick={() => startGrading.mutate({ sessionId })}
+                disabled={startGrading.isPending}
+              >
+                {startGrading.isPending
+                  ? <RefreshCw style={{ width: 12, height: 12, animation: 'spin 1s linear infinite' }} />
+                  : <Play style={{ width: 12, height: 12 }} />}
+                {startGrading.isPending ? 'Starting…' : 'Grade'}
+              </Button>
+            ) : null}
 
-          {/* Tab content */}
-          <div className="mt-5">
-            {/* Students tab */}
-            {activeTab === 'students' && (
+            {/* Bulk Approve — only when session is complete and there are approvable students */}
+            {isCompleted(session.status) && students && (() => {
+              const eligible = students.filter(s =>
+                s.status === 'graded' && !s.is_reviewed && !s.is_flagged && s.ai_confidence !== 'low'
+              )
+              if (eligible.length === 0) return null
+              return (
+                <Button variant="outline" size="sm"
+                  onClick={handleBulkApprove}
+                  disabled={bulkApproving}
+                  title={`Approve all ${eligible.length} AI-verified students (not flagged, high/medium confidence)`}
+                  style={{ borderColor: '#22c55e40', color: bulkApproving ? '#555' : '#22c55e' }}
+                >
+                  <CheckCheck style={{ width: 12, height: 12 }} />
+                  {bulkApproving && bulkProgress
+                    ? `Approving ${bulkProgress.done}/${bulkProgress.total}…`
+                    : `Approve ${eligible.length} Verified`}
+                </Button>
+              )
+            })()}
+            {hasStudents && (
               <>
-                {session.total_students > 0 ? (
-                  <Card className="p-0 overflow-hidden">
-                    <div className="px-6 py-4 border-b border-zinc-700/50 flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <Users className="h-4 w-4 text-zinc-500" />
-                        <span className="text-sm font-medium text-zinc-300">
-                          {session.total_students} student{session.total_students !== 1 ? 's' : ''}
-                        </span>
-                      </div>
-                      {canAddStudent && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setAddStudentOpen(true)}
-                          className="gap-1.5"
-                        >
-                          <UserPlus className="h-3.5 w-3.5" />
-                          Add Student
-                        </Button>
-                      )}
-                    </div>
-                    <div className="p-0">
-                      <StudentTable sessionId={sessionId} maxScore={session.max_score} />
-                    </div>
-                  </Card>
-                ) : (
-                  <div className="text-center py-16 rounded-xl border border-zinc-700/30 border-dashed bg-zinc-800/20">
-                    <Users className="h-10 w-10 text-zinc-600 mx-auto mb-3" />
-                    <p className="text-zinc-400 font-medium">No students yet</p>
-                    <p className="text-zinc-600 text-sm mt-1">Upload submissions to get started</p>
-                    {canAddStudent && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => setAddStudentOpen(true)}
-                        className="gap-1.5 mt-4"
-                      >
-                        <UserPlus className="h-3.5 w-3.5" />
-                        Add Student Manually
-                      </Button>
-                    )}
-                  </div>
-                )}
-
-                {/* Add Student Dialog */}
-                <AddStudentDialog
-                  sessionId={sessionId}
-                  open={addStudentOpen}
-                  onClose={() => setAddStudentOpen(false)}
-                  onSuccess={() => {
-                    queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
-                    queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
-                  }}
-                />
+                <Link href={`/sessions/${sessionId}/results`}>
+                  <Button variant="outline" size="sm"><BarChart3 style={{ width: 12, height: 12 }} /> Results</Button>
+                </Link>
+                <a href={`/api/session/${sessionId}/export/csv`}>
+                  <Button variant="outline" size="sm"><Download style={{ width: 12, height: 12 }} /> CSV</Button>
+                </a>
               </>
             )}
-
-            {/* Description tab */}
-            {activeTab === 'description' && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2 text-base">
-                    <FileText className="h-4 w-4 text-zinc-500" />
-                    Assignment Description
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {session.description ? (
-                    <div className="prose prose-invert prose-sm max-w-none">
-                      <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap">
-                        {session.description}
-                      </p>
-                    </div>
-                  ) : (
-                    <p className="text-sm text-zinc-500 italic">No description provided.</p>
-                  )}
-                </CardContent>
-              </Card>
-            )}
-
-            {/* Rubric tab */}
-            {activeTab === 'rubric' && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2 text-base">
-                    <BookOpen className="h-4 w-4 text-zinc-500" />
-                    Rubric
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {session.rubric ? (
-                    <div className="prose prose-invert prose-sm max-w-none">
-                      <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap">
-                        {session.rubric}
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="text-center py-10">
-                      <BookOpen className="h-8 w-8 text-zinc-600 mx-auto mb-2" />
-                      <p className="text-sm text-zinc-500">No rubric defined for this session.</p>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
+            {!isGrading(session.status) && (
+              <Button variant="outline" size="sm" onClick={() => setAddStudentOpen(true)}>
+                <UserPlus style={{ width: 12, height: 12 }} /> Add
+              </Button>
             )}
           </div>
         </div>
+
+        {/* ── Stats ───────────────────────────────────────────────── */}
+        {(() => {
+          const reviewedCount = students?.filter(s => s.is_reviewed).length ?? 0
+          const needsReviewCount = students?.filter(s =>
+            s.status === 'graded' && !s.is_reviewed && (s.is_flagged || s.ai_confidence === 'low')
+          ).length ?? 0
+          return (
+            <div style={{
+              display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)',
+              gap: 8, marginBottom: 12, flexShrink: 0,
+            }}>
+              <StatChip label="Students" value={session.total_students} />
+              <StatChip label="Graded" value={session.graded_count} color="#22c55e" />
+              <StatChip label="Reviewed" value={reviewedCount} color={reviewedCount === session.graded_count && session.graded_count > 0 ? '#22c55e' : '#6366f1'} />
+              <StatChip label="Need Review" value={needsReviewCount} color={needsReviewCount > 0 ? '#f97316' : '#555'} />
+              <StatChip label="Errors" value={session.error_count} color={session.error_count > 0 ? '#ef4444' : undefined} />
+              <StatChip label="Avg Score" value={avgScore} color="#f59e0b" />
+            </div>
+          )
+        })()}
+
+        {/* ── Grading Theater ─────────────────────────────────────── */}
+        {isGrading(session.status) && (
+          <div style={{ marginBottom: 12 }}>
+            <GradingTheater
+              sessionId={sessionId}
+              sessionTotal={session.total_students}
+              existingStudents={students ?? []}
+              onComplete={() => {
+                queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
+                queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
+              }}
+            />
+          </div>
+        )}
+
+        {/* ── Upload Zone ─────────────────────────────────────────── */}
+        {showUpload && (
+          <div style={{ marginBottom: 12, flexShrink: 0 }}>
+            <UploadZone sessionId={sessionId} onUpload={handleUpload} />
+          </div>
+        )}
+
+        {/* ── Split Panel ─────────────────────────────────────────── */}
+        {showSplitPanel && (
+          <div style={{
+            display: 'flex',
+            border: '1px solid var(--border)', borderRadius: 12,
+            overflow: 'visible',
+            alignItems: 'flex-start',
+          }}>
+            <StudentSidebar
+              sessionId={sessionId}
+              maxScore={session.max_score}
+              selectedId={selectedStudentId}
+              onSelect={setSelectedStudentId}
+            />
+            {selectedStudentId ? (
+              <StudentReviewPanel
+                sessionId={sessionId}
+                studentId={selectedStudentId}
+                maxScore={session.max_score}
+                onNext={handleNext}
+                onApproved={() => queryClient.invalidateQueries({ queryKey: ['students', sessionId] })}
+              />
+            ) : (
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#333', fontSize: 13 }}>
+                Select a student to review
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Info Toggles ────────────────────────────────────────── */}
+        {(session.description || session.rubric) && (
+          <div style={{ marginTop: 10, flexShrink: 0, display: 'flex', gap: 6 }}>
+            {session.description && (
+              <button onClick={() => setInfoTab(infoTab === 'description' ? null : 'description')}
+                style={{
+                  background: infoTab === 'description' ? '#141420' : 'transparent',
+                  border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px',
+                  fontSize: 11, color: '#555', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 4,
+                }}>
+                <FileText style={{ width: 11, height: 11 }} /> Description
+              </button>
+            )}
+            {session.rubric && (
+              <button onClick={() => setInfoTab(infoTab === 'rubric' ? null : 'rubric')}
+                style={{
+                  background: infoTab === 'rubric' ? '#141420' : 'transparent',
+                  border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px',
+                  fontSize: 11, color: '#555', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 4,
+                }}>
+                <BookOpen style={{ width: 11, height: 11 }} /> Rubric
+              </button>
+            )}
+          </div>
+        )}
+        {infoTab === 'description' && session.description && (
+          <InfoBox text={session.description} />
+        )}
+        {infoTab === 'rubric' && session.rubric && (
+          <InfoBox text={session.rubric} />
+        )}
       </div>
+
+      <AddStudentDialog
+        sessionId={sessionId}
+        open={addStudentOpen}
+        onClose={() => setAddStudentOpen(false)}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
+          queryClient.invalidateQueries({ queryKey: ['students', sessionId] })
+        }}
+      />
+
+      <style>{`
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      `}</style>
     </AppShell>
   )
 }
 
-function StatCard({
-  icon,
-  iconBg,
-  iconColor,
-  label,
-  value,
-  accent,
-  progressBar,
-}: {
-  icon: React.ReactNode
-  iconBg: string
-  iconColor: string
-  label: string
-  value: number | string
-  accent?: 'emerald' | 'rose' | 'violet'
-  progressBar?: number
-}) {
-  const valueColor = accent === 'emerald'
-    ? 'text-emerald-400'
-    : accent === 'rose'
-      ? 'text-rose-400'
-      : accent === 'violet'
-        ? 'text-violet-400'
-        : 'text-zinc-100'
-
+function StatChip({ label, value, color }: { label: string; value: number | string; color?: string }) {
   return (
-    <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 p-4 relative overflow-hidden group hover:border-zinc-600/50 transition-colors">
-      <div className="flex items-start justify-between">
-        <div className={`rounded-lg ${iconBg} p-2.5 ${iconColor}`}>
-          {icon}
-        </div>
+    <div style={{
+      background: 'var(--bg-card)', border: '1px solid var(--border)',
+      borderRadius: 8, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2,
+    }}>
+      <div style={{ fontSize: 9, color: '#666', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{label}</div>
+      <div style={{
+        fontSize: 20, fontWeight: 700, color: color || '#fff',
+        fontFamily: 'var(--font-mono), monospace',
+        letterSpacing: '-0.03em', lineHeight: 1,
+      }}>
+        {value}
       </div>
-      <div className="mt-3">
-        <p className="text-xs text-zinc-500 font-medium uppercase tracking-wide">{label}</p>
-        <p className={`text-2xl font-bold tabular-nums mt-0.5 ${valueColor}`}>{value}</p>
-      </div>
-      {/* Optional progress bar for the progress card */}
-      {progressBar !== undefined && (
-        <div className="mt-3 h-1.5 bg-zinc-700/50 rounded-full overflow-hidden">
-          <div
-            className="h-full bg-violet-500 rounded-full transition-all duration-500 ease-out"
-            style={{ width: `${progressBar}%` }}
-          />
-        </div>
-      )}
+    </div>
+  )
+}
+
+function InfoBox({ text }: { text: string }) {
+  return (
+    <div style={{
+      marginTop: 8, padding: '12px 14px',
+      background: 'var(--bg-card)', border: '1px solid var(--border)',
+      borderRadius: 8, fontSize: 12, color: '#777', lineHeight: 1.7,
+      whiteSpace: 'pre-wrap', maxHeight: 180, overflowY: 'auto',
+    }}>
+      {text}
     </div>
   )
 }

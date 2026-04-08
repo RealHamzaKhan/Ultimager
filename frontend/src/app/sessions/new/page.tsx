@@ -34,6 +34,7 @@ export default function NewSessionPage() {
   const [editorMode, setEditorMode] = useState<'text' | 'structured'>('text')
   const [criteria, setCriteria] = useState<RubricCriteriaWithId[]>([])
   const [extractedQuestions, setExtractedQuestions] = useState<ExtractedQuestion[]>([])
+  const [checkpoints, setCheckpoints] = useState<string>('')
 
   const handleCriteriaChange = useCallback((updated: RubricCriteriaWithId[]) => {
     setCriteria(updated)
@@ -65,6 +66,7 @@ export default function NewSessionPage() {
         rubric: rubric.trim(),
         max_score: Number(maxScore),
         ...(referenceSolution.trim() && { reference_solution: referenceSolution.trim() }),
+        ...(checkpoints && { checkpoints }),
       })
       router.push(session.id ? `/sessions/${session.id}` : '/')
     } catch {
@@ -89,6 +91,11 @@ export default function NewSessionPage() {
           setCriteria(toCriteriaWithIds(result.criteria))
           setExtractedQuestions(result.questions || [])
           setEditorMode('structured')
+        }
+
+        // Store checkpoints for checkpoint-based grading
+        if (result.checkpoints && Object.keys(result.checkpoints).length > 0) {
+          setCheckpoints(JSON.stringify(result.checkpoints))
         }
 
         if (result.quality_warnings?.includes('ai_generation_failed')) {
