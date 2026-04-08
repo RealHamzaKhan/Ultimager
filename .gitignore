@@ -81,3 +81,13 @@ htmlcov/
 
 # Documentation build
 docs/_build/
+
+# Dev tooling artifacts
+.claude/
+.playwright-mcp/
+.superpowers/
+docs/superpowers/
+BACKEND_AUDIT.md
+FINAL_*.txt
+RECON.md
+grading.db.bak

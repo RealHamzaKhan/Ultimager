@@ -1,0 +1,19 @@
+[run]
+source = app
+omit =
+    app/services/ai_grader.py
+    app/services/ai_grader_enhanced.py
+    app/services/code_executor.py
+    app/services/file_parser_fixed.py
+    app/services/file_processor_progress.py
+    app/services/grading_manager.py
+    app/services/parallel_grader.py
+    app/services/file_parser.py
+    app/services/acmag.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__
+    raise NotImplementedError

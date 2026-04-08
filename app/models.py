@@ -25,6 +25,8 @@ class GradingSession(Base):
     test_cases = Column(Text, nullable=True)  # JSON string
     questions = Column(Text, nullable=True)  # JSON string
     expected_files = Column(Text, nullable=True)  # JSON string
+    reference_solution = Column(Text, nullable=True)  # Optional model answer
+    checkpoints = Column(Text, nullable=True)  # JSON: {criterion_name: [checkpoints...]}
     
     # Progress tracking
     status = Column(String(50), default="pending")  # pending, grading, paused, completed, completed_with_errors, failed

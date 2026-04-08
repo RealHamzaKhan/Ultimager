@@ -10,14 +10,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 # ── NVIDIA NIM API ────────────────────────────────────────────────
-# Primary and only provider for this grading system
+# Primary provider — used for complex reasoning and code analysis
 NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
 # Llama 4 Maverick (17B MoE) - faster and more efficient than Qwen
 NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "meta/llama-4-maverick-17b-128e-instruct")
+# GLM 4.7 — used for text-only tasks like rubric generation (better instruction following)
+GLM_TEXT_MODEL: str = os.getenv("GLM_TEXT_MODEL", "z-ai/glm4.7")
 
 # Vision capabilities for the model
 NVIDIA_MAX_IMAGES_PER_REQUEST: int = int(os.getenv("NVIDIA_MAX_IMAGES_PER_REQUEST", "8"))
+# Images sent per file during routing — low detail for efficiency (routing needs content type, not fine detail)
+MAX_IMAGES_PER_FILE_FOR_ROUTING: int = int(os.getenv("MAX_IMAGES_PER_FILE_FOR_ROUTING", "2"))
 
 # Only use NVIDIA as the single provider
 LLM_PROVIDER_ORDER: str = os.getenv("LLM_PROVIDER_ORDER", "nvidia")
@@ -36,6 +40,19 @@ VISION_PREANALYSIS_CHUNK_SIZE: int = int(os.getenv("VISION_PREANALYSIS_CHUNK_SIZ
 MAX_IMAGES_FOR_FINAL_GRADE: int = int(os.getenv("MAX_IMAGES_FOR_FINAL_GRADE", "8"))
 MAX_FINAL_IMAGE_BYTES: int = int(os.getenv("MAX_FINAL_IMAGE_BYTES", "8000000"))
 RATE_LIMIT_RPM: int = 40  # requests per minute — hard limit
+
+# ── Vision Transcript Injection ──────────────────────────────────
+# Full per-image transcriptions replace the old lossy consolidation summary.
+VISION_TRANSCRIPT_MAX_CHARS: int = int(os.getenv("VISION_TRANSCRIPT_MAX_CHARS", "80000"))
+VISION_ENTRY_TRANSCRIPTION_LIMIT: int = int(os.getenv("VISION_ENTRY_TRANSCRIPTION_LIMIT", "1200"))
+VISION_ENTRY_SUMMARY_LIMIT: int = int(os.getenv("VISION_ENTRY_SUMMARY_LIMIT", "800"))
+
+# ── Score Verification ───────────────────────────────────────────
+# DISABLED: The verification LLM was incorrectly zeroing scores where
+# the grading LLM correctly awarded partial credit (e.g. typos in function
+# names treated as "no evidence").  The primary grading pass has strong
+# enough prompt guardrails; a second pass with less context does more harm.
+SCORE_VERIFICATION_ENABLED: bool = os.getenv("SCORE_VERIFICATION_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # ── ACMAG (Anchor-Calibrated Multi-Agent Grading) ────────────────
 # ACMAG can be enabled explicitly via env when needed. Keep default off for
@@ -59,6 +76,25 @@ UPLOAD_DIR: Path = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'grading.db'}"
 
+# ── Multi-Pass Grading ────────────────────────────────────────────
+# Multi-pass splits content into windows when it exceeds the model's
+# effective context.  Llama 4 Maverick has 128K tokens (~400K chars),
+# so we set the threshold high — multi-pass should only trigger for
+# truly massive submissions, not normal 3-4 file assignments.
+MODEL_CONTEXT_TOKENS: int = int(os.getenv("MODEL_CONTEXT_TOKENS", "128000"))
+# Reserve tokens for system prompt + output — the rest is available for student content
+MODEL_RESERVED_TOKENS: int = int(os.getenv("MODEL_RESERVED_TOKENS", "12000"))
+# Chars-per-token estimate (conservative for Llama tokenizer)
+CHARS_PER_TOKEN_ESTIMATE: float = float(os.getenv("CHARS_PER_TOKEN_ESTIMATE", "3.2"))
+# Effective char limit = (128000 - 12000) * 3.2 ≈ 371,200 chars
+MULTI_PASS_TEXT_THRESHOLD: int = int(os.getenv(
+    "MULTI_PASS_TEXT_THRESHOLD",
+    str(int((MODEL_CONTEXT_TOKENS - MODEL_RESERVED_TOKENS) * CHARS_PER_TOKEN_ESTIMATE))
+))
+MULTI_PASS_WINDOW_SIZE: int = int(os.getenv("MULTI_PASS_WINDOW_SIZE", "100000"))
+MULTI_PASS_OVERLAP: int = int(os.getenv("MULTI_PASS_OVERLAP", "4000"))  # overlap chars between windows
+FINAL_IMAGE_CAP: int = int(os.getenv("FINAL_IMAGE_CAP", "6"))  # images per LLM request
+
 # ── Code execution limits ─────────────────────────────────────────
 EXEC_TIMEOUT_SECONDS: int = 10
 EXEC_MEMORY_LIMIT_MB: int = 256
@@ -70,11 +106,14 @@ CODE_EXTENSIONS: set[str] = {
     ".css", ".r", ".m",
 }
 IMAGE_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+
+# M-3 fix: IGNORED_NAMES is applied to entries inside student archives.
+# Removed: generic stems "test"/"tests"/"testing" — these are valid student filenames
+#   (e.g. test.py, testing_approach.txt, unit_tests/).
+# Removed: all "__test__*" CI fixture names — dev artefacts never present in real uploads.
+# Kept:   OS junk that is ALWAYS safe to skip regardless of context.
 IGNORED_NAMES: set[str] = {
     "__MACOSX", ".DS_Store", "__pycache__", ".git", ".gitignore",
-    "test_datasets", "tests", "test", "testing",
-    "carol_cpp", "eve_pdf_text", "nick_mixed", "jake_flat", 
-    "grace_notebook", "bob_java", "frank_pdf_scanned", "dan_docx",
-    "karen_macos_junk", "leo_empty", "iris_nested", "olivia_unsupported",
-    "mia_unicode", "alice_perfect", "henry_images"
+    "test_datasets",    # explicit dataset folder used in dev — safe to ignore
+    "Thumbs.db", "desktop.ini",
 }

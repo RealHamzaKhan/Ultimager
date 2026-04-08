@@ -30,30 +30,34 @@ ARCHIVE_EXTENSIONS = {
 
 
 def _should_ignore(name: str) -> bool:
-    """Return True if the file/folder should be skipped."""
+    """Return True if the file/folder should be skipped.
+
+    M-3 fix: removed broad "test"/"sample"/"example" stem filtering — a student's
+    submission can legitimately contain test.py, testing_notes.txt, sample_output.txt,
+    etc.  We only skip OS-level junk that can never be part of academic work.
+    """
     basename = name.strip().rstrip("/")
     lower_name = basename.lower()
     stem = Path(basename).stem.lower()
 
     ignored_names_lower = {n.lower() for n in IGNORED_NAMES}
 
-    # Exact name match against ignored names set
+    # Exact name match against ignored names set (OS junk)
     if basename in IGNORED_NAMES or lower_name in ignored_names_lower or stem in ignored_names_lower:
         return True
 
-    # Hidden files and explicit system folders/files
+    # Hidden files and macOS system folders
     if basename.startswith(".") or lower_name.startswith("__macosx"):
         return True
+
+    # Windows temporary / metadata prefixes
     if basename.startswith(("~$", "._")):
         return True
 
-    if lower_name in {"thumbs.db", "desktop.ini"}:
-        return True
-
-    # Only ignore explicit synthetic/test naming conventions, not incidental substrings.
-    if stem in {"test", "tests", "testing", "sample", "samples", "example", "examples", "demo"}:
-        return True
-    if stem.startswith(("dataset_", "sample_", "example_", "test_dataset_")):
+    # Toolchain artefact folders that are never student work
+    # (only skip EXACT folder names, not files that happen to have these stems)
+    if stem in {"__pycache__", "node_modules", ".git", ".idea", ".vscode",
+                "venv", ".venv", "dist", "build"}:
         return True
 
     return False
@@ -78,20 +82,41 @@ def extract_archive(archive_path: Path, extract_dir: Path) -> Tuple[bool, str]:
     try:
         if suffix == '.zip':
             with zipfile.ZipFile(archive_path, 'r') as zf:
-                zf.extractall(extract_dir)
+                # D6 FIX: Zip slip prevention — reject entries that escape extract_dir
+                resolved_dir = extract_dir.resolve()
+                for info in zf.infolist():
+                    target = (resolved_dir / info.filename).resolve()
+                    if not str(target).startswith(str(resolved_dir)):
+                        logger.warning(f"Zip slip attempt blocked: {info.filename}")
+                        continue
+                    zf.extract(info, extract_dir)
             return True, f"Extracted ZIP: {archive_path.name}"
-        
+
         elif suffix in ['.tar', '.gz', '.tgz'] or '.tar.' in name_lower:
             mode = 'r:gz' if suffix in ['.gz', '.tgz'] or '.tar.gz' in name_lower else 'r'
             with tarfile.open(archive_path, mode) as tf:
-                tf.extractall(extract_dir)
+                # D6 FIX: Tar slip prevention
+                resolved_dir = extract_dir.resolve()
+                for member in tf.getmembers():
+                    target = (resolved_dir / member.name).resolve()
+                    if not str(target).startswith(str(resolved_dir)):
+                        logger.warning(f"Tar slip attempt blocked: {member.name}")
+                        continue
+                    tf.extract(member, extract_dir)
             return True, f"Extracted TAR: {archive_path.name}"
-        
+
         elif suffix == '.rar':
             try:
                 import rarfile
                 with rarfile.RarFile(archive_path) as rf:
-                    rf.extractall(extract_dir)
+                    # D6 FIX: RAR slip prevention
+                    resolved_dir = extract_dir.resolve()
+                    for info in rf.infolist():
+                        target = (resolved_dir / info.filename).resolve()
+                        if not str(target).startswith(str(resolved_dir)):
+                            logger.warning(f"RAR slip attempt blocked: {info.filename}")
+                            continue
+                        rf.extract(info, extract_dir)
                 return True, f"Extracted RAR: {archive_path.name}"
             except ImportError:
                 return False, "rarfile module not installed. Run: pip install rarfile"
@@ -102,7 +127,25 @@ def extract_archive(archive_path: Path, extract_dir: Path) -> Tuple[bool, str]:
             try:
                 import py7zr
                 with py7zr.SevenZipFile(archive_path, mode='r') as sz:
-                    sz.extractall(extract_dir)
+                    # C-3 FIX: 7z slip prevention — validate every member path before extraction
+                    # py7zr.getnames() returns all member names before extraction
+                    resolved_dir = extract_dir.resolve()
+                    all_names = sz.getnames()
+                    blocked = []
+                    safe_names = []
+                    for fname in all_names:
+                        target = (resolved_dir / fname).resolve()
+                        if not str(target).startswith(str(resolved_dir) + "/") and target != resolved_dir:
+                            logger.warning("7z slip attempt blocked: %s", fname)
+                            blocked.append(fname)
+                        else:
+                            safe_names.append(fname)
+                    if blocked:
+                        # Re-open and extract only safe members
+                        with py7zr.SevenZipFile(archive_path, mode='r') as sz2:
+                            sz2.extract(targets=safe_names, path=extract_dir)
+                    else:
+                        sz.extractall(path=extract_dir)
                 return True, f"Extracted 7Z: {archive_path.name}"
             except ImportError:
                 return False, "py7zr module not installed. Run: pip install py7zr"

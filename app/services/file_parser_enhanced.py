@@ -158,30 +158,35 @@ def _smart_chunk_code(text: str, language: str, max_chars: int) -> Tuple[str, Di
         for match in import_pattern.finditer(text):
             imports.append(match.group(0).strip())
 
-    # Chunk content
+    # Chunk content – respect max_chars as a *total output budget*
     chunks = []
     current_pos = 0
     chunk_boundaries = []
     missing_code_units = []
+    total_emitted = 0
+    separator = "\n### Code continues: "
+    truncation_warning_budget = 120  # reserve space for the trailing warning
 
     while current_pos < len(text):
-        # Calculate remaining space
-        remaining = max_chars - len("\n[...TRUNCATED CONTENT...]\n")
+        # How many chars can we still emit?
+        budget = max_chars - total_emitted - truncation_warning_budget
+        if budget <= 0:
+            break
 
-        if current_pos + remaining >= len(text):
+        if current_pos + budget >= len(text):
             # Fits in remaining space
             chunk_text = text[current_pos:]
             chunks.append(chunk_text)
             chunk_boundaries.append((len(chunks) - 1, current_pos, len(text), "final"))
+            total_emitted += len(chunk_text)
             break
 
-        # Find the best break point
-        # Look for code units that end before the max point
+        # Find the best break point within budget
         best_break = -1
         best_unit_name = "chunk_end"
 
         for pos, end_pos, unit_type, name in code_units:
-            if current_pos <= pos < current_pos + remaining:
+            if current_pos <= pos < current_pos + budget:
                 if pos > best_break:
                     best_break = pos
                     best_unit_name = name or f"{unit_type}_boundary"
@@ -190,13 +195,15 @@ def _smart_chunk_code(text: str, language: str, max_chars: int) -> Tuple[str, Di
             chunk_text = text[current_pos:best_break]
             chunks.append(chunk_text)
             chunk_boundaries.append((len(chunks) - 1, current_pos, best_break, best_unit_name))
+            total_emitted += len(chunk_text)
             current_pos = best_break
         else:
-            # No natural break point, hard break at max_chars
-            chunk_text = text[current_pos:current_pos + remaining]
+            # No natural break point, hard break
+            chunk_text = text[current_pos:current_pos + budget]
             chunks.append(chunk_text)
-            chunk_boundaries.append((len(chunks) - 1, current_pos, current_pos + remaining, "hard_break"))
-            current_pos += remaining
+            chunk_boundaries.append((len(chunks) - 1, current_pos, current_pos + budget, "hard_break"))
+            total_emitted += len(chunk_text)
+            current_pos += budget
 
     # Check for incomplete code units
     last_chunk_end = chunk_boundaries[-1][2] if chunk_boundaries else 0
@@ -523,7 +530,81 @@ class IngestionReport:
         }
 
 
-def parse_file_with_report(file_path: Path, max_text_chars: int = 50000, 
+# ============================================================================
+# D7 FIX: FILE MAGIC BYTE VALIDATION
+# ============================================================================
+# Detects when file extension doesn't match actual content type.
+
+_MAGIC_SIGNATURES: Dict[bytes, str] = {
+    b'%PDF':                  '.pdf',
+    b'\x50\x4b\x03\x04':     '.zip',   # ZIP (also docx/xlsx/pptx)
+    b'\x89PNG\r\n\x1a\n':    '.png',
+    b'\xff\xd8\xff':          '.jpg',
+    b'GIF87a':                '.gif',
+    b'GIF89a':                '.gif',
+    b'RIFF':                  '.webp',  # needs WEBP check at offset 8
+    b'BM':                    '.bmp',
+    b'PK\x03\x04':           '.zip',
+}
+
+# ZIP-based formats identified by internal file patterns
+_ZIP_SUBTYPES = {
+    'word/document.xml': '.docx',
+    'xl/workbook.xml': '.xlsx',
+    'ppt/presentation.xml': '.pptx',
+}
+
+
+def _validate_magic_bytes(file_path: Path, claimed_ext: str) -> Optional[str]:
+    """Check if the file's magic bytes match its claimed extension.
+    Returns the detected extension if it differs, or None if it matches or is undetectable.
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(16)
+    except Exception:
+        return None
+
+    if len(header) < 4:
+        return None
+
+    detected = None
+    for sig, ext in _MAGIC_SIGNATURES.items():
+        if header[:len(sig)] == sig:
+            detected = ext
+            break
+
+    if detected is None:
+        return None
+
+    # If it's a ZIP, probe internal structure for docx/xlsx/pptx
+    if detected == '.zip' and claimed_ext not in ('.zip',):
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                names = zf.namelist()
+                for internal_path, sub_ext in _ZIP_SUBTYPES.items():
+                    if internal_path in names:
+                        detected = sub_ext
+                        break
+        except Exception:
+            pass
+
+    # Return None if it matches the claimed extension (no mismatch)
+    if detected == claimed_ext:
+        return None
+    # ZIP-based formats: .docx is a .zip, so don't flag docx as zip
+    if detected == '.zip' and claimed_ext in ('.docx', '.xlsx', '.pptx', '.jar', '.ipynb'):
+        return None
+    # Image subtypes: jpg/jpeg are equivalent
+    if detected == '.jpg' and claimed_ext in ('.jpg', '.jpeg'):
+        return None
+    if detected == '.jpeg' and claimed_ext in ('.jpg', '.jpeg'):
+        return None
+
+    return detected
+
+
+def parse_file_with_report(file_path: Path, max_text_chars: int = 80000,
                           max_image_size: int = 5*1024*1024) -> Tuple[ExtractedContent, IngestionReport]:
     """
     Parse a single file with full transparency logging.
@@ -565,7 +646,16 @@ def parse_file_with_report(file_path: Path, max_text_chars: int = 50000,
                 size_bytes=size,
                 metadata={"reason": "transient_system_file"},
             ), report
-        
+
+        # D7 FIX: Magic byte validation — detect extension mismatch
+        actual_type = _validate_magic_bytes(file_path, ext)
+        if actual_type and actual_type != ext:
+            logger.warning(
+                f"Magic byte mismatch: {filename} claims {ext} but looks like {actual_type}"
+            )
+            report["warning"] = f"Extension mismatch: file appears to be {actual_type}"
+            ext = actual_type  # Use the actual detected type for routing
+
         # Route to appropriate parser
         if ext in CODE_EXTENSIONS:
             content = _parse_code_file(file_path, max_text_chars)
@@ -679,18 +769,23 @@ def parse_file_with_report(file_path: Path, max_text_chars: int = 50000,
 def _parse_code_file(file_path: Path, max_chars: int) -> ExtractedContent:
     """Parse code files with intelligent chunking that respects function/class boundaries."""
     text = file_path.read_text(encoding="utf-8", errors="replace")
-    truncated = len(text) > max_chars
-    
+    language = _detect_language(file_path.suffix)
+
+    # Use smart chunking to respect function/class boundaries instead of naive truncation
+    chunked_text, chunk_meta = _smart_chunk_code(text, language, max_chars)
+
     return ExtractedContent(
         filename=file_path.name,
         file_type="code",
-        text_content=text[:max_chars] if truncated else text,
-        extraction_method="text_utf8",
+        text_content=chunked_text,
+        extraction_method="smart_chunk" if chunk_meta.get("truncated") else "text_utf8",
         size_bytes=file_path.stat().st_size,
         metadata={
-            "language": _detect_language(file_path.suffix),
-            "truncated": truncated,
-            "original_length": len(text)
+            "language": language,
+            "truncated": chunk_meta.get("truncated", False),
+            "original_length": chunk_meta.get("original_length", len(text)),
+            "total_chunks": chunk_meta.get("total_chunks", 1),
+            "missing_code_units": chunk_meta.get("missing_code_units", []),
         }
     )
 
@@ -743,19 +838,42 @@ def _parse_as_text_fallback(file_path: Path, max_chars: int) -> ExtractedContent
     )
 
 
-def _parse_pdf_mixed(file_path: Path, max_text_chars: int = 50000, 
-                     dpi: int = 200, max_pages: int = 30) -> ExtractedContent:
+def _compute_image_hash(img_bytes: bytes) -> int:
+    """Compute a perceptual average hash (64-bit) for image deduplication."""
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(img_bytes)).convert("L").resize((8, 8), PILImage.Resampling.LANCZOS)
+        pixels = list(img.getdata())
+        avg = sum(pixels) / len(pixels)
+        return sum(1 << i for i, p in enumerate(pixels) if p >= avg)
+    except Exception:
+        return int(hashlib.md5(img_bytes[:4096]).hexdigest()[:16], 16)
+
+
+def _is_duplicate_image(new_hash: int, existing_hashes: list, threshold: int = 5) -> bool:
+    """Check if image is perceptually similar to any existing image (Hamming distance)."""
+    for h in existing_hashes:
+        hamming = bin(new_hash ^ h).count("1")
+        if hamming <= threshold:
+            return True
+    return False
+
+
+def _parse_pdf_mixed(file_path: Path, max_text_chars: int = 80000,
+                     dpi: int = 200, max_pages: int = 60) -> ExtractedContent:
     """
     Parse PDF with mixed content strategy:
-    1. Try to extract text
+    1. Extract text from all pages
     2. Convert pages to images for vision analysis
-    3. Return both text and images
+    3. Extract embedded high-res images (diagrams, figures) from PDF XObjects
+    4. Deduplicate embedded images vs page renders using perceptual hashing
+    5. Return both text and all unique images
     """
     import fitz  # PyMuPDF
-    
+
     doc = fitz.open(str(file_path))
     page_count = len(doc)
-    
+
     # Extract text
     text_parts = []
     for page_num in range(min(page_count, max_pages)):
@@ -763,43 +881,110 @@ def _parse_pdf_mixed(file_path: Path, max_text_chars: int = 50000,
         text = page.get_text()
         if text.strip():
             text_parts.append(f"\n--- Page {page_num + 1} ---\n{text}")
-    
+
     full_text = "\n".join(text_parts)
     text_truncated = len(full_text) > max_text_chars
-    
-    # Convert pages to images
+
     images = []
+    image_hashes: list[int] = []
+    MAX_IMAGE_RENDER_PAGES = 30  # Cap page-to-image rendering to limit memory usage
     pages_converted = min(page_count, max_pages)
-    
-    for page_num in range(pages_converted):
+    pages_rendered = min(pages_converted, MAX_IMAGE_RENDER_PAGES)
+    embedded_count = 0
+    deduplicated_count = 0
+
+    # Phase 1: Render pages to images (capped to avoid memory blowup on large PDFs)
+    for page_num in range(pages_rendered):
         try:
             page = doc[page_num]
             pix = page.get_pixmap(dpi=dpi)
             img_bytes = pix.tobytes("png")
             b64 = base64.b64encode(img_bytes).decode()
-            
+            img_hash = _compute_image_hash(img_bytes)
+            image_hashes.append(img_hash)
+
             images.append({
                 "page": page_num + 1,
                 "base64": b64,
                 "media_type": "image/png",
-                "size_bytes": len(img_bytes)
+                "size_bytes": len(img_bytes),
+                "source": "page_render",
             })
         except Exception as e:
             logger.warning(f"Failed to convert PDF page {page_num + 1}: {e}")
-    
+
+    # Phase 2: Extract embedded XObject images (diagrams, figures, photos at native res)
+    for page_num in range(pages_converted):
+        try:
+            page = doc[page_num]
+            image_list = page.get_images(full=True)
+
+            for img_info in image_list:
+                xref = img_info[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    if not base_image:
+                        continue
+
+                    img_bytes = base_image["image"]
+                    img_ext = base_image.get("ext", "png")
+                    width = base_image.get("width", 0)
+                    height = base_image.get("height", 0)
+
+                    # Skip tiny images (icons, bullets, decorations)
+                    if width < 50 or height < 50:
+                        continue
+
+                    # Resize very large embedded images (> 5MB)
+                    if len(img_bytes) > 5 * 1024 * 1024:
+                        try:
+                            from PIL import Image as PILImage
+                            pil_img = PILImage.open(io.BytesIO(img_bytes))
+                            pil_img.thumbnail((2048, 2048), PILImage.Resampling.LANCZOS)
+                            buf = io.BytesIO()
+                            pil_img.save(buf, format="PNG")
+                            img_bytes = buf.getvalue()
+                            img_ext = "png"
+                        except Exception:
+                            continue
+
+                    # Deduplicate against page renders and previously seen embedded images
+                    img_hash = _compute_image_hash(img_bytes)
+                    if _is_duplicate_image(img_hash, image_hashes):
+                        deduplicated_count += 1
+                        continue
+
+                    image_hashes.append(img_hash)
+                    media_type = f"image/{img_ext}" if img_ext != "jpg" else "image/jpeg"
+                    b64 = base64.b64encode(img_bytes).decode()
+                    embedded_count += 1
+
+                    images.append({
+                        "page": page_num + 1,
+                        "base64": b64,
+                        "media_type": media_type,
+                        "size_bytes": len(img_bytes),
+                        "source": "embedded_xobject",
+                        "native_resolution": f"{width}x{height}",
+                        "embedded_id": embedded_count,
+                    })
+                except Exception as e:
+                    logger.debug(f"Failed to extract embedded image xref={xref} p{page_num+1}: {e}")
+        except Exception as e:
+            logger.debug(f"Failed to scan page {page_num+1} for embedded images: {e}")
+
     doc.close()
-    
-    # Determine extraction method
+
     has_text = len(full_text.strip()) > 50
     has_images = len(images) > 0
-    
+
     if has_text and has_images:
         extraction_method = "mixed_text_and_vision"
     elif has_images:
         extraction_method = "vision_only"
     else:
         extraction_method = "text_only"
-    
+
     return ExtractedContent(
         filename=file_path.name,
         file_type="pdf",
@@ -813,13 +998,17 @@ def _parse_pdf_mixed(file_path: Path, max_text_chars: int = 50000,
             "pages_exceeded": page_count > max_pages,
             "text_extracted": has_text,
             "images_extracted": has_images,
+            "page_render_images": pages_converted,
+            "embedded_images_extracted": embedded_count,
+            "deduplicated_images": deduplicated_count,
+            "total_images": len(images),
             "truncated": text_truncated,
-            "original_text_length": len(full_text)
+            "original_text_length": len(full_text),
         }
     )
 
 
-def _parse_docx_mixed(file_path: Path, max_text_chars: int = 50000) -> ExtractedContent:
+def _parse_docx_mixed(file_path: Path, max_text_chars: int = 80000) -> ExtractedContent:
     """
     Parse DOCX with mixed content strategy:
     1. Extract text from paragraphs and tables
@@ -916,46 +1105,72 @@ def _parse_docx_mixed(file_path: Path, max_text_chars: int = 50000) -> Extracted
 
 
 def _parse_image_file(file_path: Path, max_size: int = 5*1024*1024) -> ExtractedContent:
-    """Parse image files for vision input."""
+    """Parse image files for vision input.
+
+    Always caps resolution at 1536px on the longest side to keep API payloads
+    manageable while retaining enough detail for handwriting and diagrams.
+    """
     from PIL import Image
-    
+
     size = file_path.stat().st_size
-    
-    # Check size
-    if size > max_size:
-        # Resize large images
-        with Image.open(file_path) as img:
-            # Resize to max 2048x2048 while maintaining aspect ratio
-            img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-            
-            # Save to bytes
-            buffer = io.BytesIO()
-            ext = file_path.suffix.lower().lstrip(".")
-            if ext == "jpg":
-                ext = "jpeg"
-            if ext == "tif":
-                ext = "tiff"
-            
-            img_format = ext.upper() if ext != "jpg" else "JPEG"
-            img.save(buffer, format=img_format)
-            img_bytes = buffer.getvalue()
-    else:
-        img_bytes = file_path.read_bytes()
-    
-    b64 = base64.b64encode(img_bytes).decode()
+    MAX_DIM = 1536  # Max pixels on longest side — enough for vision models
+
     ext = file_path.suffix.lower().lstrip(".")
     if ext == "jpg":
         ext = "jpeg"
     if ext == "tif":
         ext = "tiff"
-    
-    # Get image dimensions
+
+    # SVG cannot be processed by PIL — read raw bytes and treat as PNG for downstream
+    PIL_UNSUPPORTED_FORMATS = {"svg"}
+    if ext in PIL_UNSUPPORTED_FORMATS:
+        img_bytes = file_path.read_bytes()
+        b64 = base64.b64encode(img_bytes).decode()
+        return ExtractedContent(
+            filename=file_path.name,
+            file_type="image",
+            images=[{
+                "base64": b64,
+                "media_type": f"image/svg+xml",
+                "size_bytes": len(img_bytes),
+                "original_size": file_path.stat().st_size,
+                "source": "raw_file",
+            }],
+            extraction_method="raw_bytes",
+            size_bytes=file_path.stat().st_size,
+            metadata={"format": "svg", "note": "SVG not processed by PIL"},
+        )
+
+    resized = False
     try:
         with Image.open(file_path) as img:
-            width, height = img.size
-    except:
-        width, height = 0, 0
-    
+            orig_width, orig_height = img.size
+            # Always resize if either dimension exceeds MAX_DIM or file is too large
+            needs_resize = (
+                max(orig_width, orig_height) > MAX_DIM
+                or size > max_size
+            )
+            if needs_resize:
+                img.thumbnail((MAX_DIM, MAX_DIM), Image.Resampling.LANCZOS)
+                resized = True
+
+            buffer = io.BytesIO()
+            img_format = "JPEG" if ext in ("jpeg", "jpg") else ext.upper()
+            save_kwargs = {}
+            if img_format == "JPEG":
+                save_kwargs["quality"] = 85  # Good quality, smaller size
+                save_kwargs["optimize"] = True
+            img.save(buffer, format=img_format, **save_kwargs)
+            img_bytes = buffer.getvalue()
+            final_width, final_height = img.size
+    except Exception as e:
+        # Fallback: read raw bytes if PIL fails
+        img_bytes = file_path.read_bytes()
+        orig_width, orig_height = 0, 0
+        final_width, final_height = 0, 0
+
+    b64 = base64.b64encode(img_bytes).decode()
+
     return ExtractedContent(
         filename=file_path.name,
         file_type="image",
@@ -964,54 +1179,136 @@ def _parse_image_file(file_path: Path, max_size: int = 5*1024*1024) -> Extracted
             "media_type": f"image/{ext}",
             "size_bytes": len(img_bytes),
             "original_size": size,
-            "resized": size > max_size,
-            "dimensions": {"width": width, "height": height}
+            "resized": resized,
+            "dimensions": {"width": final_width, "height": final_height},
+            "original_dimensions": {"width": orig_width, "height": orig_height},
         }],
         extraction_method="image_base64",
         size_bytes=size,
         metadata={
-            "dimensions": {"width": width, "height": height},
-            "resized": size > max_size
+            "dimensions": {"width": final_width, "height": final_height},
+            "original_dimensions": {"width": orig_width, "height": orig_height},
+            "resized": resized
         }
     )
 
 
 def _parse_notebook_file(file_path: Path, max_chars: int) -> ExtractedContent:
-    """Parse Jupyter notebooks."""
+    """Parse Jupyter notebooks — extracts code, markdown, text outputs, AND output images."""
     import nbformat
-    
+
     nb = nbformat.read(str(file_path), as_version=4)
     parts = []
-    
+    images = []
+    output_image_count = 0
+
     for i, cell in enumerate(nb.cells, 1):
         if cell.cell_type == "code":
             parts.append(f"# --- Code Cell {i} ---\n{cell.source}")
             if cell.get("outputs"):
-                for output in cell.outputs:
+                for out_idx, output in enumerate(cell.outputs):
+                    # Text output (stdout, stderr, plain text)
                     if output.get("text"):
                         parts.append(f"# Output:\n{output['text']}")
+                    elif output.get("output_type") == "stream":
+                        text = output.get("text", "")
+                        if text:
+                            parts.append(f"# Output ({output.get('name', 'stdout')}):\n{text}")
+
+                    # Image outputs (matplotlib plots, display_data, execute_result)
+                    data = output.get("data", {})
+                    if not data and output.get("output_type") not in ("display_data", "execute_result"):
+                        continue
+
+                    # Check for PNG image (most common: matplotlib, seaborn, plotly static)
+                    if "image/png" in data:
+                        b64_data = data["image/png"]
+                        # nbformat stores base64 directly (no prefix)
+                        if isinstance(b64_data, str):
+                            b64_clean = b64_data.replace("\n", "").strip()
+                            try:
+                                img_bytes = base64.b64decode(b64_clean)
+                                output_image_count += 1
+                                images.append({
+                                    "base64": b64_clean,
+                                    "media_type": "image/png",
+                                    "size_bytes": len(img_bytes),
+                                    "source": f"notebook_cell_{i}_output_{out_idx}",
+                                    "description": f"Output image from code cell {i}",
+                                })
+                            except Exception as e:
+                                logger.debug(f"Failed to decode notebook PNG cell {i}: {e}")
+
+                    # Check for JPEG image
+                    elif "image/jpeg" in data:
+                        b64_data = data["image/jpeg"]
+                        if isinstance(b64_data, str):
+                            b64_clean = b64_data.replace("\n", "").strip()
+                            try:
+                                img_bytes = base64.b64decode(b64_clean)
+                                output_image_count += 1
+                                images.append({
+                                    "base64": b64_clean,
+                                    "media_type": "image/jpeg",
+                                    "size_bytes": len(img_bytes),
+                                    "source": f"notebook_cell_{i}_output_{out_idx}",
+                                    "description": f"Output image from code cell {i}",
+                                })
+                            except Exception as e:
+                                logger.debug(f"Failed to decode notebook JPEG cell {i}: {e}")
+
+                    # Check for SVG (render to PNG if cairosvg available)
+                    elif "image/svg+xml" in data:
+                        svg_data = data["image/svg+xml"]
+                        if isinstance(svg_data, str):
+                            try:
+                                import cairosvg
+                                png_bytes = cairosvg.svg2png(bytestring=svg_data.encode("utf-8"))
+                                b64_png = base64.b64encode(png_bytes).decode()
+                                output_image_count += 1
+                                images.append({
+                                    "base64": b64_png,
+                                    "media_type": "image/png",
+                                    "size_bytes": len(png_bytes),
+                                    "source": f"notebook_cell_{i}_output_{out_idx}_svg",
+                                    "description": f"SVG output rendered from code cell {i}",
+                                })
+                            except ImportError:
+                                logger.debug("cairosvg not installed, skipping SVG render")
+                            except Exception as e:
+                                logger.debug(f"Failed to render SVG from cell {i}: {e}")
+
+                    # Include text/plain representation as fallback
+                    if "text/plain" in data and "image/png" not in data and "image/jpeg" not in data:
+                        plain = data["text/plain"]
+                        if isinstance(plain, str) and plain.strip():
+                            parts.append(f"# Output:\n{plain}")
+
         elif cell.cell_type == "markdown":
             parts.append(f"# --- Markdown Cell {i} ---\n{cell.source}")
-    
+
     full_text = "\n\n".join(parts)
     truncated = len(full_text) > max_chars
-    
+
     return ExtractedContent(
         filename=file_path.name,
         file_type="notebook",
         text_content=full_text[:max_chars] if truncated else full_text,
-        extraction_method="nbformat",
+        images=images if images else [],
+        extraction_method="nbformat_with_images" if images else "nbformat",
         size_bytes=file_path.stat().st_size,
         metadata={
             "cells": len(nb.cells),
+            "code_cells": sum(1 for c in nb.cells if c.cell_type == "code"),
+            "output_images_extracted": output_image_count,
             "truncated": truncated,
-            "original_length": len(full_text)
+            "original_length": len(full_text),
         }
     )
 
 
 def _parse_excel_file(file_path: Path) -> ExtractedContent:
-    """Parse Excel files with openpyxl/xlrd fallback and clear failures."""
+    """Parse Excel files — extracts cell values, AND embedded images/charts from xlsx."""
     ext = file_path.suffix.lower()
     errors: list[str] = []
 
@@ -1019,11 +1316,12 @@ def _parse_excel_file(file_path: Path) -> ExtractedContent:
         try:
             from openpyxl import load_workbook
 
-            workbook = load_workbook(filename=str(file_path), data_only=True, read_only=True)
+            # First pass: read cell data (read_only mode for speed)
+            workbook_ro = load_workbook(filename=str(file_path), data_only=True, read_only=True)
             parts: list[str] = []
             sheet_names: list[str] = []
 
-            for sheet in workbook.worksheets:
+            for sheet in workbook_ro.worksheets:
                 sheet_names.append(sheet.title)
                 parts.append(f"=== Sheet: {sheet.title} ===")
                 for row in sheet.iter_rows(values_only=True):
@@ -1031,14 +1329,81 @@ def _parse_excel_file(file_path: Path) -> ExtractedContent:
                     if any(value.strip() for value in values):
                         parts.append(" | ".join(values))
 
-            workbook.close()
+            workbook_ro.close()
+
+            # Second pass: extract embedded images (requires non-read-only mode)
+            images: list[dict] = []
+            chart_count = 0
+            try:
+                workbook_full = load_workbook(filename=str(file_path))
+                for sheet in workbook_full.worksheets:
+                    # Extract embedded images
+                    for img_obj in getattr(sheet, '_images', []):
+                        try:
+                            img_data = img_obj._data()
+                            if len(img_data) < 500:
+                                continue
+                            b64 = base64.b64encode(img_data).decode()
+                            images.append({
+                                "base64": b64,
+                                "media_type": "image/png",
+                                "size_bytes": len(img_data),
+                                "source": f"excel_sheet_{sheet.title}_image",
+                            })
+                        except Exception as e:
+                            logger.debug(f"Failed to extract Excel image: {e}")
+
+                    # Count charts (for metadata — chart rendering requires matplotlib bridge)
+                    chart_count += len(getattr(sheet, '_charts', []))
+
+                workbook_full.close()
+            except Exception as e:
+                logger.debug(f"Non-critical: could not extract Excel images: {e}")
+
+            # Also extract images from xl/media/ in the xlsx ZIP archive
+            if not images:
+                try:
+                    with zipfile.ZipFile(file_path, "r") as zf:
+                        media_files = [n for n in zf.namelist() if n.startswith("xl/media/")]
+                        for mf in media_files:
+                            mf_ext = Path(mf).suffix.lower()
+                            if mf_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".emf", ".wmf"):
+                                try:
+                                    img_bytes = zf.read(mf)
+                                    if len(img_bytes) < 500:
+                                        continue
+
+                                    # Handle EMF/WMF (Windows Metafiles) - skip if can't convert
+                                    if mf_ext in (".emf", ".wmf"):
+                                        continue
+
+                                    mt = f"image/{mf_ext.lstrip('.')}"
+                                    if mf_ext == ".jpg":
+                                        mt = "image/jpeg"
+                                    b64 = base64.b64encode(img_bytes).decode()
+                                    images.append({
+                                        "base64": b64,
+                                        "media_type": mt,
+                                        "size_bytes": len(img_bytes),
+                                        "source": f"excel_media_{Path(mf).name}",
+                                    })
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
             return ExtractedContent(
                 filename=file_path.name,
                 file_type="excel",
                 text_content="\n".join(parts),
-                extraction_method="openpyxl",
+                images=images if images else [],
+                extraction_method="openpyxl" + ("_with_images" if images else ""),
                 size_bytes=file_path.stat().st_size,
-                metadata={"sheets": sheet_names},
+                metadata={
+                    "sheets": sheet_names,
+                    "embedded_images": len(images),
+                    "charts_detected": chart_count,
+                },
             )
         except Exception as exc:
             errors.append(f"openpyxl: {exc}")
@@ -1048,24 +1413,24 @@ def _parse_excel_file(file_path: Path) -> ExtractedContent:
             import xlrd
 
             workbook = xlrd.open_workbook(str(file_path))
-            parts: list[str] = []
-            sheet_names: list[str] = []
+            parts_xls: list[str] = []
+            sheet_names_xls: list[str] = []
 
             for sheet in workbook.sheets():
-                sheet_names.append(sheet.name)
-                parts.append(f"=== Sheet: {sheet.name} ===")
+                sheet_names_xls.append(sheet.name)
+                parts_xls.append(f"=== Sheet: {sheet.name} ===")
                 for row_idx in range(sheet.nrows):
                     values = [str(sheet.cell_value(row_idx, col_idx)) for col_idx in range(sheet.ncols)]
                     if any(value.strip() for value in values):
-                        parts.append(" | ".join(values))
+                        parts_xls.append(" | ".join(values))
 
             return ExtractedContent(
                 filename=file_path.name,
                 file_type="excel",
-                text_content="\n".join(parts),
+                text_content="\n".join(parts_xls),
                 extraction_method="xlrd",
                 size_bytes=file_path.stat().st_size,
-                metadata={"sheets": sheet_names},
+                metadata={"sheets": sheet_names_xls},
             )
         except Exception as exc:
             errors.append(f"xlrd: {exc}")
@@ -1080,31 +1445,103 @@ def _parse_excel_file(file_path: Path) -> ExtractedContent:
 
 
 def _parse_powerpoint_file(file_path: Path) -> ExtractedContent:
-    """Parse PowerPoint files with python-pptx and XML fallback."""
+    """Parse PowerPoint files — extracts text, speaker notes, AND embedded images."""
     pptx_error: Optional[Exception] = None
+    images: list[dict] = []
 
     try:
         from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
         prs = Presentation(str(file_path))
         parts = []
-        
+        image_count = 0
+
         for i, slide in enumerate(prs.slides, 1):
             parts.append(f"=== Slide {i} ===")
+
+            # Extract text from all shapes
             for shape in slide.shapes:
                 if hasattr(shape, "text") and shape.text.strip():
                     parts.append(shape.text)
-        
+
+                # Extract embedded images from picture shapes
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        image_part = shape.image
+                        img_bytes = image_part.blob
+                        content_type = image_part.content_type or "image/png"
+
+                        # Skip tiny images (icons)
+                        if len(img_bytes) < 1000:
+                            continue
+
+                        # Resize if > 5MB
+                        if len(img_bytes) > 5 * 1024 * 1024:
+                            try:
+                                from PIL import Image as PILImage
+                                pil_img = PILImage.open(io.BytesIO(img_bytes))
+                                pil_img.thumbnail((2048, 2048), PILImage.Resampling.LANCZOS)
+                                buf = io.BytesIO()
+                                pil_img.save(buf, format="PNG")
+                                img_bytes = buf.getvalue()
+                                content_type = "image/png"
+                            except Exception:
+                                continue
+
+                        b64 = base64.b64encode(img_bytes).decode()
+                        image_count += 1
+                        images.append({
+                            "base64": b64,
+                            "media_type": content_type,
+                            "size_bytes": len(img_bytes),
+                            "source": f"slide_{i}_picture",
+                            "description": f"Image from slide {i}",
+                        })
+                    except Exception as e:
+                        logger.debug(f"Failed to extract PPTX image from slide {i}: {e}")
+
+                # Extract images from group shapes
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    try:
+                        for grp_shape in shape.shapes:
+                            if hasattr(grp_shape, 'image'):
+                                img_bytes = grp_shape.image.blob
+                                if len(img_bytes) < 1000:
+                                    continue
+                                b64 = base64.b64encode(img_bytes).decode()
+                                ct = grp_shape.image.content_type or "image/png"
+                                image_count += 1
+                                images.append({
+                                    "base64": b64,
+                                    "media_type": ct,
+                                    "size_bytes": len(img_bytes),
+                                    "source": f"slide_{i}_group_picture",
+                                })
+                    except Exception:
+                        pass
+
+            # Extract speaker notes
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes_text = slide.notes_slide.notes_text_frame.text.strip()
+                if notes_text:
+                    parts.append(f"[Speaker Notes]: {notes_text}")
+
         return ExtractedContent(
             filename=file_path.name,
             file_type="powerpoint",
             text_content="\n".join(parts),
-            extraction_method="python-pptx",
+            images=images if images else [],
+            extraction_method="python-pptx" + ("_with_images" if images else ""),
             size_bytes=file_path.stat().st_size,
-            metadata={"slides": len(prs.slides)}
+            metadata={
+                "slides": len(prs.slides),
+                "embedded_images": image_count,
+            }
         )
     except Exception as exc:
         pptx_error = exc
 
+    # XML fallback (text only, no images)
     xml_error: Optional[Exception] = None
     if file_path.suffix.lower() == ".pptx":
         try:
@@ -1118,7 +1555,9 @@ def _parse_powerpoint_file(file_path: Path) -> ExtractedContent:
                     if re.search(r"slide(\d+)\.xml$", name) else 10**9,
                 )
 
-                parts: list[str] = []
+                parts_fb: list[str] = []
+                fb_images: list[dict] = []
+
                 for idx, slide_path in enumerate(slide_paths, 1):
                     xml_data = archive.read(slide_path)
                     root = ET.fromstring(xml_data)
@@ -1127,18 +1566,41 @@ def _parse_powerpoint_file(file_path: Path) -> ExtractedContent:
                         for node in root.iter()
                         if node.tag.endswith("}t") and node.text and node.text.strip()
                     ]
-                    parts.append(f"=== Slide {idx} ===")
+                    parts_fb.append(f"=== Slide {idx} ===")
                     if texts:
-                        parts.append("\n".join(texts))
+                        parts_fb.append("\n".join(texts))
+
+                # Also try extracting images from the ppt/media/ folder
+                media_files = [n for n in archive.namelist() if n.startswith("ppt/media/")]
+                for mf in media_files:
+                    ext = Path(mf).suffix.lower()
+                    if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+                        try:
+                            img_bytes = archive.read(mf)
+                            if len(img_bytes) < 1000:
+                                continue
+                            media_type = f"image/{ext.lstrip('.')}"
+                            if ext == ".jpg":
+                                media_type = "image/jpeg"
+                            b64 = base64.b64encode(img_bytes).decode()
+                            fb_images.append({
+                                "base64": b64,
+                                "media_type": media_type,
+                                "size_bytes": len(img_bytes),
+                                "source": f"pptx_media_{Path(mf).name}",
+                            })
+                        except Exception:
+                            pass
 
                 if slide_paths:
                     return ExtractedContent(
                         filename=file_path.name,
                         file_type="powerpoint",
-                        text_content="\n".join(parts),
+                        text_content="\n".join(parts_fb),
+                        images=fb_images if fb_images else None,
                         extraction_method="pptx_xml_fallback",
                         size_bytes=file_path.stat().st_size,
-                        metadata={"slides": len(slide_paths)},
+                        metadata={"slides": len(slide_paths), "media_images": len(fb_images)},
                     )
         except Exception as exc:
             xml_error = exc
@@ -1210,17 +1672,49 @@ def process_student_submission(student_dir: Path, student_id: str,
     
     extracted_contents = []
     
-    # Find all files recursively
+    # Find all files — only from the IMMEDIATE student directory.
+    # Do NOT descend into nested subdirectories that look like other students'
+    # folders (e.g., "Muhammad_fasihullah_23P-0627/") to prevent cross-contamination.
+    # We allow ONE level of nesting for common structures (e.g., "src/", "code/")
+    # but skip directories whose names look like student identifiers.
+    import re as _re_parser
+    _student_dir_pattern = _re_parser.compile(
+        r'^\d{2}[pPiI][-_]?\d{3,5}|^[A-Z][a-z]+[-_ ][A-Z][a-z]+|^[A-Z][a-z]+_\d{2}[pPiI]',
+    )
+
     all_files = []
-    for file_path in student_dir.rglob("*"):
+    for file_path in sorted(student_dir.rglob("*")):
         if file_path.is_file():
-            # Skip hidden and system files
-            if any(part.startswith(".") or part.startswith("__") for part in file_path.parts):
+            # Skip hidden and system files (only check relative path parts, not parent dirs)
+            rel_parts = file_path.relative_to(student_dir).parts
+            if any(part.startswith(".") or part.startswith("__") for part in rel_parts):
                 continue
             if file_path.name in {".DS_Store", "Thumbs.db", ".gitignore"}:
                 continue
             if _is_transient_or_system_file(file_path):
                 continue
+
+            # Cross-contamination guard: skip files inside nested directories
+            # that look like other student submissions (name patterns like
+            # "23P-0627_Name", "Name_23P0627", "Firstname Lastname")
+            if len(rel_parts) >= 2:
+                # Check if ANY intermediate directory looks like a student folder
+                skip = False
+                for dir_part in rel_parts[:-1]:  # all dirs, not the filename
+                    if _student_dir_pattern.search(dir_part):
+                        skip = True
+                        break
+                if skip:
+                    logger.info(
+                        f"[FILE_PARSER] Skipping nested student file: "
+                        f"{'/'.join(rel_parts)} (probable cross-contamination)"
+                    )
+                    report.warnings.append(
+                        f"Nested student folder detected: {rel_parts[0]} — "
+                        f"skipped {'/'.join(rel_parts)} to prevent cross-contamination"
+                    )
+                    continue
+
             all_files.append(file_path)
     
     # Record received files
