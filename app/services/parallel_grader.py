@@ -15,18 +15,23 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Callable
-import threading
 import json
+import time
 
-from app.config import RATE_LIMIT_RPM, ACMAG_ENABLED, PARALLEL_GRADING_WORKERS
+from app.config import RATE_LIMIT_RPM, PARALLEL_GRADING_WORKERS
 from app.services.ai_grader_fixed import (
-    grade_student,
     validate_submission_relevance,
     compute_grading_hash,
     evaluate_relevance_gate,
     build_relevance_block_result,
 )
 from app.services.file_parser_enhanced import process_student_submission
+from app.services.agents.orchestrator import grade_student_with_agents, filter_routing_map_by_question
+from app.services.checkpoint_grader import (
+    collect_student_text,
+    filter_submission_files,
+    route_files_to_criteria,
+)
 
 # NOTE: Do NOT import _broadcast_sse from app.main to avoid circular import
 # Use the sse_callback parameter instead
@@ -34,9 +39,24 @@ from app.services.file_parser_enhanced import process_student_submission
 logger = logging.getLogger(__name__)
 
 
-# Module-level shared rate limiter state (shared across ALL GradingWorker instances)
-_shared_rate_limiter_lock: Optional[threading.Lock] = None
+# H-1 FIX: Use asyncio.Lock (not threading.Lock) so the event loop is never
+# blocked while waiting for the rate-limit slot.  A threading.Lock inside an
+# async function stalls the *entire* event loop, causing all 8 workers to
+# queue behind a single lock acquisition.
+#
+# The lock is created lazily (on first acquire) because asyncio primitives must
+# be created inside a running event loop — module-level creation breaks on
+# Python < 3.10 when no loop exists yet at import time.
+_shared_rate_limiter_lock: Optional[asyncio.Lock] = None
 _shared_request_timestamps: list = []
+
+
+def _get_rate_limiter_lock() -> asyncio.Lock:
+    """Return (or lazily create) the shared asyncio.Lock for rate limiting."""
+    global _shared_rate_limiter_lock
+    if _shared_rate_limiter_lock is None:
+        _shared_rate_limiter_lock = asyncio.Lock()
+    return _shared_rate_limiter_lock
 
 
 @dataclass
@@ -51,41 +71,47 @@ class GradingWorker:
 
     @classmethod
     def set_rate_limiter(cls, lock, timestamps):
+        """Legacy entry point kept for back-compat.  The lock arg is now ignored;
+        the module always uses its own asyncio.Lock.  Timestamps list is still
+        shared if provided."""
         global _shared_rate_limiter_lock, _shared_request_timestamps
-        _shared_rate_limiter_lock = lock
-        _shared_request_timestamps = timestamps
-    
+        # Accept an asyncio.Lock from callers that already create one, or create ours
+        if isinstance(lock, asyncio.Lock):
+            _shared_rate_limiter_lock = lock
+        else:
+            # Discard threading.Lock — create a proper asyncio one instead
+            _shared_rate_limiter_lock = asyncio.Lock()
+        if timestamps is not None:
+            _shared_request_timestamps = timestamps
+
     async def acquire_rate_limit(self, rpm: int = RATE_LIMIT_RPM):
-        """Acquire rate limit permission, waiting if necessary.
+        """Acquire rate limit permission, yielding to the event loop while waiting.
 
         Uses the module-level ``_shared_request_timestamps`` list so that
-        the combined request rate across *all* workers stays within the
-        configured RPM.
+        the combined request rate across *all* workers stays within rpm.
+        The asyncio.Lock ensures mutual exclusion without blocking the loop.
         """
-        import time
-        global _shared_rate_limiter_lock, _shared_request_timestamps
+        lock = _get_rate_limiter_lock()
 
         while True:
-            if _shared_rate_limiter_lock is None:
-                return  # No rate limiter configured
-            with _shared_rate_limiter_lock:
-                now = time.time()
+            async with lock:
+                now = time.monotonic()
                 # Remove timestamps older than 1 minute
                 _shared_request_timestamps[:] = [
                     t for t in _shared_request_timestamps if now - t < 60
                 ]
 
                 if len(_shared_request_timestamps) < rpm:
-                    # Under limit, proceed
+                    # Under limit — claim a slot and return immediately
                     _shared_request_timestamps.append(now)
                     return
 
-                # At limit, calculate wait time
+                # At limit — compute how long until the oldest slot expires
                 oldest = _shared_request_timestamps[0]
-                wait_time = 60 - (now - oldest) + 0.1
+                wait_time = max(0.05, 60.0 - (now - oldest) + 0.05)
 
-            # Wait outside lock
-            await asyncio.sleep(min(wait_time, 2))  # Cap at 2 seconds
+            # Wait OUTSIDE the lock so other workers can check their own slots
+            await asyncio.sleep(min(wait_time, 2.0))
     
     async def grade_single_student(
         self,
@@ -94,8 +120,7 @@ class GradingWorker:
         rubric_text: str,
         max_score: int,
         questions: list,
-        use_acmag: bool = False,
-        acmag_runtime=None,
+        checkpoints: dict = None,
     ):
         """Grade a single student submission."""
         from pathlib import Path
@@ -139,7 +164,20 @@ class GradingWorker:
                 student_dir, student_identifier, self.session_id
             )
             ingestion_report_dict = ingestion_report.to_dict() if hasattr(ingestion_report, "to_dict") else None
-            
+
+            # ── Remove system / hidden / IDE files ────────────────────────────
+            # macOS junk (.DS_Store, ._*, __MACOSX/), Python artifacts (__pycache__,
+            # .pyc), IDE configs (.vscode, .idea), VCS dirs (.git) etc. carry no
+            # submission content and can confuse the grader.
+            before_count = len(extracted_contents)
+            extracted_contents = filter_submission_files(extracted_contents)
+            after_count = len(extracted_contents)
+            if before_count != after_count:
+                logger.info(
+                    "[FILTER] %s: removed %d system file(s), %d remain",
+                    student_identifier, before_count - after_count, after_count,
+                )
+
             # Store ingestion report
             if hasattr(ingestion_report, 'to_dict'):
                 worker_submission.ingestion_report = json.dumps(ingestion_report.to_dict())
@@ -276,87 +314,157 @@ class GradingWorker:
             # configured limit.
 
             # Grade
-            if use_acmag and acmag_runtime:
-                from app.services.acmag import grade_submission_acmag
-                
-                run_secondary = acmag_runtime.should_run_secondary(
-                    worker_submission.id, str(student_identifier)
+            if not checkpoints:
+                logger.error(
+                    "[WORKER %d] %s: no checkpoints available — ensure generate_checkpoints() ran before grading",
+                    self.worker_id, student_identifier,
                 )
-                anchor_context = (
-                    acmag_runtime.anchor_context_text() 
-                    if acmag_runtime.calibration_complete 
-                    else ""
-                )
-                try:
-                    acmag_pack = await asyncio.wait_for(
-                        grade_submission_acmag(
-                            title=str(session.title),
-                            description=str(session.description) or "",
-                            rubric=rubric_text,
-                            max_score=max_score,
+                raise RuntimeError(f"No checkpoints for session {self.session_id} — cannot grade {student_identifier}")
+
+            if checkpoints:
+                # ── Multi-agent grading pipeline ──────────────────────
+                # Checkpoints available → use the new agent system:
+                # Domain Judge (partial credit) → Verifier → Scorer → Critic
+
+                # ── Normalise checkpoint format ───────────────────────
+                # Checkpoints are stored as {"criterion_name": [cp, ...]}
+                # We need criteria=[{"criterion": name, "max": N}] and
+                # checkpoints_by_criterion={"criterion_name": [cp, ...]}
+
+                # Build checkpoints_by_criterion from the stored dict
+                checkpoints_by_criterion: dict = {}
+                if isinstance(checkpoints, dict):
+                    # Stored format: {"criterion_name": [cp_dicts]}
+                    # Filter out any non-list values (e.g. metadata keys)
+                    checkpoints_by_criterion = {
+                        k: v for k, v in checkpoints.items()
+                        if isinstance(v, list)
+                    }
+
+                # Parse rubric text to get max points per criterion
+                from app.services.ai_grader_fixed import parse_rubric as _parse_rubric
+                rubric_criteria = _parse_rubric(rubric_text) if rubric_text else []
+
+                # Build a lookup: criterion_name → max_points
+                rubric_max_lookup = {c["criterion"]: c["max"] for c in rubric_criteria}
+
+                # Build criteria list. For each criterion in checkpoints,
+                # look up max from rubric; fall back to sum of checkpoint points,
+                # then to equal share of max_score.
+                criteria = []
+                for crit_name, crit_cps in checkpoints_by_criterion.items():
+                    if crit_name in rubric_max_lookup:
+                        crit_max = float(rubric_max_lookup[crit_name])
+                    else:
+                        # Fallback: sum checkpoint points (may be 0 if not set)
+                        cp_sum = sum(float(cp.get("points", 0)) for cp in crit_cps)
+                        if cp_sum > 0:
+                            crit_max = cp_sum
+                        else:
+                            # Last resort: equal share of total max_score
+                            n = len(checkpoints_by_criterion) or 1
+                            crit_max = round(max_score / n, 2)
+                    criteria.append({"criterion": crit_name, "max": crit_max})
+
+                # Fix checkpoints that have points: 0 by distributing criterion max
+                fixed_checkpoints_by_criterion: dict = {}
+                for crit_name, crit_cps in checkpoints_by_criterion.items():
+                    crit_max = next(
+                        (c["max"] for c in criteria if c["criterion"] == crit_name), 0.0
+                    )
+                    cp_sum = sum(float(cp.get("points", 0)) for cp in crit_cps)
+                    if cp_sum == 0 and crit_max > 0 and crit_cps:
+                        # Distribute evenly (last checkpoint gets remainder)
+                        each = crit_max / len(crit_cps)
+                        fixed_cps = []
+                        total_assigned = 0.0
+                        for i, cp in enumerate(crit_cps):
+                            cp = dict(cp)
+                            if i < len(crit_cps) - 1:
+                                cp["points"] = round(each, 2)
+                                total_assigned += cp["points"]
+                            else:
+                                cp["points"] = round(crit_max - total_assigned, 2)
+                            fixed_cps.append(cp)
+                        fixed_checkpoints_by_criterion[crit_name] = fixed_cps
+                    else:
+                        fixed_checkpoints_by_criterion[crit_name] = list(crit_cps)
+                checkpoints_by_criterion = fixed_checkpoints_by_criterion
+
+                submission_text = collect_student_text(extracted_contents)
+
+                # Rate limiter wrapper for the orchestrator
+                async def _rate_limit_fn():
+                    await self.acquire_rate_limit()
+
+                # ── File routing: map rubric criteria → relevant files ──────────
+                # Instead of grading each criterion with the full (possibly
+                # truncated) submission, we ask the LLM which files are relevant
+                # for each criterion.  This eliminates input truncation and
+                # cross-question contamination in one step.
+                #
+                # Only run routing when there are multiple files — single-file
+                # submissions don't benefit (routing would just return the one
+                # file for every criterion anyway).
+                file_routing_map: dict | None = None
+                _routing_fallback = False
+                if len(extracted_contents) > 1:
+                    try:
+                        file_routing_map, _routing_fallback = await route_files_to_criteria(
+                            criteria=criteria,
                             student_files=extracted_contents,
-                            questions=questions,
-                            student_identifier=str(student_identifier),
-                            anchor_context=anchor_context,
-                            run_secondary=run_secondary,
-                            moderation_delta=acmag_runtime.moderation_delta,
-                        ),
-                        timeout=45,
-                    )
-
-                    if not isinstance(acmag_pack, dict):
-                        logger.error(f"ACMAG returned non-dict for {student_identifier}: {type(acmag_pack)}")
-                        acmag_pack = {"result": {}}
-                    result = dict(acmag_pack.get("result") or {})
-
-                    # Update ACMAG runtime state
-                    if not result.get("error"):
-                        acmag_runtime.register_anchor(
-                            worker_submission.id, str(student_identifier), result
+                            rate_limiter=_rate_limit_fn,
+                            files_per_batch=5,
                         )
-                        secondary_result = acmag_pack.get("secondary_result")
-                        if (
-                            acmag_pack.get("secondary_executed")
-                            and isinstance(secondary_result, dict)
-                            and not secondary_result.get("error")
-                        ):
-                            acmag_runtime.record_secondary_pair(
-                                primary=acmag_pack.get("primary_result") or result,
-                                secondary=secondary_result,
-                                from_calibration=acmag_runtime.is_calibration_submission(worker_submission.id),
+                        # Post-process: remove cross-question file mappings
+                        # (e.g. LLM may route Q3.ipynb to Q1b criteria due to
+                        # semantic similarity — this enforces Q-number consistency).
+                        file_routing_map = filter_routing_map_by_question(file_routing_map)
+                        # Sanity check: if routing returned nothing useful, discard
+                        total_mapped = sum(len(v) for v in file_routing_map.values())
+                        if total_mapped == 0:
+                            logger.warning(
+                                "[ROUTING] %s: routing returned 0 mappings after Q-filter — falling back to full text",
+                                student_identifier,
                             )
-                        result.setdefault("acmag", {})
-                        result["acmag"]["runtime"] = acmag_runtime.reliability_snapshot()
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"ACMAG timed out for {student_identifier}; falling back to standard grading"
+                            file_routing_map = None
+                    except Exception as route_err:
+                        logger.warning(
+                            "[ROUTING] %s: routing failed (%s) — grading with full text",
+                            student_identifier, route_err,
+                        )
+                        file_routing_map = None
+                        _routing_fallback = True
+                else:
+                    logger.debug(
+                        "[ROUTING] %s: single-file submission — skipping routing",
+                        student_identifier,
                     )
-                    result = await grade_student(
-                        title=str(session.title),
-                        description=str(session.description) or "",
-                        rubric=rubric_text,
-                        max_score=max_score,
-                        student_files=extracted_contents,
-                        questions=questions,
-                        reference_solution=getattr(session, "reference_solution", None) or None,
-                        test_cases=getattr(session, "test_cases", None) or None,
-                        run_command=getattr(session, "run_command", None) or None,
-                        student_dir=str(student_dir) if student_dir else None,
-                    )
-            else:
-                result = await grade_student(
-                    title=str(session.title),
-                    description=str(session.description) or "",
-                    rubric=rubric_text,
-                    max_score=max_score,
+
+                result = await grade_student_with_agents(
+                    student_id=worker_submission.id,
+                    session_id=self.session_id,
+                    checkpoints_by_criterion=checkpoints_by_criterion,
+                    criteria=criteria,
+                    submission_text=submission_text,
                     student_files=extracted_contents,
-                    questions=questions,
-                    reference_solution=getattr(session, "reference_solution", None) or None,
-                    test_cases=getattr(session, "test_cases", None) or None,
-                    run_command=getattr(session, "run_command", None) or None,
-                    student_dir=str(student_dir) if student_dir else None,
+                    title=str(session.title),
+                    max_score=max_score,
+                    rate_limiter=_rate_limit_fn,
+                    file_routing_map=file_routing_map,
                 )
-            
+
+                # Propagate routing fallback flag to result dict
+                if isinstance(result, dict) and _routing_fallback:
+                    result["routing_fallback_used"] = True
+                    result.setdefault("needs_review", True)
+                    flags = result.get("review_flags") or []
+                    flags.append(
+                        "File routing failed for ≥1 batch — some criteria may have received wrong files. "
+                        "Manual review recommended."
+                    )
+                    result["review_flags"] = flags
+
             # Safety: ensure result is always a dict
             if not isinstance(result, dict):
                 logger.error(f"[GRADER] grade_student returned non-dict for {student_identifier}: {type(result)}")
@@ -442,7 +550,11 @@ class GradingWorker:
 
             # 4. Low confidence from LLM
             if str(result.get("confidence", "")).lower() == "low":
-                flag_reasons.append(f"Low confidence from AI grader: {result.get('confidence_reasoning', 'no reasoning provided')[:100]}")
+                verification_rate = result.get("verification_rate")
+                if verification_rate is not None:
+                    flag_reasons.append(f"Low grading confidence ({round(verification_rate * 100)}% evidence verification rate)")
+                else:
+                    flag_reasons.append("Low grading confidence — manual review recommended")
 
             # 5. Ingestion warnings (nested student folders, cross-contamination, parse failures)
             if ingestion_report_dict:
@@ -577,7 +689,19 @@ class GradingWorker:
                 StudentSubmission.session_id == self.session_id,
                 StudentSubmission.status == "error",
             ).count()
-            
+
+            # Keep session.graded_count / error_count live so the status endpoint
+            # always returns up-to-date counts (frontend invalidates on each SSE event).
+            try:
+                from app.models import GradingSession as _GS
+                _sess = db.query(_GS).filter(_GS.id == self.session_id).first()
+                if _sess:
+                    _sess.graded_count = graded_count
+                    _sess.error_count = failed_count
+                    db.commit()
+            except Exception:
+                pass  # Non-critical; totals will be fixed at run-end regardless
+
             # Broadcast progress
             if self.sse_callback:
                 self.sse_callback(self.session_id, {
@@ -654,8 +778,8 @@ class ParallelGrader:
         self.sse_callback = sse_callback
         self.stop_check = stop_check
 
-        # Shared rate limiter state
-        self._rate_lock = threading.Lock()
+        # Shared rate limiter state — asyncio.Lock so the event loop is never blocked
+        self._rate_lock = asyncio.Lock()
         self._request_timestamps: list[float] = []
 
         # Set up worker class
@@ -675,8 +799,7 @@ class ParallelGrader:
         max_score: int,
         questions: list,
         progress_callback=None,
-        use_acmag: bool = False,
-        acmag_runtime=None,
+        checkpoints: dict = None,
     ) -> dict:
         """
         Grade a batch of submissions in parallel.
@@ -712,7 +835,7 @@ class ParallelGrader:
         max_iterations = len(submissions) * (max_retries + 1)
         iteration = 0
         
-        while pending and iteration < max_iterations:
+        while (pending or in_progress) and iteration < max_iterations:
             iteration += 1
 
             # Check stop flag before starting new work
@@ -739,7 +862,7 @@ class ParallelGrader:
                 task = asyncio.create_task(
                     worker.grade_single_student(
                         sub, session, rubric_text, max_score, questions,
-                        use_acmag=use_acmag, acmag_runtime=acmag_runtime,
+                        checkpoints=checkpoints,
                     )
                 )
                 in_progress[sub.id] = (sub, task, worker)
@@ -752,26 +875,37 @@ class ParallelGrader:
             task_to_sub = {t: (sub_id, sub, worker) for sub_id, (sub, t, worker) in in_progress.items()}
             
             # Wait for at least one to complete (with timeout)
+            # Checkpoint grading with retries can take 120+ seconds per student
             try:
                 done, still_pending = await asyncio.wait(
                     list(task_to_sub.keys()),
                     return_when=asyncio.FIRST_COMPLETED,
-                    timeout=30  # 30 second timeout
+                    timeout=300  # 5 minute timeout per wait cycle
                 )
             except Exception as e:
                 logger.error(f"[PARALLEL_GRADER] Error in asyncio.wait: {e}")
                 break
-            
+
             # DEBUG: Log wait results
             logger.info(f"[PARALLEL_GRADER] Wait returned: {len(done)} done, {len(still_pending)} pending")
-            
+
             if not done:
-                logger.warning("[PARALLEL_GRADER] asyncio.wait timed out with no completed tasks!")
-                # Cancel pending tasks and break
-                for task in still_pending:
-                    task.cancel()
-                break
+                logger.warning("[PARALLEL_GRADER] asyncio.wait timed out (300s) with no completed tasks! Continuing to wait...")
+                # Don't cancel — just loop again and wait more
+                # Only cancel if we've been waiting for too long (3 consecutive timeouts)
+                if not hasattr(self, '_timeout_count'):
+                    self._timeout_count = 0
+                self._timeout_count += 1
+                if self._timeout_count >= 3:
+                    logger.error("[PARALLEL_GRADER] 3 consecutive timeouts — cancelling remaining tasks")
+                    for task in still_pending:
+                        task.cancel()
+                    break
+                continue
             
+            # Reset timeout counter since we got results
+            self._timeout_count = 0
+
             # Check stop flag after wait returns
             if self.stop_check and self.stop_check():
                 logger.info(f"[PARALLEL_GRADER] Stop requested after wait for session {self.session_id}")
@@ -878,8 +1012,6 @@ def grade_session_parallel_sync(
     session_id: int,
     db,
     max_workers: int = PARALLEL_GRADING_WORKERS,
-    use_acmag: bool = False,
-    acmag_runtime=None,
 ) -> dict:
     """Synchronous wrapper for parallel grading."""
     from app.models import GradingSession, StudentSubmission
@@ -904,6 +1036,16 @@ def grade_session_parallel_sync(
             questions = json.loads(session.questions)
         except:
             pass
+
+    # Load checkpoints for checkpoint-based grading
+    session_checkpoints = None
+    if getattr(session, "checkpoints", None):
+        try:
+            session_checkpoints = json.loads(session.checkpoints)
+            if not isinstance(session_checkpoints, dict):
+                session_checkpoints = None
+        except (json.JSONDecodeError, TypeError):
+            session_checkpoints = None
     
     grader = ParallelGrader(session_id, db, max_workers=max_workers)
     
@@ -914,7 +1056,7 @@ def grade_session_parallel_sync(
         result = loop.run_until_complete(
             grader.grade_batch_parallel(
                 submissions, session, rubric_text, max_score, questions,
-                use_acmag=use_acmag, acmag_runtime=acmag_runtime,
+                checkpoints=session_checkpoints,
             )
         )
         return result

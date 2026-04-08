@@ -419,6 +419,17 @@ export function TransparencyVault({ submission, ingestionReport }: TransparencyV
             </div>
           )}
 
+          {/* Judge truncation warning */}
+          {submission.judge_truncated && (
+            <div className="flex items-start gap-2 text-xs text-amber-400 mt-2">
+              <AlertTriangle className="h-3 w-3 shrink-0 mt-0.5" />
+              <span>
+                <strong>AI grading truncated:</strong> submission exceeded the AI context window (28,000 chars).
+                Content beyond that limit was not evaluated. Manual review of large submissions is recommended.
+              </span>
+            </div>
+          )}
+
           {/* Warnings */}
           {ingestionReport.warnings && ingestionReport.warnings.length > 0 && (
             <div className="space-y-1">
@@ -446,6 +457,72 @@ export function TransparencyVault({ submission, ingestionReport }: TransparencyV
           )}
         </div>
       ) : null,
+    },
+    {
+      id: 'checkpoint_grading',
+      title: 'Checkpoint Grading',
+      icon: CheckCircle2,
+      badge: (() => {
+        if (aiResult?.grading_method !== 'checkpoint') return null
+        const stats = aiResult?.checkpoint_stats
+        if (!stats) return null
+        return `${stats.verified}/${stats.total} verified`
+      })(),
+      content: (() => {
+        if (aiResult?.grading_method !== 'checkpoint') return null
+        const stats = aiResult?.checkpoint_stats
+        const vRate = aiResult?.verification_rate
+        if (!stats) return null
+        return (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="rounded-lg bg-[var(--bg-page)] border border-[var(--border)] p-2.5 text-center">
+                <p className="text-lg font-bold tabular-nums text-[var(--text-primary)]">{stats.total}</p>
+                <p className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider">Total Checkpoints</p>
+              </div>
+              <div className="rounded-lg bg-emerald-500/5 border border-emerald-500/20 p-2.5 text-center">
+                <p className="text-lg font-bold tabular-nums text-emerald-400">{stats.verified}</p>
+                <p className="text-[10px] text-emerald-400/80 uppercase tracking-wider">Verified</p>
+              </div>
+              <div className="rounded-lg bg-amber-500/5 border border-amber-500/20 p-2.5 text-center">
+                <p className="text-lg font-bold tabular-nums text-amber-400">{stats.hallucinated_and_retried}</p>
+                <p className="text-[10px] text-amber-400/80 uppercase tracking-wider">Retried</p>
+              </div>
+              <div className="rounded-lg bg-rose-500/5 border border-rose-500/20 p-2.5 text-center">
+                <p className="text-lg font-bold tabular-nums text-rose-400">{stats.flagged_criteria}</p>
+                <p className="text-[10px] text-rose-400/80 uppercase tracking-wider">Flagged Criteria</p>
+              </div>
+            </div>
+            {typeof vRate === 'number' && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-[var(--text-muted)]">Evidence Verification Rate</span>
+                  <span className={cn(
+                    'font-semibold',
+                    vRate >= 0.9 ? 'text-emerald-400' : vRate >= 0.7 ? 'text-amber-400' : 'text-rose-400'
+                  )}>
+                    {Math.round(vRate * 100)}%
+                  </span>
+                </div>
+                <div className="h-2 rounded-full bg-[var(--border)] overflow-hidden">
+                  <div
+                    className={cn(
+                      'h-full rounded-full transition-all',
+                      vRate >= 0.9 ? 'bg-emerald-500' : vRate >= 0.7 ? 'bg-amber-500' : 'bg-rose-500'
+                    )}
+                    style={{ width: `${vRate * 100}%` }}
+                  />
+                </div>
+              </div>
+            )}
+            <p className="text-xs text-[var(--text-muted)] leading-relaxed">
+              Checkpoint grading uses binary pass/fail checkpoints with evidence verification.
+              Scores are computed deterministically from verified checkpoints only.
+              Unverifiable evidence is retried and flagged for teacher review.
+            </p>
+          </div>
+        )
+      })(),
     },
   ]
 
