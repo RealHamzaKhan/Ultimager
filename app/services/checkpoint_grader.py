@@ -18,6 +18,11 @@ import hashlib
 from difflib import SequenceMatcher
 from typing import Any, Optional
 
+from app.config import (
+    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT,
+    MAX_TOKENS_CHECKPOINT_GEN, MAX_TOKENS_GRADING, MAX_TOKENS_ROUTING, MAX_TOKENS_RETRY,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -138,7 +143,7 @@ async def generate_checkpoints(
             ],
             temperature=0.0,
             top_p=1.0,
-            max_tokens=4000,
+            max_tokens=MAX_TOKENS_CHECKPOINT_GEN,
             seed=42,
             response_format={"type": "json_object"},
         )
@@ -1063,7 +1068,6 @@ async def route_files_to_criteria(
         return {}, False
 
     try:
-        from app.config import NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL
         from openai import OpenAI
         from app.services.ai_grader_fixed import _extract_json
     except Exception as e:
@@ -1115,9 +1119,9 @@ async def route_files_to_criteria(
     routing_map: dict[str, set[str]] = {name: set() for name in all_crit_names}
 
     client = OpenAI(
-        base_url=NVIDIA_BASE_URL,
-        api_key=NVIDIA_API_KEY,
-        timeout=60.0,
+        base_url=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        timeout=LLM_TIMEOUT,
     )
 
     batch_count = 0
@@ -1166,14 +1170,14 @@ async def route_files_to_criteria(
 
         try:
             response = client.chat.completions.create(
-                model=NVIDIA_MODEL,
+                model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": _ROUTING_SYSTEM_PROMPT},
                     user_message,
                 ],
                 temperature=0.0,
                 seed=42,
-                max_tokens=2000,
+                max_tokens=MAX_TOKENS_ROUTING,
             )
             raw = ""
             if response and response.choices:
@@ -1369,7 +1373,7 @@ async def grade_with_checkpoints(
         messages=grading_messages,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=4000,
+        max_tokens=MAX_TOKENS_GRADING,
         seed=42,
         preferred_provider=preferred_provider,
     )
@@ -1723,7 +1727,7 @@ async def _retry_hallucinated_checkpoints(
                 ],
                 temperature=0.0,
                 top_p=1.0,
-                max_tokens=2000,
+                max_tokens=MAX_TOKENS_RETRY,
                 seed=42,
                 preferred_provider=preferred_provider,
             )

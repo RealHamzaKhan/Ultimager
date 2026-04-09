@@ -27,10 +27,13 @@ from openai import (
 from PIL import Image, ImageStat
 
 from app.config import (
-    NVIDIA_API_KEY,
-    NVIDIA_BASE_URL,
-    NVIDIA_MODEL,
-    GLM_TEXT_MODEL,
+    # Provider — generic names (preferred)
+    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_RUBRIC_MODEL, LLM_TIMEOUT,
+    MAX_TOKENS_RUBRIC, MAX_TOKENS_RELEVANCE, MAX_TOKENS_VISION,
+    JUDGE_CONTENT_LIMIT,
+    # backward-compat aliases
+    NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL, GLM_TEXT_MODEL,
+    # everything else
     LLM_PROVIDER_ORDER,
     NVIDIA_MAX_IMAGES_PER_REQUEST,
     ENABLE_VISION_PREANALYSIS,
@@ -178,14 +181,14 @@ _provider_state_lock = threading.Lock()
 
 
 def _provider_catalog() -> dict[str, ProviderSpec]:
-    """Returns the provider catalog - NVIDIA NIM only."""
+    """Returns the provider catalog — uses LLM_* env vars for full configurability."""
     return {
         "nvidia": ProviderSpec(
             name="nvidia_nim",
-            base_url=NVIDIA_BASE_URL,
-            api_key=NVIDIA_API_KEY,
-            model_text=NVIDIA_MODEL,
-            model_vision=NVIDIA_MODEL,
+            base_url=LLM_BASE_URL,
+            api_key=LLM_API_KEY,
+            model_text=LLM_MODEL,
+            model_vision=LLM_MODEL,
             default_headers={},
         ),
     }
@@ -310,13 +313,13 @@ def _call_rubric_model(
     temperature: float = 0.3,
     max_tokens: int = 5000,
 ) -> Any:
-    """Call NVIDIA_MODEL for rubric generation.
+    """Call LLM_RUBRIC_MODEL for rubric generation.
 
     Returns an OpenAI-compatible response object (response.choices[0].message.content).
     """
-    client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY, timeout=60.0)
+    client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY, timeout=LLM_TIMEOUT)
     response = client.chat.completions.create(
-        model=NVIDIA_MODEL,
+        model=LLM_RUBRIC_MODEL,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
@@ -1306,7 +1309,7 @@ async def _extract_question_structure(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=4000,
+            max_tokens=MAX_TOKENS_RUBRIC,
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1684,7 +1687,7 @@ Generate the rubric following the question structure above. Total: exactly {max_
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=5000,
+            max_tokens=MAX_TOKENS_RUBRIC,
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -1862,7 +1865,7 @@ For each criterion, the sub-item point breakdown in the description MUST sum to 
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=5000,
+            max_tokens=MAX_TOKENS_RUBRIC,
         )
 
         raw_text = response.choices[0].message.content or ""
@@ -2139,7 +2142,7 @@ Is this submission relevant to the assignment?"""
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=MAX_TOKENS_RELEVANCE,
             response_format={"type": "json_object"},
         )
         
@@ -3130,8 +3133,8 @@ def _vision_batch_with_failover(
                     ],
                     temperature=0.0,
                     top_p=1.0,
-                    # BUG-25 fix: scale tokens with chunk size (~250 tokens per image)
-                    max_tokens=min(4000, max(1200, len(chunk) * 250)),
+                    # scale tokens with chunk size (~250 tokens per image), bounded by MAX_TOKENS_VISION
+                    max_tokens=min(MAX_TOKENS_VISION * 4, max(MAX_TOKENS_VISION, len(chunk) * 250)),
                     seed=42,
                 )
                 notes = (response.choices[0].message.content or "").strip()
@@ -3219,7 +3222,7 @@ async def _consolidate_vision_notes(batch_notes: list[dict[str, Any]]) -> tuple[
             ],
             temperature=0.0,
             top_p=1.0,
-            max_tokens=1200,
+            max_tokens=MAX_TOKENS_VISION,
             seed=42,
             response_format={"type": "json_object"},
         )
@@ -4347,7 +4350,7 @@ async def _verify_citations_with_llm(
             ],
             temperature=0.0,
             top_p=1.0,
-            max_tokens=1200,
+            max_tokens=MAX_TOKENS_VISION,
             seed=42,
             preferred_provider=preferred_provider,
             allow_fallback=bool(SCORING_ALLOW_FALLBACK),

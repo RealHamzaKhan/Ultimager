@@ -16,7 +16,13 @@ from typing import Optional
 
 from openai import OpenAI
 
-from app.config import NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL, NVIDIA_MAX_IMAGES_PER_REQUEST
+from app.config import (
+    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT,
+    MAX_TOKENS_JUDGE, JUDGE_CONTENT_LIMIT,
+    NVIDIA_MAX_IMAGES_PER_REQUEST,
+    # backward-compat aliases kept for any code that imports them directly
+    NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL,
+)
 from app.services.agents.base import CheckpointResult
 
 logger = logging.getLogger(__name__)
@@ -102,9 +108,9 @@ Grade this criterion for this student. Respond ONLY in this JSON format:
 
 def _get_nvidia_client() -> OpenAI:
     return OpenAI(
-        base_url=NVIDIA_BASE_URL,
-        api_key=NVIDIA_API_KEY,
-        timeout=120.0,
+        base_url=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        timeout=LLM_TIMEOUT,
     )
 
 
@@ -131,7 +137,7 @@ async def judge_checkpoint(
             Images are capped at NVIDIA_MAX_IMAGES_PER_REQUEST per call.
     """
     # Flow-audit gap #1 fix: warn when content is truncated so this is never silent.
-    content_limit = 60_000
+    content_limit = JUDGE_CONTENT_LIMIT
     truncated = len(submission_content) > content_limit
     content_for_prompt = submission_content[:content_limit]
     if truncated:
@@ -150,15 +156,11 @@ async def judge_checkpoint(
         content=content_for_prompt,
     )
 
-    # Always use NVIDIA as primary — GLM (z-ai/glm4.7) returns empty strings for
-    # prompts > ~5k chars, which causes silent grading failures.  NVIDIA Llama is
-    # faster, more reliable, and handles any submission length correctly.
-    nvidia_client = _get_nvidia_client()
-    if nvidia_client is None:
+    client = _get_nvidia_client()
+    if client is None:
         return _error_result(checkpoint_id, criterion, points_max, "No LLM client available", "none")
 
-    client = nvidia_client
-    model = NVIDIA_MODEL
+    model = LLM_MODEL
 
     # Build the user message — multimodal when images are present, plain string otherwise.
     # An empty list is treated the same as None (no images).
@@ -200,7 +202,7 @@ async def judge_checkpoint(
                 ],
                 temperature=0,
                 seed=42,       # H-2 fix: deterministic output — same student always gets same grade
-                max_tokens=800,
+                max_tokens=MAX_TOKENS_JUDGE,
             )
             raw = _safe_content(response)
             if not raw:
