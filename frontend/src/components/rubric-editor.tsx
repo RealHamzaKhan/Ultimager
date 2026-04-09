@@ -148,7 +148,7 @@ export function RubricEditor({ criteria, onChange, maxScore, questions }: Rubric
 
       {/* Criteria groups */}
       {groupedCriteria.map((group, gi) => (
-        <div key={group.questionId ?? `group-${gi}`} className="space-y-2">
+        <div key={`${group.questionId ?? 'ungrouped'}-${gi}`} className="space-y-2">
           {group.label && (
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">

@@ -1721,6 +1721,30 @@ Generate the rubric following the question structure above. Total: exactly {max_
                 break
         final_criteria = model_criteria
 
+        # ── Guaranteed total: Phase 2 LLM sometimes ignores mark allocations
+        # (e.g. when question_ids don't match leaf ids, or it just ignores the
+        # instructions).  Apply a final rescale so the total ALWAYS equals
+        # max_score regardless of what the LLM returned.
+        total_final = sum(c.get("max", 0) for c in final_criteria)
+        if total_final != max_score and len(final_criteria) > 0:
+            logger.warning(
+                "Phase 2 total %d ≠ max_score %d — applying final rescale",
+                total_final, max_score,
+            )
+            factor = max_score / total_final if total_final > 0 else max_score / len(final_criteria)
+            for c in final_criteria:
+                c["max"] = max(1, round((c.get("max") or 1) * factor))
+            # Distribute remainder evenly (not all on one criterion)
+            current = sum(c.get("max", 0) for c in final_criteria)
+            diff = max_score - current
+            if diff != 0:
+                sorted_c = sorted(final_criteria, key=lambda x: x.get("max", 0), reverse=(diff > 0))
+                for i in range(abs(diff)):
+                    sorted_c[i % len(sorted_c)]["max"] += 1 if diff > 0 else -1
+                for c in final_criteria:
+                    if c.get("max", 0) < 1:
+                        c["max"] = 1
+
         rubric_text = _format_rubric_text(final_criteria, max_score)
         rubric_display = _format_rubric_display(final_criteria, max_score)
         reasoning = _normalize_space(result.get("reasoning", ""))
