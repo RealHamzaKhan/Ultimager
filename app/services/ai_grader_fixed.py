@@ -1520,15 +1520,26 @@ def _rescale_criteria_to_max_score(criteria: list[dict], max_score: int) -> None
     current = sum(c.get("marks") or 0 for c in criteria)
     diff = max_score - current
     if diff != 0:
-        # Sort by original weight descending; ties broken by current marks
+        # Always sort descending: reduce/increase highest-weight criteria first.
+        # Reducing biggest criteria is safe (they can spare a mark); increasing
+        # them is proportionally fair.
         sorted_c = sorted(
             criteria,
             key=lambda c: (c.get("marks") or 0),
-            reverse=(diff > 0),
+            reverse=True,
         )
         for i in range(abs(diff)):
             idx = i % len(sorted_c)
-            sorted_c[idx]["marks"] = (sorted_c[idx].get("marks") or 0) + (1 if diff > 0 else -1)
+            new_val = (sorted_c[idx].get("marks") or 0) + (1 if diff > 0 else -1)
+            if new_val >= 1:
+                sorted_c[idx]["marks"] = new_val
+            else:
+                # Skip — find next criterion that can donate a mark
+                for j in range(1, len(sorted_c)):
+                    alt = sorted_c[(idx + j) % len(sorted_c)]
+                    if (alt.get("marks") or 0) > 1:
+                        alt["marks"] = (alt.get("marks") or 0) - 1
+                        break
         # Final safety: no criterion below 1
         for c in criteria:
             if (c.get("marks") or 0) < 1:
@@ -1741,9 +1752,24 @@ Generate the rubric following the question structure above. Total: exactly {max_
             current = sum(c.get("max", 0) for c in final_criteria)
             diff = max_score - current
             if diff != 0:
-                sorted_c = sorted(final_criteria, key=lambda x: x.get("max", 0), reverse=(diff > 0))
+                # For reductions (diff < 0): sort DESCENDING so we reduce biggest
+                # criteria first — they can spare a point.  For additions (diff > 0):
+                # sort DESCENDING too so the heaviest items grow proportionally.
+                sorted_c = sorted(final_criteria, key=lambda x: x.get("max", 0), reverse=True)
                 for i in range(abs(diff)):
-                    sorted_c[i % len(sorted_c)]["max"] += 1 if diff > 0 else -1
+                    idx = i % len(sorted_c)
+                    new_val = sorted_c[idx]["max"] + (1 if diff > 0 else -1)
+                    # Never allow a criterion to drop below 1 mark
+                    if new_val >= 1:
+                        sorted_c[idx]["max"] = new_val
+                    else:
+                        # Skip this criterion — find the next one that can absorb
+                        for j in range(1, len(sorted_c)):
+                            alt = sorted_c[(idx + j) % len(sorted_c)]
+                            if alt["max"] > 1:
+                                alt["max"] -= 1
+                                break
+                # Final safety clamp — should never be needed but just in case
                 for c in final_criteria:
                     if c.get("max", 0) < 1:
                         c["max"] = 1
