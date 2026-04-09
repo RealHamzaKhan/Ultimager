@@ -887,11 +887,9 @@ async def stop_grading(session_id: int, db: Session = Depends(get_db)):
     # Clean up active grading state so start_grading can work again
     _active_grading.pop(session_id, None)
 
-    # Clean up stop flag after a short delay (give workers time to see it)
-    async def _cleanup_stop_flag():
-        await asyncio.sleep(5)
-        _stop_grading_flags.pop(session_id, None)
-    asyncio.create_task(_cleanup_stop_flag())
+    # NOTE: Do NOT clear the stop flag here.  The grading thread's finally
+    # block owns the flag lifecycle.  If we remove it after 5s the thread
+    # may still be in asyncio.wait() and miss the signal entirely.
     
     # Broadcast stop event
     _broadcast_sse(session_id, {

@@ -874,14 +874,27 @@ class ParallelGrader:
             # Create mapping of task to submission info BEFORE waiting
             task_to_sub = {t: (sub_id, sub, worker) for sub_id, (sub, t, worker) in in_progress.items()}
             
-            # Wait for at least one to complete (with timeout)
-            # Checkpoint grading with retries can take 120+ seconds per student
+            # Wait for at least one to complete.  Poll in 2-second slices so
+            # stop requests are acted on within ~2 seconds rather than waiting
+            # for the full 300-second timeout or the next task to finish.
+            done: set = set()
+            still_pending: set = set(task_to_sub.keys())
+            _total_wait = 0
+            _MAX_WAIT = 300
             try:
-                done, still_pending = await asyncio.wait(
-                    list(task_to_sub.keys()),
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=300  # 5 minute timeout per wait cycle
-                )
+                while still_pending and _total_wait < _MAX_WAIT:
+                    # Check stop flag before each slice
+                    if self.stop_check and self.stop_check():
+                        break
+                    _slice_done, still_pending = await asyncio.wait(
+                        list(still_pending),
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=2,
+                    )
+                    done |= _slice_done
+                    _total_wait += 2
+                    if done:
+                        break  # at least one task finished — process it
             except Exception as e:
                 logger.error(f"[PARALLEL_GRADER] Error in asyncio.wait: {e}")
                 break
@@ -890,19 +903,21 @@ class ParallelGrader:
             logger.info(f"[PARALLEL_GRADER] Wait returned: {len(done)} done, {len(still_pending)} pending")
 
             if not done:
-                logger.warning("[PARALLEL_GRADER] asyncio.wait timed out (300s) with no completed tasks! Continuing to wait...")
-                # Don't cancel — just loop again and wait more
-                # Only cancel if we've been waiting for too long (3 consecutive timeouts)
-                if not hasattr(self, '_timeout_count'):
-                    self._timeout_count = 0
-                self._timeout_count += 1
-                if self._timeout_count >= 3:
-                    logger.error("[PARALLEL_GRADER] 3 consecutive timeouts — cancelling remaining tasks")
-                    for task in still_pending:
-                        task.cancel()
-                    break
-                continue
-            
+                # Either stop was requested or genuine timeout
+                if self.stop_check and self.stop_check():
+                    pass  # handled below
+                else:
+                    logger.warning("[PARALLEL_GRADER] asyncio.wait timed out (%ds) with no completed tasks!", _total_wait)
+                    if not hasattr(self, '_timeout_count'):
+                        self._timeout_count = 0
+                    self._timeout_count += 1
+                    if self._timeout_count >= 3:
+                        logger.error("[PARALLEL_GRADER] 3 consecutive timeouts — cancelling remaining tasks")
+                        for task in still_pending:
+                            task.cancel()
+                        break
+                    continue
+
             # Reset timeout counter since we got results
             self._timeout_count = 0
 
