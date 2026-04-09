@@ -823,15 +823,15 @@ def collect_student_text(student_files: list, vision_notes: Optional[str] = None
 
     result = "\n\n".join(parts)
 
-    # Flow-audit gap #8 fix: warn when content far exceeds the 28K judge window
-    if total_chars > 30_000:
+    # Warn when content far exceeds the 60K judge window
+    if total_chars > 62_000:
         logger.warning(
-            "Student submission text is %d chars; judge input is capped at 28K "
+            "Student submission text is %d chars; judge input is capped at 60K "
             "— %d chars (~%.0f%%) will be truncated. "
-            "Content beyond 28K will not be graded for this student.",
+            "Content beyond 60K will not be graded for this student.",
             total_chars,
-            max(0, total_chars - 28_000),
-            max(0, total_chars - 28_000) / total_chars * 100 if total_chars else 0,
+            max(0, total_chars - 60_000),
+            max(0, total_chars - 60_000) / total_chars * 100 if total_chars else 0,
         )
 
     if not result.strip():

@@ -131,7 +131,7 @@ async def judge_checkpoint(
             Images are capped at NVIDIA_MAX_IMAGES_PER_REQUEST per call.
     """
     # Flow-audit gap #1 fix: warn when content is truncated so this is never silent.
-    content_limit = 28_000
+    content_limit = 60_000
     truncated = len(submission_content) > content_limit
     content_for_prompt = submission_content[:content_limit]
     if truncated:
