@@ -1512,14 +1512,24 @@ def _rescale_criteria_to_max_score(criteria: list[dict], max_score: int) -> None
         for c in criteria:
             c["marks"] = max(1, round((c.get("marks") or 0) * factor))
 
-    # Fix rounding drift — adjust largest criterion to hit exact total
+    # Fix rounding drift — distribute remainder one mark at a time across
+    # the highest-weight criteria so no single item gets an outsized bump.
     current = sum(c.get("marks") or 0 for c in criteria)
-    if current != max_score:
-        largest = max(criteria, key=lambda c: c.get("marks") or 0)
-        largest["marks"] = (largest.get("marks") or 0) + (max_score - current)
-        # Safety: never let rounding push a criterion below 1
-        if largest["marks"] < 1:
-            largest["marks"] = 1
+    diff = max_score - current
+    if diff != 0:
+        # Sort by original weight descending; ties broken by current marks
+        sorted_c = sorted(
+            criteria,
+            key=lambda c: (c.get("marks") or 0),
+            reverse=(diff > 0),
+        )
+        for i in range(abs(diff)):
+            idx = i % len(sorted_c)
+            sorted_c[idx]["marks"] = (sorted_c[idx].get("marks") or 0) + (1 if diff > 0 else -1)
+        # Final safety: no criterion below 1
+        for c in criteria:
+            if (c.get("marks") or 0) < 1:
+                c["marks"] = 1
 
 
 async def generate_rubric_from_description(
