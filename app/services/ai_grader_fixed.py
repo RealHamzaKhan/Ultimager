@@ -1512,14 +1512,24 @@ def _rescale_criteria_to_max_score(criteria: list[dict], max_score: int) -> None
         for c in criteria:
             c["marks"] = max(1, round((c.get("marks") or 0) * factor))
 
-    # Fix rounding drift — adjust largest criterion to hit exact total
+    # Fix rounding drift — distribute remainder one mark at a time across
+    # the highest-weight criteria so no single item gets an outsized bump.
     current = sum(c.get("marks") or 0 for c in criteria)
-    if current != max_score:
-        largest = max(criteria, key=lambda c: c.get("marks") or 0)
-        largest["marks"] = (largest.get("marks") or 0) + (max_score - current)
-        # Safety: never let rounding push a criterion below 1
-        if largest["marks"] < 1:
-            largest["marks"] = 1
+    diff = max_score - current
+    if diff != 0:
+        # Sort by original weight descending; ties broken by current marks
+        sorted_c = sorted(
+            criteria,
+            key=lambda c: (c.get("marks") or 0),
+            reverse=(diff > 0),
+        )
+        for i in range(abs(diff)):
+            idx = i % len(sorted_c)
+            sorted_c[idx]["marks"] = (sorted_c[idx].get("marks") or 0) + (1 if diff > 0 else -1)
+        # Final safety: no criterion below 1
+        for c in criteria:
+            if (c.get("marks") or 0) < 1:
+                c["marks"] = 1
 
 
 async def generate_rubric_from_description(
@@ -1710,6 +1720,30 @@ Generate the rubric following the question structure above. Total: exactly {max_
                 quality_issues.append("generic_names")
                 break
         final_criteria = model_criteria
+
+        # ── Guaranteed total: Phase 2 LLM sometimes ignores mark allocations
+        # (e.g. when question_ids don't match leaf ids, or it just ignores the
+        # instructions).  Apply a final rescale so the total ALWAYS equals
+        # max_score regardless of what the LLM returned.
+        total_final = sum(c.get("max", 0) for c in final_criteria)
+        if total_final != max_score and len(final_criteria) > 0:
+            logger.warning(
+                "Phase 2 total %d ≠ max_score %d — applying final rescale",
+                total_final, max_score,
+            )
+            factor = max_score / total_final if total_final > 0 else max_score / len(final_criteria)
+            for c in final_criteria:
+                c["max"] = max(1, round((c.get("max") or 1) * factor))
+            # Distribute remainder evenly (not all on one criterion)
+            current = sum(c.get("max", 0) for c in final_criteria)
+            diff = max_score - current
+            if diff != 0:
+                sorted_c = sorted(final_criteria, key=lambda x: x.get("max", 0), reverse=(diff > 0))
+                for i in range(abs(diff)):
+                    sorted_c[i % len(sorted_c)]["max"] += 1 if diff > 0 else -1
+                for c in final_criteria:
+                    if c.get("max", 0) < 1:
+                        c["max"] = 1
 
         rubric_text = _format_rubric_text(final_criteria, max_score)
         rubric_display = _format_rubric_display(final_criteria, max_score)
