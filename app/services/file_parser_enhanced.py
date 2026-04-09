@@ -1672,20 +1672,36 @@ def process_student_submission(student_dir: Path, student_id: str,
     
     extracted_contents = []
     
-    # Find all files — only from the IMMEDIATE student directory.
-    # Do NOT descend into nested subdirectories that look like other students'
-    # folders (e.g., "Muhammad_fasihullah_23P-0627/") to prevent cross-contamination.
-    # We allow ONE level of nesting for common structures (e.g., "src/", "code/")
-    # but skip directories whose names look like student identifiers.
+    # Find all files recursively.  Apply a targeted cross-contamination guard:
+    # skip files that live inside a subdirectory whose name starts with a roll
+    # number DIFFERENT from the current student's roll number.
+    #
+    # Examples of what we WANT to allow:
+    #   Lab Task 3/file.ipynb          — subject folder, not a student
+    #   22P-9171/Lab3_T1.ipynb         — student's own subfolder
+    #   src/main.py                    — standard code layout
+    #
+    # Examples of what we WANT to block (teacher bundled all ZIPs into one ZIP,
+    # so other students' folders appear as subdirs):
+    #   22P-9040_Ali/work.py           — clearly a different student
     import re as _re_parser
-    _student_dir_pattern = _re_parser.compile(
-        r'^\d{2}[pPiI][-_]?\d{3,5}|^[A-Z][a-z]+[-_ ][A-Z][a-z]+|^[A-Z][a-z]+_\d{2}[pPiI]',
-    )
+
+    # Matches roll-number prefix ONLY: 22P-9171, 22p9075, 21I-0001, etc.
+    _roll_pattern = _re_parser.compile(r'^\d{2}[pPiI][-_]?\d{3,5}', _re_parser.IGNORECASE)
+
+    # Normalise the current student's roll prefix for comparison
+    def _norm_roll(s: str) -> str:
+        return _re_parser.sub(r'[-_]', '', s).lower()
+
+    _current_roll = ""
+    _m = _roll_pattern.match(student_dir.name)
+    if _m:
+        _current_roll = _norm_roll(_m.group(0))
 
     all_files = []
     for file_path in sorted(student_dir.rglob("*")):
         if file_path.is_file():
-            # Skip hidden and system files (only check relative path parts, not parent dirs)
+            # Skip hidden and system files
             rel_parts = file_path.relative_to(student_dir).parts
             if any(part.startswith(".") or part.startswith("__") for part in rel_parts):
                 continue
@@ -1694,16 +1710,21 @@ def process_student_submission(student_dir: Path, student_id: str,
             if _is_transient_or_system_file(file_path):
                 continue
 
-            # Cross-contamination guard: skip files inside nested directories
-            # that look like other student submissions (name patterns like
-            # "23P-0627_Name", "Name_23P0627", "Firstname Lastname")
+            # Cross-contamination guard: skip files inside a subdirectory whose
+            # roll-number prefix is DIFFERENT from the current student's roll.
+            # Folders like "Lab Task 3", "src", "code" never match the roll
+            # pattern so they are always allowed.
             if len(rel_parts) >= 2:
-                # Check if ANY intermediate directory looks like a student folder
                 skip = False
-                for dir_part in rel_parts[:-1]:  # all dirs, not the filename
-                    if _student_dir_pattern.search(dir_part):
-                        skip = True
-                        break
+                for dir_part in rel_parts[:-1]:
+                    dm = _roll_pattern.match(dir_part)
+                    if dm:
+                        dir_roll = _norm_roll(dm.group(0))
+                        # Same student wrapped files in their own named subfolder — allow.
+                        # Different roll number — this is a contaminated submission.
+                        if _current_roll and dir_roll != _current_roll:
+                            skip = True
+                            break
                 if skip:
                     logger.info(
                         f"[FILE_PARSER] Skipping nested student file: "
