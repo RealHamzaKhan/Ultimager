@@ -1399,21 +1399,34 @@ def _distribute_question_marks(
     if not leaves:
         return
 
-    # Scale leaf marks to match max_score
+    # Scale leaf marks to match max_score — but ONLY when marks were not
+    # explicitly stated in the assignment.  If the assignment says "T1 [25 marks]"
+    # and "T2 [25 marks]", the sum (50, 100, 200 …) IS the correct total; we must
+    # not crush it down to whatever the session's max_score default is.
     actual_total = sum(leaf.get("marks") or 0 for leaf in leaves)
-    if actual_total != max_score and actual_total > 0:
+    explicit_leaves = sum(1 for leaf in leaves if leaf.get("marks_explicit"))
+    all_derived_from_explicit = (explicit_leaves == 0 and has_explicit and actual_total > 0)
+    any_leaf_explicit = explicit_leaves > 0
+
+    if actual_total == 0:
+        # No marks at all — distribute equally across max_score
+        per_item = max_score / len(leaves)
+        for leaf in leaves:
+            leaf["marks"] = round(per_item)
+        current = sum(leaf["marks"] for leaf in leaves)
+        if current != max_score:
+            leaves[-1]["marks"] += max_score - current
+    elif has_explicit and actual_total > 0:
+        # Explicit marks found in the assignment — trust them, do not rescale.
+        # The session max_score is just a UI default and must not override the
+        # instructor's stated allocations (e.g. 4 × 25 = 100, not 50).
+        pass  # marks are already correct from _distribute_parent_to_children
+    elif actual_total != max_score and actual_total > 0:
+        # No explicit marks anywhere — scale proportionally to hit max_score
         factor = max_score / actual_total
         for leaf in leaves:
             if leaf.get("marks"):
                 leaf["marks"] = round(leaf["marks"] * factor)
-        current = sum(leaf["marks"] for leaf in leaves)
-        if current != max_score:
-            leaves[-1]["marks"] += max_score - current
-    elif actual_total == 0:
-        # No marks at all — distribute equally
-        per_item = max_score / len(leaves)
-        for leaf in leaves:
-            leaf["marks"] = round(per_item)
         current = sum(leaf["marks"] for leaf in leaves)
         if current != max_score:
             leaves[-1]["marks"] += max_score - current
@@ -1481,16 +1494,31 @@ async def generate_rubric_from_description(
     if detail_level not in ("simple", "balanced", "detailed"):
         detail_level = "balanced"
 
+    # When the assignment contains explicit mark allocations (e.g. "[25 marks]"),
+    # use the sum of those as the true total rather than the session's max_score
+    # default.  The session default is only a UI hint — it must never crush marks
+    # that the instructor explicitly stated in the assignment text.
+    total_explicit = extraction.get("total_explicit_marks", 0)
+    has_explicit = extraction.get("has_explicit_marks", False)
+    if has_explicit and total_explicit > 0:
+        effective_max = total_explicit
+        logger.info(
+            "generate_rubric: explicit marks found (total=%d) — overriding session max_score=%d",
+            total_explicit, max_score,
+        )
+    else:
+        effective_max = max_score
+
     # If questions found, use constrained Phase 2
     if leaves:
         return await _phase2_constrained_rubric(
-            assignment_description, max_score, strictness, detail_level,
+            assignment_description, effective_max, strictness, detail_level,
             questions, leaves,
         )
 
     # Otherwise fall back to unconstrained generation
     return await _unconstrained_rubric(
-        assignment_description, max_score, strictness, detail_level
+        assignment_description, effective_max, strictness, detail_level
     )
 
 
