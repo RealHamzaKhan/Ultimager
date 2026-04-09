@@ -1399,26 +1399,16 @@ def _distribute_question_marks(
     if not leaves:
         return
 
-    # Scale leaf marks to match max_score
+    # Distribute marks proportionally — do NOT scale to max_score here.
+    # Scaling happens later after collapsing (in _rescale_criteria_to_max_score),
+    # so every criterion gets the right proportional share of the teacher's max.
     actual_total = sum(leaf.get("marks") or 0 for leaf in leaves)
-    if actual_total != max_score and actual_total > 0:
-        factor = max_score / actual_total
+    if actual_total == 0:
+        # No marks anywhere — give each leaf an equal weight of 1 so proportions work
         for leaf in leaves:
-            if leaf.get("marks"):
-                leaf["marks"] = round(leaf["marks"] * factor)
-        current = sum(leaf["marks"] for leaf in leaves)
-        if current != max_score:
-            leaves[-1]["marks"] += max_score - current
-    elif actual_total == 0:
-        # No marks at all — distribute equally
-        per_item = max_score / len(leaves)
-        for leaf in leaves:
-            leaf["marks"] = round(per_item)
-        current = sum(leaf["marks"] for leaf in leaves)
-        if current != max_score:
-            leaves[-1]["marks"] += max_score - current
+            leaf["marks"] = 1
 
-    # Propagate marks up
+    # Propagate marks up so parent nodes reflect sum of children
     def _sum_parts(qs: list[dict]):
         for q in qs:
             parts = q.get("parts") or []
@@ -1457,6 +1447,81 @@ def _build_question_constraint(questions: list[dict], indent: int = 0) -> str:
     return "\n".join(lines)
 
 
+def _compute_max_criteria(max_score: int) -> int:
+    """Cap rubric criteria count based on max_score to avoid hundreds of checkpoints.
+
+    More marks → finer granularity is reasonable, but there's a ceiling beyond
+    which LLM grading becomes impractically slow (each criterion = one LLM call
+    per student).
+    """
+    if max_score <= 10:
+        return 8
+    elif max_score <= 25:
+        return 15
+    elif max_score <= 50:
+        return 25
+    elif max_score <= 100:
+        return 40
+    return 50
+
+
+def _collapse_to_max_criteria(questions: list[dict], max_criteria: int) -> list[dict]:
+    """Collapse deep question hierarchy to at most max_criteria items.
+
+    Tries progressively shallower tree depths until the count fits.
+    Each returned item has parts=[] so Phase 2 treats it as a [LEAF].
+    Marks on returned items are already correct (summed from children by
+    _distribute_question_marks → _sum_parts).
+    """
+    def at_depth(qs: list[dict], max_depth: int, cur: int = 0) -> list[dict]:
+        result = []
+        for q in qs:
+            parts = q.get("parts") or []
+            if not parts or cur >= max_depth:
+                result.append({**q, "parts": []})
+            else:
+                result.extend(at_depth(parts, max_depth, cur + 1))
+        return result
+
+    for depth in range(10, -1, -1):
+        candidates = at_depth(questions, depth)
+        if len(candidates) <= max_criteria:
+            return candidates
+
+    # Absolute fallback: top-level questions only
+    return [{**q, "parts": []} for q in questions][:max_criteria]
+
+
+def _rescale_criteria_to_max_score(criteria: list[dict], max_score: int) -> None:
+    """Scale criteria marks proportionally so they sum exactly to max_score.
+
+    Guarantees every criterion is worth at least 1 mark.
+    Mutates the list in-place.
+    """
+    if not criteria:
+        return
+
+    total = sum(c.get("marks") or 0 for c in criteria)
+    if total == 0:
+        # No weight info — distribute equally
+        per = max_score / len(criteria)
+        for c in criteria:
+            c["marks"] = max(1, round(per))
+    else:
+        factor = max_score / total
+        for c in criteria:
+            c["marks"] = max(1, round((c.get("marks") or 0) * factor))
+
+    # Fix rounding drift — adjust largest criterion to hit exact total
+    current = sum(c.get("marks") or 0 for c in criteria)
+    if current != max_score:
+        largest = max(criteria, key=lambda c: c.get("marks") or 0)
+        largest["marks"] = (largest.get("marks") or 0) + (max_score - current)
+        # Safety: never let rounding push a criterion below 1
+        if largest["marks"] < 1:
+            largest["marks"] = 1
+
+
 async def generate_rubric_from_description(
     assignment_description: str,
     max_score: int = 100,
@@ -1468,27 +1533,51 @@ async def generate_rubric_from_description(
     Uses a two-phase approach:
     - Phase 1: Extract question structure and mark allocations from the description
     - Phase 2: Generate criteria constrained to match the extracted structure exactly
+
+    The teacher's max_score is always the authoritative total. Explicit marks in the
+    assignment (e.g. "[25 marks]") are used as proportional weights, then scaled to
+    sum exactly to max_score. This works for any assignment regardless of how marks
+    are stated in the description.
     """
     await _rate_limiter.acquire()
-
-    # ── Phase 1: Extract question structure ──────────────────────────
-    extraction = await _extract_question_structure(assignment_description, max_score)
-    questions = extraction.get("questions", [])
-    leaves = _get_leaf_questions(questions) if questions else []
 
     if strictness not in ("lenient", "balanced", "strict"):
         strictness = "balanced"
     if detail_level not in ("simple", "balanced", "detailed"):
         detail_level = "balanced"
 
-    # If questions found, use constrained Phase 2
-    if leaves:
-        return await _phase2_constrained_rubric(
-            assignment_description, max_score, strictness, detail_level,
-            questions, leaves,
+    # ── Phase 1: Extract question structure and proportions ──────────
+    extraction = await _extract_question_structure(assignment_description, max_score)
+    questions = extraction.get("questions", [])
+
+    if questions:
+        # Cap criteria count to keep grading fast, then scale to teacher's max_score
+        max_criteria = _compute_max_criteria(max_score)
+        raw_leaves = _get_leaf_questions(questions)
+
+        if len(raw_leaves) > max_criteria:
+            logger.info(
+                "generate_rubric: %d leaves exceeds max_criteria=%d for max_score=%d "
+                "— collapsing hierarchy",
+                len(raw_leaves), max_criteria, max_score,
+            )
+            effective_leaves = _collapse_to_max_criteria(questions, max_criteria)
+        else:
+            effective_leaves = raw_leaves
+
+        # Scale proportionally so marks sum exactly to teacher's max_score
+        _rescale_criteria_to_max_score(effective_leaves, max_score)
+        logger.info(
+            "generate_rubric: %d criteria, total=%d marks",
+            len(effective_leaves), sum(c.get("marks") or 0 for c in effective_leaves),
         )
 
-    # Otherwise fall back to unconstrained generation
+        return await _phase2_constrained_rubric(
+            assignment_description, max_score, strictness, detail_level,
+            effective_leaves, effective_leaves,
+        )
+
+    # No structure found — fall back to unconstrained generation
     return await _unconstrained_rubric(
         assignment_description, max_score, strictness, detail_level
     )
