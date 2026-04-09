@@ -43,7 +43,7 @@ class CheckpointResult:
     needs_review: bool = False
 
     # Transparency flags (set by orchestrator)
-    judge_truncated: bool = False   # True when submission content was cut to fit 28K token limit
+    judge_truncated: bool = False   # True when submission content was cut to fit 60K token limit
 
     # Which model made this decision
     model_used: str = ""

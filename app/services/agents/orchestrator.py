@@ -453,7 +453,7 @@ class GradingOrchestrator:
         if any_truncated:
             result.needs_review = True
             result.review_flags.append(
-                "Submission content was truncated to fit AI context window (28,000 chars). "
+                "Submission content was truncated to fit AI context window (60,000 chars). "
                 "Some submitted work may not have been evaluated. Manual review of large submissions recommended."
             )
 

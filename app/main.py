@@ -1691,7 +1691,7 @@ def _grade_all_students_parallel(session_id: int):
         # Generate checkpoints on-the-fly if not already present
         if not _session_checkpoints and rubric_text:
             try:
-                from app.services.ai_grader_fixed import _parse_rubric_criteria
+                from app.services.ai_grader_fixed import parse_rubric as _parse_rubric_criteria
                 from app.services.checkpoint_grader import generate_checkpoints as _gen_cp
                 import asyncio as _aio
                 _crit = _parse_rubric_criteria(rubric_text)
