@@ -1,4 +1,4 @@
-```markdown
+
 # GradeForge 🎓⚡
 
 > **AI-powered automated grading platform for university CS instructors**  
@@ -687,4 +687,4 @@ SOFTWARE.
 > *Built by instructors, for instructors.*
 
 [⬆ Back to Top](#-table-of-contents)
-```
+
